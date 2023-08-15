@@ -28,6 +28,45 @@ pub const MemoryPoolAligned = memory_pool.MemoryPoolAligned;
 pub const MemoryPoolExtra = memory_pool.MemoryPoolExtra;
 pub const MemoryPoolOptions = memory_pool.Options;
 
+/// Compile time known minimum page size.
+pub const min_page_size = switch (builtin.cpu.arch) {
+    .aarch64 => switch (builtin.os.tag) {
+        .macos, .ios, .watchos, .tvos => 16 * 1024,
+        else => 4 * 1024,
+    },
+    .mips, .mipsel, .mips64, .mips64el => switch (builtin.os) {
+        .linux => 4 * 1024,
+        else => 1024, // NEC VR41xx processors support as low as 1K page size
+    },
+    .sparc64 => 8 * 1024,
+    .wasm32, .wasm64 => 64 * 1024,
+    else => 4 * 1024,
+};
+
+/// Compile time known maximum page size.
+pub const max_page_size = switch (builtin.arch) {
+    .arm, .armeb => 16 * 1024 * 1024, // At least ARMv7 has optional support for 16M pages
+    .aarch64, .aarch64_be => 1 * 1024 * 1024 * 1024,
+
+    .mips,
+    .mipsel,
+    .mips64,
+    .mips64el,
+    .powerpc64,
+    .powerpc64le,
+    .wasm32,
+    .wasm64,
+    => 64 * 1024,
+
+    .s390x => 2 * 1024 * 1024 * 1024,
+    .sparcv9 => 16 * 1024 * 1024 * 1024,
+
+    .x86 => 4 * 1024 * 1024, // 4M in PSE mode
+    .x86_64 => 1 * 1024 * 1024 * 1024, // 1G with PDPE1GB flag
+
+    else => min_page_size,
+};
+
 /// TODO Utilize this on Windows.
 pub var next_mmap_addr_hint: ?[*]align(mem.page_size) u8 = null;
 

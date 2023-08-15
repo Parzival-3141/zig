@@ -10,18 +10,6 @@ const testing = std.testing;
 const Endian = std.builtin.Endian;
 const native_endian = builtin.cpu.arch.endian();
 
-/// Compile time known minimum page size.
-/// https://github.com/ziglang/zig/issues/4082
-pub const page_size = switch (builtin.cpu.arch) {
-    .wasm32, .wasm64 => 64 * 1024,
-    .aarch64 => switch (builtin.os.tag) {
-        .macos, .ios, .watchos, .tvos => 16 * 1024,
-        else => 4 * 1024,
-    },
-    .sparc64 => 8 * 1024,
-    else => 4 * 1024,
-};
-
 /// The standard library currently thoroughly depends on byte size
 /// being 8 bits.  (see the use of u8 throughout allocation code as
 /// the "byte" type.)  Code which depends on this can reference this
