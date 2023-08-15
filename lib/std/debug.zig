@@ -17,6 +17,7 @@ const windows = std.os.windows;
 const native_arch = builtin.cpu.arch;
 const native_os = builtin.os.tag;
 const native_endian = native_arch.endian();
+const min_page_size = std.heap.min_page_size;
 
 pub const runtime_safety = switch (builtin.mode) {
     .Debug, .ReleaseSafe => true,
@@ -596,9 +597,9 @@ pub const StackIterator = struct {
         // We are unable to determine validity of memory for freestanding targets
         if (native_os == .freestanding) return true;
 
-        const aligned_address = address & ~@as(usize, @intCast((mem.page_size - 1)));
+        const aligned_address = address & ~@as(usize, @intCast((min_page_size - 1)));
         if (aligned_address == 0) return false;
-        const aligned_memory = @as([*]align(mem.page_size) u8, @ptrFromInt(aligned_address))[0..mem.page_size];
+        const aligned_memory = @as([*]align(min_page_size) u8, @ptrFromInt(aligned_address))[0..min_page_size];
 
         if (native_os != .windows) {
             if (native_os != .wasi) {
@@ -1068,7 +1069,7 @@ pub fn readElfDebugInfo(
     build_id: ?[]const u8,
     expected_crc: ?u32,
     parent_sections: *DW.DwarfInfo.SectionArray,
-    parent_mapped_mem: ?[]align(mem.page_size) const u8,
+    parent_mapped_mem: ?[]align(min_page_size) const u8,
 ) !ModuleDebugInfo {
     nosuspend {
 
@@ -1392,7 +1393,7 @@ fn printLineFromFileAnyOs(out_stream: anytype, line_info: LineInfo) !void {
     defer f.close();
     // TODO fstat and make sure that the file has the correct size
 
-    var buf: [mem.page_size]u8 = undefined;
+    var buf: [min_page_size]u8 = undefined;
     var line: usize = 1;
     var column: usize = 1;
     while (true) {
@@ -1441,7 +1442,7 @@ const MachoSymbol = struct {
 /// `file` is expected to have been opened with .intended_io_mode == .blocking.
 /// Takes ownership of file, even on error.
 /// TODO it's weird to take ownership even on error, rework this code.
-fn mapWholeFile(file: File) ![]align(mem.page_size) const u8 {
+fn mapWholeFile(file: File) ![]align(min_page_size) const u8 {
     nosuspend {
         defer file.close();
 
@@ -1932,7 +1933,7 @@ pub const ModuleDebugInfo = switch (native_os) {
     .macos, .ios, .watchos, .tvos => struct {
         base_address: usize,
         vmaddr_slide: usize,
-        mapped_memory: []align(mem.page_size) const u8,
+        mapped_memory: []align(min_page_size) const u8,
         symbols: []const MachoSymbol,
         strings: [:0]const u8,
         ofiles: OFileTable,
@@ -2216,8 +2217,8 @@ pub const ModuleDebugInfo = switch (native_os) {
     .linux, .netbsd, .freebsd, .dragonfly, .openbsd, .haiku, .solaris => struct {
         base_address: usize,
         dwarf: DW.DwarfInfo,
-        mapped_memory: []align(mem.page_size) const u8,
-        external_mapped_memory: ?[]align(mem.page_size) const u8,
+        mapped_memory: []align(min_page_size) const u8,
+        external_mapped_memory: ?[]align(min_page_size) const u8,
 
         pub fn deinit(self: *@This(), allocator: mem.Allocator) void {
             self.dwarf.deinit(allocator);

@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @This();
-const page_size = std.mem.page_size;
+const page_size = std.heap.min_page_size;
 const iovec = std.os.iovec;
 const iovec_const = std.os.iovec_const;
 
