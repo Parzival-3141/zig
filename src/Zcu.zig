@@ -3866,6 +3866,7 @@ pub fn atomicPtrAlignment(
         .loongarch32,
         .xtensa,
         .propeller,
+        .quakec,
         => 32,
 
         .amdgcn,
@@ -4556,6 +4557,10 @@ pub fn callconvSupported(zcu: *Zcu, cc: std.builtin.CallingConvention) union(enu
         .stage2_spirv => switch (cc) {
             .spirv_device, .spirv_kernel => true,
             .spirv_fragment, .spirv_vertex => target.os.tag == .vulkan or target.os.tag == .opengl,
+            else => false,
+        },
+        .stage2_quakec => switch (cc) {
+            .naked => true,
             else => false,
         },
     };

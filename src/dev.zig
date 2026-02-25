@@ -52,6 +52,10 @@ pub const Env = enum {
     /// - `zig build-* -fincremental -fno-llvm -fno-lld -target x86_64-linux --listen=-`
     @"x86_64-linux",
 
+    /// - sema
+    /// - `zig build-* -fno-llvm -fno-lld -target quakec-* --listen=-`
+    quakec,
+
     pub inline fn supports(comptime dev_env: Env, comptime feature: Feature) bool {
         return switch (dev_env) {
             .full => true,
@@ -213,6 +217,14 @@ pub const Env = enum {
                 => true,
                 else => Env.sema.supports(feature),
             },
+            .quakec => switch (feature) {
+                .stdio_listen,
+                .incremental,
+                .quakec_backend,
+                .quakec_linker,
+                => true,
+                else => Env.sema.supports(feature),
+            },
         };
     }
 
@@ -278,6 +290,7 @@ pub const Feature = enum {
     riscv64_backend,
     sparc64_backend,
     spirv_backend,
+    quakec_backend,
 
     lld_linker,
     coff_linker,
@@ -289,6 +302,7 @@ pub const Feature = enum {
     plan9_linker,
     goff_linker,
     xcoff_linker,
+    quakec_linker,
 };
 
 /// Makes the code following the call to this function unreachable if `feature` is disabled.

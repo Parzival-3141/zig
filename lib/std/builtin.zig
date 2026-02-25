@@ -1069,6 +1069,8 @@ pub const CompilerBackend = enum(u64) {
     /// powerpc backend.
     stage2_powerpc = 12,
 
+    stage2_quakec = 0x5175616B6543,
+
     _,
 };
 

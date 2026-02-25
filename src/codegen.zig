@@ -43,6 +43,7 @@ fn devFeatureForBackend(backend: std.builtin.CompilerBackend) dev.Feature {
         .stage2_wasm => .wasm_backend,
         .stage2_x86 => .x86_backend,
         .stage2_x86_64 => .x86_64_backend,
+        .stage2_quakec => .quakec_backend,
         _ => unreachable,
     };
 }
@@ -60,6 +61,7 @@ fn importBackend(comptime backend: std.builtin.CompilerBackend) type {
         .stage2_spirv => @import("codegen/spirv/CodeGen.zig"),
         .stage2_wasm => @import("arch/wasm/CodeGen.zig"),
         .stage2_x86, .stage2_x86_64 => @import("arch/x86_64/CodeGen.zig"),
+        .stage2_quakec => @import("arch/quakec/CodeGen.zig"),
         _ => unreachable,
     };
 }
@@ -78,6 +80,7 @@ pub fn legalizeFeatures(pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) ?*co
         .stage2_riscv64,
         .stage2_sparc64,
         .stage2_spirv,
+        .stage2_quakec,
         => |backend| {
             dev.check(devFeatureForBackend(backend));
             return importBackend(backend).legalizeFeatures(target);
@@ -104,6 +107,7 @@ pub const AnyMir = union {
     x86_64: if (dev.env.supports(.x86_64_backend)) @import("arch/x86_64/Mir.zig") else noreturn,
     wasm: if (dev.env.supports(.wasm_backend)) @import("arch/wasm/Mir.zig") else noreturn,
     c: if (dev.env.supports(.c_backend)) @import("codegen/c.zig").Mir else noreturn,
+    quakec: if (dev.env.supports(.quakec_backend)) @import("arch/quakec/Mir.zig") else noreturn,
 
     pub inline fn tag(comptime backend: std.builtin.CompilerBackend) []const u8 {
         return switch (backend) {
@@ -113,6 +117,7 @@ pub const AnyMir = union {
             .stage2_x86_64 => "x86_64",
             .stage2_wasm => "wasm",
             .stage2_c => "c",
+            .stage2_quakec => "quakec",
             else => unreachable,
         };
     }
@@ -128,6 +133,7 @@ pub const AnyMir = union {
             .stage2_x86_64,
             .stage2_wasm,
             .stage2_c,
+            .stage2_quakec,
             => |backend_ct| @field(mir, tag(backend_ct)).deinit(gpa),
         }
     }
@@ -157,6 +163,7 @@ pub fn generateFunction(
         .stage2_x86_64,
         .stage2_wasm,
         .stage2_c,
+        .stage2_quakec,
         => |backend| {
             dev.check(devFeatureForBackend(backend));
             const CodeGen = importBackend(backend);

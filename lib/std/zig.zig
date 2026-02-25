@@ -237,6 +237,8 @@ pub fn binNameAlloc(allocator: Allocator, options: BinNameOptions) error{OutOfMe
                 t.libPrefix(), root_name,
             }),
         },
+
+        .quakec => return std.fmt.allocPrint(allocator, "{s}.dat", .{root_name}),
     }
 }
 

@@ -614,6 +614,7 @@ pub const File = struct {
                 });
             },
             .c, .spirv => dev.checkAny(&.{ .c_linker, .spirv_linker }),
+            .quakec => dev.check(.quakec_linker),
             .plan9 => unreachable,
         }
     }
@@ -678,6 +679,7 @@ pub const File = struct {
                 }
             },
             .c, .spirv => dev.checkAny(&.{ .c_linker, .spirv_linker }),
+            .quakec => dev.check(.quakec_linker),
             .plan9 => unreachable,
         }
     }
@@ -1118,6 +1120,7 @@ pub const File = struct {
         goff,
         xcoff,
         lld,
+        quakec,
 
         pub fn Type(comptime tag: Tag) type {
             return switch (tag) {
@@ -1130,7 +1133,9 @@ pub const File = struct {
                 .goff => Goff,
                 .xcoff => Xcoff,
                 .lld => Lld,
-                .plan9 => comptime unreachable,
+                .quakec => QuakeC,
+                .plan9,
+                => comptime unreachable,
             };
         }
 
@@ -1147,6 +1152,7 @@ pub const File = struct {
                 .xcoff => .xcoff,
                 .hex => @panic("TODO implement hex object format"),
                 .raw => @panic("TODO implement raw object format"),
+                .quakec => .quakec,
             };
         }
 
@@ -1229,6 +1235,7 @@ pub const File = struct {
     pub const Goff = @import("link/Goff.zig");
     pub const Xcoff = @import("link/Xcoff.zig");
     pub const Dwarf = @import("link/Dwarf.zig");
+    pub const QuakeC = @import("link/QuakeC.zig");
 };
 
 pub const PrelinkTask = union(enum) {

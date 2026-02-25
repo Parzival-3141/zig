@@ -727,6 +727,24 @@ pub const x86 = @import("Target/x86.zig");
 pub const xcore = @import("Target/xcore.zig");
 pub const xtensa = @import("Target/xtensa.zig");
 
+pub const quakec = struct {
+    pub const Feature = enum {};
+    pub const featureSet = Cpu.Feature.FeatureSetFns(Feature).featureSet;
+    pub const featureSetHas = Cpu.Feature.FeatureSetFns(Feature).featureSetHas;
+    pub const featureSetHasAny = Cpu.Feature.FeatureSetFns(Feature).featureSetHasAny;
+    pub const featureSetHasAll = Cpu.Feature.FeatureSetFns(Feature).featureSetHasAll;
+
+    pub const all_features: [0]Cpu.Feature = .{};
+
+    pub const cpu = struct {
+        pub const generic: Cpu.Model = .{
+            .name = "generic",
+            .llvm_name = null,
+            .features = .empty,
+        };
+    };
+};
+
 pub const Abi = enum {
     none,
     gnu,
@@ -975,6 +993,8 @@ pub const ObjectFormat = enum {
     wasm,
     /// The eXtended Common Object File Format used by AIX.
     xcoff,
+    /// QuakeC bytecode
+    quakec,
 
     // LLVM tags deliberately omitted:
     // - dxcontainer
@@ -988,6 +1008,7 @@ pub const ObjectFormat = enum {
             .plan9 => arch.plan9Ext(),
             .raw => ".bin",
             .spirv => ".spv",
+            .quakec => ".dat",
         };
     }
 
@@ -1001,6 +1022,7 @@ pub const ObjectFormat = enum {
             else => switch (arch) {
                 .spirv32, .spirv64 => .spirv,
                 .wasm32, .wasm64 => .wasm,
+                .quakec => .quakec,
                 else => .elf,
             },
         };
@@ -1043,6 +1065,7 @@ pub fn toElfMachine(target: *const Target) std.elf.EM {
         .spirv64,
         .wasm32,
         .wasm64,
+        .quakec,
         => .NONE,
     };
 }
@@ -1095,6 +1118,7 @@ pub fn toCoffMachine(target: *const Target) std.coff.MachineType {
         .xcore,
         .xtensa,
         .propeller,
+        .quakec,
         => .UNKNOWN,
     };
 }
@@ -1309,6 +1333,8 @@ pub const Cpu = struct {
         xcore,
         xtensa,
 
+        quakec,
+
         // LLVM tags deliberately omitted:
         // - aarch64_32
         // - amdil
@@ -1359,6 +1385,7 @@ pub const Cpu = struct {
             x86,
             xcore,
             xtensa,
+            quakec,
         };
 
         pub inline fn family(arch: Arch) Family {
@@ -1390,6 +1417,7 @@ pub const Cpu = struct {
                 .x86, .x86_64 => .x86,
                 .xcore => .xcore,
                 .xtensa => .xtensa,
+                .quakec => .quakec,
             };
         }
 
@@ -1543,6 +1571,7 @@ pub const Cpu = struct {
                 .xcore,
                 .thumb,
                 .ve,
+                .quakec,
                 // GPU bitness is opaque. For now, assume little endian.
                 .spirv32,
                 .spirv64,
@@ -2604,6 +2633,7 @@ pub fn ptrBitWidth_arch_abi(cpu_arch: Cpu.Arch, abi: Abi) u16 {
         .loongarch32,
         .xtensa,
         .propeller,
+        .quakec,
         => 32,
 
         .aarch64,
@@ -3063,7 +3093,7 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) u16 {
 pub fn cTypeAlignment(target: *const Target, c_type: CType) u16 {
     // Overrides for unusual alignments
     switch (target.cpu.arch) {
-        .avr => return 1,
+        .avr, .quakec => return 1,
         .x86 => switch (target.os.tag) {
             .windows, .uefi => switch (c_type) {
                 .longlong, .ulonglong, .double => return 8,
@@ -3153,6 +3183,7 @@ pub fn cTypeAlignment(target: *const Target, c_type: CType) u16 {
             => 16,
 
             .avr,
+            .quakec,
             => unreachable, // Handled above.
         }),
     );
@@ -3165,7 +3196,7 @@ pub fn cTypePreferredAlignment(target: *const Target, c_type: CType) u16 {
             .longdouble => return 4,
             else => {},
         },
-        .avr => return 1,
+        .avr, .quakec => return 1,
         .x86 => switch (target.os.tag) {
             .windows, .uefi => switch (c_type) {
                 .longdouble => switch (target.abi) {
@@ -3249,6 +3280,7 @@ pub fn cTypePreferredAlignment(target: *const Target, c_type: CType) u16 {
             => 16,
 
             .avr,
+            .quakec,
             => unreachable, // Handled above.
         }),
     );
@@ -3256,7 +3288,7 @@ pub fn cTypePreferredAlignment(target: *const Target, c_type: CType) u16 {
 
 pub fn cMaxIntAlignment(target: *const Target) u16 {
     return switch (target.cpu.arch) {
-        .avr => 1,
+        .avr, .quakec => 1,
 
         .msp430 => 2,
 
@@ -3378,6 +3410,7 @@ pub fn cCallingConvention(target: *const Target) ?std.builtin.CallingConvention 
         .amdgcn => .{ .amdgcn_device = .{} },
         .nvptx, .nvptx64 => .nvptx_device,
         .spirv32, .spirv64 => .spirv_device,
+        .quakec => .naked,
     };
 }
 

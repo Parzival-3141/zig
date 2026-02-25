@@ -75,7 +75,7 @@ pub fn alwaysSingleThreaded(target: *const std.Target) bool {
 
 pub fn defaultSingleThreaded(target: *const std.Target) bool {
     switch (target.cpu.arch) {
-        .wasm32, .wasm64 => return true,
+        .wasm32, .wasm64, .quakec => return true,
         else => {},
     }
     switch (target.os.tag) {
@@ -151,6 +151,7 @@ pub fn hasLlvmSupport(target: *const std.Target, ofmt: std.Target.ObjectFormat) 
         // LLVM does not support these object formats:
         .c,
         .plan9,
+        .quakec,
         => return false,
 
         .coff,
@@ -217,6 +218,7 @@ pub fn hasLlvmSupport(target: *const std.Target, ofmt: std.Target.ObjectFormat) 
         .kalimba,
         .or1k,
         .propeller,
+        .quakec,
         => false,
     };
 }
@@ -852,6 +854,7 @@ pub fn zigBackend(target: *const std.Target, use_llvm: bool) std.builtin.Compile
         .wasm32, .wasm64 => .stage2_wasm,
         .x86 => .stage2_x86,
         .x86_64 => .stage2_x86_64,
+        .quakec => .stage2_quakec,
         else => .other,
     };
 }
