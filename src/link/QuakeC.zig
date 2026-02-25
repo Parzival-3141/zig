@@ -1,23 +1,29 @@
+//! Linker consumes MIR and produces a binary file (link.File)
+
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const fs = std.fs;
-const Path = std.Build.Cache.Path;
+const log = std.log.scoped(.link);
 
 const QuakeC = @This();
-const build_options = @import("build_options");
+const Path = std.Build.Cache.Path;
 const Zcu = @import("../Zcu.zig");
 const Module = @import("../Package/Module.zig");
 const InternPool = @import("../InternPool.zig");
 const Alignment = InternPool.Alignment;
 const Compilation = @import("../Compilation.zig");
-const codegen = @import("../codegen.zig");
-const link = @import("../link.zig");
-const trace = @import("../tracy.zig").trace;
 const Type = @import("../Type.zig");
 const Value = @import("../Value.zig");
-const AnyMir = @import("../codegen.zig").AnyMir;
+const CodeGen = @import("../arch/quakec/CodeGen.zig");
+
+const build_options = @import("build_options");
+const codegen = @import("../codegen.zig");
+const dev = @import("../dev.zig");
+const link = @import("../link.zig");
+const trace = @import("../tracy.zig").trace;
 
 base: link.File,
 
@@ -84,12 +90,27 @@ pub fn updateFunc(
     self: *QuakeC,
     pt: Zcu.PerThread,
     func_index: InternPool.Index,
-    mir: *AnyMir,
+    mir: *codegen.AnyMir,
 ) link.File.UpdateNavError!void {
-    _ = self; // autofix
-    _ = pt; // autofix
-    _ = func_index; // autofix
     _ = mir; // autofix
+    if (build_options.skip_non_native and builtin.object_format != .quakec) {
+        @panic("Attempted to compile for object format that was disabled by build configuration");
+    }
+
+    dev.check(.quakec_backend);
+
+    const zcu = pt.zcu;
+    const gpa = self.base.comp.gpa;
+    _ = gpa; // autofix
+
+    const ip = &zcu.intern_pool;
+    const owner_nav = zcu.funcInfo(func_index).owner_nav;
+    log.debug("updateFunc {f}", .{ip.getNav(owner_nav).fqn.fmt(ip)});
+
+    // codegen.emitFunction()
+
+    // const function = try CodeGen.function(self, pt, func_index, air, liveness);
+    // try self.funcs.put(gpa, func_index, function);
     @panic("@Todo");
 }
 
@@ -99,9 +120,27 @@ pub fn updateNav(
     nav_index: InternPool.Nav.Index,
 ) link.File.UpdateNavError!void {
     _ = self; // autofix
-    _ = pt; // autofix
-    _ = nav_index; // autofix
-    @panic("@Todo");
+    if (build_options.skip_non_native and builtin.object_format != .quakec) {
+        @panic("Attempted to compile for object format that was disabled by build configuration");
+    }
+    const zcu = pt.zcu;
+    const ip = &zcu.intern_pool;
+    const nav = ip.getNav(nav_index);
+
+    const nav_init, const chased_nav_index = switch (ip.indexToKey(nav.status.fully_resolved.val)) {
+        .func => return, // global const which is a function alias
+        .@"extern" => |ext| {
+            _ = ext;
+            @panic("TODO updateNav extern func");
+        },
+        .variable => |variable| .{ variable.init, variable.owner_nav },
+        else => .{ nav.status.fully_resolved.val, nav_index },
+    };
+    log.debug("updateNav {f} {d}", .{ nav.fqn.fmt(ip), chased_nav_index });
+
+    if (nav_init != .none and !Value.fromInterned(nav_init).typeOf(zcu).hasRuntimeBits(zcu)) {
+        return;
+    }
 }
 
 pub fn updateLineNumber(
@@ -110,9 +149,21 @@ pub fn updateLineNumber(
     ti_id: InternPool.TrackedInst.Index,
 ) !void {
     _ = self; // autofix
-    _ = pt; // autofix
-    _ = ti_id; // autofix
-    @panic("@Todo");
+
+    const zcu = pt.zcu;
+    const ip = &zcu.intern_pool;
+
+    const inst_info = ti_id.resolveFull(ip).?;
+    assert(inst_info.inst != .main_struct_inst);
+    const file = zcu.fileByIndex(inst_info.file);
+    const decl = file.zir.?.getDeclaration(inst_info.inst);
+    log.debug("updateLineNumber({s}:{d}:{d} %{d} = {s})", .{
+        file.sub_file_path,
+        decl.src_line + 1,
+        decl.src_column + 1,
+        @intFromEnum(inst_info.inst),
+        file.zir.?.nullTerminatedString(decl.name),
+    });
 }
 
 pub fn updateExports(
@@ -121,11 +172,25 @@ pub fn updateExports(
     exported: Zcu.Exported,
     export_indices: []const Zcu.Export.Index,
 ) !void {
-    _ = self; // autofix
-    _ = pt; // autofix
-    _ = exported; // autofix
-    _ = export_indices; // autofix
-    @panic("@Todo");
+    _ = self;
+    if (build_options.skip_non_native and builtin.object_format != .quakec) {
+        @panic("Attempted to compile for object format that was disabled by build configuration");
+    }
+
+    const zcu = pt.zcu;
+    const ip = &zcu.intern_pool;
+    for (export_indices) |export_idx| {
+        const exp = export_idx.ptr(zcu);
+        const name_slice = exp.opts.name.toSlice(ip);
+        switch (exported) {
+            .nav => |nav_index| {
+                log.debug("updateExports '{s}' nav={d}", .{ name_slice, @intFromEnum(nav_index) });
+            },
+            .uav => |uav_index| {
+                log.debug("updateExports '{s}' uav={d}", .{ name_slice, @intFromEnum(uav_index) });
+            },
+        }
+    }
 }
 
 pub fn getNavVAddr(
@@ -166,11 +231,19 @@ pub fn getUavVAddr(self: *QuakeC, decl_val: InternPool.Index, reloc_info: link.F
 pub fn deleteExport(
     self: *QuakeC,
     exported: Zcu.Exported,
-    _: InternPool.NullTerminatedString,
+    name: InternPool.NullTerminatedString,
 ) void {
-    _ = self; // autofix
-    _ = exported; // autofix
-    @panic("@Todo");
+    const zcu = self.base.comp.zcu.?;
+    const ip = &zcu.intern_pool;
+    const name_slice = name.toSlice(ip);
+    switch (exported) {
+        .nav => |nav_index| {
+            log.debug("deleteExport '{s}' nav={d}", .{ name_slice, @intFromEnum(nav_index) });
+        },
+        .uav => |uav_index| {
+            log.debug("deleteExport '{s}' uav={d}", .{ name_slice, @intFromEnum(uav_index) });
+        },
+    }
 }
 
 /// Commit pending changes and write headers. Takes into account final output mode.
@@ -181,9 +254,17 @@ pub fn flush(
     tid: Zcu.PerThread.Id,
     prog_node: std.Progress.Node,
 ) link.File.FlushError!void {
-    _ = self; // autofix
-    _ = arena; // autofix
-    _ = tid; // autofix
-    _ = prog_node; // autofix
-    @panic("@Todo");
+    // The goal is to never use this because it's only needed if we need to
+    // write to InternPool, but flush is too late to be writing to the
+    // InternPool.
+    _ = tid;
+    const comp = self.base.comp;
+    const diags = &comp.link_diags;
+
+    const sub_prog_node = prog_node.start("QuakeC Flush", 0);
+    defer sub_prog_node.end();
+
+    _ = arena;
+
+    return diags.fail("TODO implement flushModule for quakec", .{});
 }

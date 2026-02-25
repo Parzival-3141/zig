@@ -1,3 +1,6 @@
+//! QuakeC codegen.
+//! This lowers AIR into MIR.
+
 const std = @import("std");
 const link = @import("../../link.zig");
 const codegen = @import("../../codegen.zig");
@@ -27,3 +30,9 @@ pub fn generate(
     _ = liveness; // autofix
     @panic("@Todo");
 }
+
+// Okay
+
+// codegen.zig calls the backend's CodeGen.generate() via codegen.generateFunction(), which creates the MIR for a function.
+// The linker ingests the MIR, at some point lowering the MIR to machine code (Mir.emit() via codegen.emitFunction(), or using custom emit logic e.g. Wasm & C linkers)
+// Whether the linker uses custom emission instead of codegen.emitFunction() seems to depend on the linker understanding the backend's MIR directly
