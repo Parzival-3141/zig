@@ -61,7 +61,7 @@ fn importBackend(comptime backend: std.builtin.CompilerBackend) type {
         .stage2_spirv => @import("codegen/spirv/CodeGen.zig"),
         .stage2_wasm => @import("arch/wasm/CodeGen.zig"),
         .stage2_x86, .stage2_x86_64 => @import("arch/x86_64/CodeGen.zig"),
-        .stage2_quakec => @import("arch/quakec/CodeGen.zig"),
+        .stage2_quakec => @import("codegen/quakec/CodeGen.zig"),
         _ => unreachable,
     };
 }
@@ -107,7 +107,7 @@ pub const AnyMir = union {
     x86_64: if (dev.env.supports(.x86_64_backend)) @import("arch/x86_64/Mir.zig") else noreturn,
     wasm: if (dev.env.supports(.wasm_backend)) @import("arch/wasm/Mir.zig") else noreturn,
     c: if (dev.env.supports(.c_backend)) @import("codegen/c.zig").Mir else noreturn,
-    quakec: if (dev.env.supports(.quakec_backend)) @import("arch/quakec/Mir.zig") else noreturn,
+    quakec: if (dev.env.supports(.quakec_backend)) @import("codegen/quakec/Mir.zig") else noreturn,
 
     pub inline fn tag(comptime backend: std.builtin.CompilerBackend) []const u8 {
         return switch (backend) {

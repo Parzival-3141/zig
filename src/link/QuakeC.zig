@@ -17,7 +17,7 @@ const Alignment = InternPool.Alignment;
 const Compilation = @import("../Compilation.zig");
 const Type = @import("../Type.zig");
 const Value = @import("../Value.zig");
-const CodeGen = @import("../arch/quakec/CodeGen.zig");
+const CodeGen = @import("../codegen/quakec/CodeGen.zig");
 
 const build_options = @import("build_options");
 const codegen = @import("../codegen.zig");
@@ -130,8 +130,18 @@ pub fn updateNav(
     const nav_init, const chased_nav_index = switch (ip.indexToKey(nav.status.fully_resolved.val)) {
         .func => return, // global const which is a function alias
         .@"extern" => |ext| {
-            _ = ext;
-            @panic("TODO updateNav extern func");
+            // const name = ext.name.toSlice(ip);
+            if (ip.isFunctionType(nav.typeOf(ip))) {
+
+                // Extern functions are treated as QuakeC builtins
+                // how to bind builtin number? Hijack callconv? libname?
+                const fn_info = zcu.typeToFunc(.fromInterned(ext.ty)).?;
+                _ = fn_info; // autofix
+                log.debug("updateNav == extern func {f} ==", .{nav.fqn.fmt(ip)});
+                return; // @Incomplete
+            }
+
+            @panic("TODO updateNav extern");
         },
         .variable => |variable| .{ variable.init, variable.owner_nav },
         else => .{ nav.status.fully_resolved.val, nav_index },
