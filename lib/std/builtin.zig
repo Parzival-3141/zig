@@ -352,6 +352,8 @@ pub const CallingConvention = union(enum(u8)) {
     spirv_fragment,
     spirv_vertex,
 
+    quakec,
+
     /// Options shared across most calling conventions.
     pub const CommonOptions = struct {
         /// The boundary the stack is aligned to when the function is called.

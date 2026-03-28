@@ -1802,6 +1802,8 @@ pub const Cpu = struct {
                 .spirv_fragment,
                 .spirv_vertex,
                 => &.{ .spirv32, .spirv64 },
+
+                .quakec => &.{.quakec},
             };
         }
     };
@@ -3410,7 +3412,7 @@ pub fn cCallingConvention(target: *const Target) ?std.builtin.CallingConvention 
         .amdgcn => .{ .amdgcn_device = .{} },
         .nvptx, .nvptx64 => .nvptx_device,
         .spirv32, .spirv64 => .spirv_device,
-        .quakec => .naked,
+        .quakec => .quakec,
     };
 }
 

@@ -4560,7 +4560,7 @@ pub fn callconvSupported(zcu: *Zcu, cc: std.builtin.CallingConvention) union(enu
             else => false,
         },
         .stage2_quakec => switch (cc) {
-            .naked => true,
+            .quakec => true,
             else => false,
         },
     };

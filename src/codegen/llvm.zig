@@ -12007,6 +12007,7 @@ fn toLlvmCallConvTag(cc_tag: std.builtin.CallingConvention.Tag, target: *const s
         .spirv_kernel,
         .spirv_fragment,
         .spirv_vertex,
+        .quakec,
         => null,
     };
 }
