@@ -9,12 +9,16 @@ statements: []const Statement,
 
 locals: []const ValueType,
 immediates: []const f32, // @Todo handle other QC types
+globals: []const InternPool.Nav.Index,
 
 pub const QValue = union(enum) {
     void: void,
-    local: u32, // index into locals
-    immediate: u32, // index into immediates
-    constant_float: f32,
+    /// index into locals
+    local: u32,
+    /// index into immediates
+    immediate: u32,
+    /// index into globals
+    global: u32,
 };
 
 pub const Statement = struct {
@@ -26,6 +30,7 @@ pub fn deinit(mir: *@This(), gpa: std.mem.Allocator) void {
     gpa.free(mir.statements);
     gpa.free(mir.locals);
     gpa.free(mir.immediates);
+    gpa.free(mir.globals);
     mir.* = undefined;
 }
 

@@ -19,12 +19,15 @@ const InternPool = @import("../../InternPool.zig");
 // Value represents a compile-time known value, such as an integer, struct, etc.
 // Type represents a compile-time known type, such as u8 (all types are compile-time known).
 // Both are actually indexes into InternPool, with the index value being one of the known InternPool.Index tag values.
-// I'm not 100% sure how InternPool works, but I think it stored deduplicated Values and Types.
+// I'm not 100% sure how InternPool works, but I think it stores deduplicated Values and Types.
 // Note that Values can hold types! E.g. `const c = u8;` is represented by a Value of "u8" of Type "type".
 // Specifically, `Value{ .ip_index = .u8_type }` and `Type{ .ip_index = .type_type }`
 
 // Air.Ref.toIndex() returns non-null if the Ref references an Air instruction. Used when working with the result of an instruction.
 // Air.Ref.toInterned() returns non-null if the Ref references a value stored in InternPool. Used when working with a constant value.
+
+// NAVs are Named Addressable Values. They may be mutable or constant.
+// UAVs are Unnamed Addressable Values. They are all constant.
 
 pub fn legalizeFeatures(_: *const std.Target) ?*const Air.Legalize.Features {
     // @Todo after the implementation here has stabalized, consider what features
@@ -41,7 +44,7 @@ pub fn legalizeFeatures(_: *const std.Target) ?*const Air.Legalize.Features {
 }
 
 // @Cleanup while our CodeGen is a file struct, it's never actually instantiated anywhere outside
-// this file. It matches the style of the other backends, but it's unecessary and I don't like it.k
+// this file. It matches the style of the other backends, but it's unecessary and I don't like it.
 
 pt: Zcu.PerThread,
 func_index: InternPool.Index,
@@ -49,6 +52,7 @@ func_index: InternPool.Index,
 num_params: u8 = 0,
 locals: std.AutoArrayHashMapUnmanaged(Air.Inst.Index, QValueType) = .empty,
 immediates: std.AutoArrayHashMapUnmanaged(InternPool.Index, f32) = .empty,
+globals: std.AutoArrayHashMapUnmanaged(InternPool.Nav.Index, void) = .empty,
 
 statements: std.ArrayList(Statement) = .empty,
 
@@ -69,7 +73,7 @@ pub fn generate(
     liveness: *const ?Air.Liveness,
 ) codegen.CodeGenError!Mir {
     _ = src_loc; // autofix
-    std.debug.assert(lf.tag == .quakec); // or do dev.check(.quakec_backend) instead?
+    std.debug.assert(lf.tag == .quakec); // @Cleanup or do dev.check(.quakec_backend) instead?
 
     const live = liveness.*.?;
     const zcu = pt.zcu;
@@ -122,31 +126,39 @@ pub fn generate(
 
                 assert(ptr_info.child == .f32_type); // @Todo handle all QC types
                 var stmt: Statement = .{ .op = .store_f };
-                // @Incomplete I don't think .store is limited to stack locals!
                 // stmt.args[0] = index of global that holds the variable, which must be resolved in link phase
                 // stmt.args[1] = index of global that holds the value, which must be resolved in link phase
                 // For now these must directly hold intermediate values which represent the above final values.
 
                 if (bin_op.lhs.toIndex()) |air_inst_idx| {
+                    // lhs is the address of a local variable, the result of an air instruction
                     log.debug("lhs = %{d}: {f}", .{
                         @intFromEnum(air_inst_idx),
                         ptr_ty.fmt(pt),
                     });
-                    const local_ty = function.locals.get(air_inst_idx).?; // @Todo handle storing to other globals besides locals
+                    const local_ty = function.locals.get(air_inst_idx).?; // @Todo handle storing to other registers besides locals, like .load-ed values.
                     assert(local_ty == .float); // @Todo handle all QC types
-                    stmt.op = .store_f;
                     stmt.args[1] = .{ .local = @intCast(function.locals.getIndex(air_inst_idx).?) };
                 } else {
+                    // lhs is the address of a global variable, a constant Value
                     const val: Value = .fromInterned(bin_op.lhs.toInterned().?);
-                    return function.fail("@Todo store to global value: lhs = <{f}, {f}>", .{
+                    log.debug("lhs = <{f}, {f}>", .{
                         val.typeOf(zcu).fmt(pt),
                         val.fmtValue(pt),
                     });
+
+                    assert(ptr_ty.isSinglePointer(zcu)); // @Todo is it possible to lower stores to other pointer types?
+                    const nav_idx = Value.pointerNav(val, zcu).?;
+                    const nav = ip.getNav(nav_idx);
+                    assert(nav.typeOf(ip) == .f32_type); // @Todo handle all QC types
+                    const gop = try function.globals.getOrPut(zcu.gpa, nav_idx);
+                    stmt.args[1] = .{ .global = @intCast(gop.index) };
                 }
 
                 if (bin_op.rhs.toIndex()) |air_inst_idx| {
                     return function.fail("@Todo store instruction result: rhs = {f}", .{air_inst_idx});
                 } else {
+                    // rhs is a constant Value
                     const val: Value = .fromInterned(bin_op.rhs.toInterned().?);
                     log.debug("rhs = <{f}, {f}>", .{
                         val.typeOf(zcu).fmt(pt),
@@ -195,12 +207,14 @@ pub fn generate(
         .statements = &.{}, // assigned after errdefer
         .locals = &.{}, // assigned after errdefer
         .immediates = &.{}, // assigned after errdefer
+        .globals = &.{}, // assigned after errdefer
         .num_params = function.num_params,
     };
     errdefer mir.deinit(zcu.gpa);
     mir.statements = try function.statements.toOwnedSlice(zcu.gpa);
     mir.locals = try zcu.gpa.dupe(QValueType, function.locals.values());
     mir.immediates = try zcu.gpa.dupe(f32, function.immediates.values());
+    mir.globals = try zcu.gpa.dupe(InternPool.Nav.Index, function.globals.keys());
     return mir;
 }
 
@@ -209,6 +223,7 @@ fn deinit(cg: *CodeGen) void {
     cg.statements.deinit(gpa);
     cg.locals.deinit(gpa);
     cg.immediates.deinit(gpa);
+    cg.globals.deinit(gpa);
     cg.live_values.deinit(gpa);
     cg.* = undefined;
 }

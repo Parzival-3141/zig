@@ -202,6 +202,7 @@ pub fn updateFunc(
         .immediates = &.{},
         .locals = &.{},
         .statements = &.{},
+        .globals = &.{},
     };
 
     // @panic("@Todo updateFunc");
@@ -394,6 +395,7 @@ pub fn flush(
     // write to InternPool, but flush is too late to be writing to the
     // InternPool.
     _ = tid;
+
     const comp = self.base.comp;
     const diags = &comp.link_diags;
 
@@ -407,18 +409,20 @@ pub fn flush(
 }
 
 fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
+    const zcu = self.base.comp.zcu.?;
+    const ip = &zcu.intern_pool;
     const mir = self.func_mir.?;
 
     assert(mir.num_params == 0); // @Todo @Cleanup handle parameter allocation later
-    const num_immediates_and_locals = mir.immediates.len + mir.locals.len;
+    const num_globals = mir.immediates.len + mir.locals.len + mir.globals.len;
 
     // add 1 to these to account for their sentinel value
     var statements: std.ArrayList(Statement) = try .initCapacity(arena, 1 + mir.statements.len);
     var functions: std.ArrayList(Function) = try .initCapacity(arena, 1 + 1); // only 1 function for now
-    var globaldefs: std.ArrayList(Def) = try .initCapacity(arena, 1 + num_immediates_and_locals);
+    var globaldefs: std.ArrayList(Def) = try .initCapacity(arena, 1 + num_globals);
     var fielddefs: std.ArrayList(Def) = try .initCapacity(arena, 1);
     var strings: std.ArrayList(u8) = try .initCapacity(arena, 1); // @Todo use StringTable instead?
-    var globals: std.ArrayList(f32) = try .initCapacity(arena, @intFromEnum(Offset.reserved_len) + num_immediates_and_locals);
+    var globals: std.ArrayList(f32) = try .initCapacity(arena, @intFromEnum(Offset.reserved_len) + num_globals);
     globals.appendNTimesAssumeCapacity(0, @intFromEnum(Offset.reserved_len));
 
     // append sentinels
@@ -434,9 +438,10 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
     const GlobalKey = union(enum) {
         immediate: u32,
         local: u32,
+        global: u32,
     };
     var allocated_globals: std.AutoHashMapUnmanaged(GlobalKey, u32) = .empty;
-    try allocated_globals.ensureUnusedCapacity(arena, @intCast(num_immediates_and_locals));
+    try allocated_globals.ensureUnusedCapacity(arena, @intCast(num_globals));
 
     for (mir.immediates, 0..) |imm, index| {
         const offset: u32 = @intCast(globals.items.len);
@@ -469,25 +474,57 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
         });
         allocated_globals.putAssumeCapacityNoClobber(.{ .local = @intCast(index) }, offset);
     }
+    for (mir.globals, 0..) |nav_idx, index| {
+        const offset: u32 = @intCast(globals.items.len); // not to be confused with mir.globals!
+        // @Cleanup
+
+        // It's not very clear how you're supposed to transform an InternPool.Index into the desired data.
+        // Here I want to get the initial value of the Nav, but have to chase it through an Index in a subfield,
+        // to a Value, to an InternPool.Key.Variable, to another Index in a subfield, then back to a Value, and finally to a float.
+        // Also, the conversions to a Value are largely redundant since getVariable and toFloat immediately convert back to an Index to call indexToKey.
+        //
+        // This is probably obvious to those with a better understanding of InternPool's guts, but to an outsider it's like cutting through thick jungle.
+        // It doesn't have to be this way; InternPool seems conceptually simple. An overview of how it works, how it's supposed to be used and why,
+        // and how other data structures (Key, Tag, Index, Nav, Uav, Value, Type, etc.) relate to it, would go a long way.
+
+        // Also, I'm not sure but, I think in InternPool functions that accept a "val: Index" argument, val is the index of a Value.
+
+        const nav = ip.getNav(nav_idx);
+        assert(nav.typeOf(ip) == .f32_type); // @Todo handle all QC types
+        assert(ip.isVariable(nav.status.fully_resolved.val));
+        // const nav_val: Value = .fromInterned(nav.status.fully_resolved.val);
+        // const init_val_idx = nav_val.getVariable(zcu).?.init;
+        const init_val_idx = ip.indexToKey(nav.status.fully_resolved.val).variable.init;
+        const init_value: f32 = if (!ip.isUndef(init_val_idx)) Value.fromInterned(init_val_idx).toFloat(f32, zcu) else 0;
+
+        globals.appendAssumeCapacity(init_value);
+        globaldefs.appendAssumeCapacity(.{
+            .type = .{ .tag = .float, .save_global = false },
+            .offset = @intCast(offset),
+            .s_name = idx: {
+                const str_idx: u32 = @intCast(strings.items.len);
+                // @Todo preallocate all strings
+                try strings.ensureUnusedCapacity(arena, nav.fqn.length(ip) + 1);
+                strings.appendSliceAssumeCapacity(nav.fqn.toSlice(ip));
+                strings.appendAssumeCapacity(0);
+                break :idx str_idx;
+            },
+        });
+        allocated_globals.putAssumeCapacityNoClobber(.{ .global = @intCast(index) }, offset);
+    }
 
     const first_statement: u31 = @intCast(statements.items.len);
 
     // link statements
     for (mir.statements) |stmt| {
-        var result: Statement = undefined;
-        result.op = stmt.op;
-        for (stmt.args, &result.args) |arg, *res| {
-            switch (arg) {
-                .constant_float => unreachable,
-                .void => res.* = 0,
-                .local => |index| {
-                    // lookup offset in globals
-                    res.* = @intCast(allocated_globals.get(.{ .local = index }).?);
-                },
-                .immediate => |index| {
-                    // lookup offset in globals
-                    res.* = @intCast(allocated_globals.get(.{ .immediate = index }).?);
-                },
+        var result: Statement = .{ .op = stmt.op, .args = undefined };
+        for (stmt.args, &result.args) |mir_arg, *res_arg| {
+            switch (mir_arg) {
+                .void => res_arg.* = 0,
+                // lookup allocated global offset
+                .local => |index| res_arg.* = @intCast(allocated_globals.get(.{ .local = index }).?),
+                .immediate => |index| res_arg.* = @intCast(allocated_globals.get(.{ .immediate = index }).?),
+                .global => |index| res_arg.* = @intCast(allocated_globals.get(.{ .global = index }).?),
             }
         }
         statements.appendAssumeCapacity(result);
@@ -500,7 +537,6 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
         .locals = @intCast(mir.locals.len), // @Todo handle parameters
         .profile = 0,
         .s_name = idx: {
-            // @Cleanup
             const str_idx: u32 = @intCast(strings.items.len);
             try strings.ensureUnusedCapacity(arena, self.func_name.?.len + 1);
             strings.appendSliceAssumeCapacity(self.func_name.?);
@@ -508,7 +544,6 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
             break :idx str_idx;
         },
         .s_file = idx: {
-            // @Cleanup
             const str_idx: u32 = @intCast(strings.items.len);
             try strings.ensureUnusedCapacity(arena, self.file_name.?.len + 1);
             strings.appendSliceAssumeCapacity(self.file_name.?);
@@ -516,7 +551,7 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
             break :idx str_idx;
         },
         .numparms = mir.num_params,
-        .parm_sizes = @splat(0), // @Todo
+        .parm_sizes = @splat(0), // @Todo handle parameters
     });
 
     if (strings.getLast() != 0) try strings.append(arena, 0); // @Cleanup do this when writing to file instead?
