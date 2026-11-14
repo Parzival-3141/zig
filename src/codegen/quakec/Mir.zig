@@ -7,6 +7,9 @@ const InternPool = @import("../../InternPool.zig");
 num_params: u8,
 statements: []const Statement,
 
+// The Wasm backend encodes these inside the instruction stream, which the linker lowers while iterating the stream.
+// This is opposed to storing them seperately, which we do here. We could do it the other way, since we always add the
+// registers before they're needed (@Todo is that true?), but it's fine, at least for now.
 locals: []const ValueType,
 immediates: []const f32, // @Todo handle other QC types
 globals: []const InternPool.Nav.Index,
