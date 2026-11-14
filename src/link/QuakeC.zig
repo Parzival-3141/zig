@@ -422,8 +422,8 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
     var globaldefs: std.ArrayList(Def) = try .initCapacity(arena, 1 + num_globals);
     var fielddefs: std.ArrayList(Def) = try .initCapacity(arena, 1);
     var strings: std.ArrayList(u8) = try .initCapacity(arena, 1); // @Todo use StringTable instead?
-    var globals: std.ArrayList(f32) = try .initCapacity(arena, @intFromEnum(Offset.reserved_len) + num_globals);
-    globals.appendNTimesAssumeCapacity(0, @intFromEnum(Offset.reserved_len));
+    var globals: std.ArrayList(f32) = try .initCapacity(arena, SpecialRegisterOffset.reserved_len + num_globals);
+    globals.appendNTimesAssumeCapacity(0, SpecialRegisterOffset.reserved_len);
 
     // append sentinels
     statements.appendAssumeCapacity(std.mem.zeroes(Statement));
@@ -533,8 +533,8 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
     // @Todo handle multiple functions
     functions.appendAssumeCapacity(.{
         .first_statement = first_statement,
-        .parm_start = if (mir.locals.len > 0) allocated_globals.get(.{ .local = 0 }).? else 0,
-        .locals = @intCast(mir.locals.len), // @Todo handle parameters
+        .frame_start = if (mir.locals.len > 0) allocated_globals.get(.{ .local = 0 }).? else 0,
+        .frame_size = @intCast(mir.locals.len), // @Todo handle parameters
         .profile = 0,
         .s_name = idx: {
             const str_idx: u32 = @intCast(strings.items.len);
@@ -550,8 +550,8 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
             strings.appendAssumeCapacity(0);
             break :idx str_idx;
         },
-        .numparms = mir.num_params,
-        .parm_sizes = @splat(0), // @Todo handle parameters
+        .num_params = mir.num_params,
+        .param_size = @splat(0), // @Todo handle parameters
     });
 
     if (strings.getLast() != 0) try strings.append(arena, 0); // @Cleanup do this when writing to file instead?
@@ -662,11 +662,13 @@ pub const Def = extern struct {
 };
 
 pub const Function = extern struct {
-    /// negative numbers are builtins
+    /// A negative value is a builtin index and marks this function as a builtin.
     first_statement: i32,
-    parm_start: u32,
-    /// total ints of parms + locals
-    locals: u32,
+    // parm_start
+    /// Offset of the function frame (parameters + local variables) in Vm.globals.
+    frame_start: u32,
+    // locals
+    frame_size: u32,
 
     /// runtime
     profile: u32,
@@ -675,24 +677,29 @@ pub const Function = extern struct {
     /// source file defined in
     s_file: u32,
 
-    numparms: u32,
-    parm_sizes: [MAX_PARMS]u8,
+    num_params: u32,
+    param_size: [MAX_PARAMETERS]u8,
 
-    pub const MAX_PARMS = 8;
+    pub const MAX_PARAMETERS = 8;
 };
 
 pub const PROG_VERSION = 6;
 
-pub const Offset = enum(u16) {
+/// Offsets of special purpose registers in globals
+pub const SpecialRegisterOffset = enum(u16) {
     null = 0,
+    /// Padded to 3 words to hold vectors
     @"return" = 1,
-    parm0 = 4, // leave 3 ofs for each parm to hold vectors
-    parm1 = 7,
-    parm2 = 10,
-    parm3 = 13,
-    parm4 = 16,
-    parm5 = 19,
-    parm6 = 22,
-    parm7 = 25,
-    reserved_len = 28,
+    // parm0-7
+    /// Function arguments, filled by caller.
+    /// Each argument is padded to 3 words to hold vectors.
+    arg0 = 4,
+    arg1 = 7,
+    arg2 = 10,
+    arg3 = 13,
+    arg4 = 16,
+    arg5 = 19,
+    arg6 = 22,
+    arg7 = 25,
+    pub const reserved_len = 28;
 };

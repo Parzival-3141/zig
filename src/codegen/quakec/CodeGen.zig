@@ -56,8 +56,12 @@ globals: std.AutoArrayHashMapUnmanaged(InternPool.Nav.Index, void) = .empty,
 
 statements: std.ArrayList(Statement) = .empty,
 
+// @Incomplete
+// Need to track addressable variables besides immediates or locals.
+// Wasm backend handles this with a pool of WValues, representing in flight values from the AIR stream, used for lowering to MIR.
+// Aarch64 does something similar with its live_values field.
+
 /// Used for tracking loaded values used in upcoming instructions.
-/// Use fetchRemove when accessing a value.
 loaded_values: std.AutoHashMapUnmanaged(Air.Inst.Index, QValue) = .empty,
 
 const QValueType = Mir.ValueType;
@@ -125,7 +129,8 @@ pub fn generate(
                 if (bin_op.rhs.toInterned()) |intern| if (ip.isUndef(intern)) continue; // skip store of undefined. If this store is part of a declaration then the linker will ensure the variable is zeroed.
 
                 assert(ptr_info.child == .f32_type); // @Todo handle all QC types
-                var stmt: Statement = .{ .op = .store_f };
+                const stmt = try function.statements.addOne(zcu.gpa);
+                stmt.* = .{ .op = .store_f };
                 // stmt.args[0] = index of global that holds the variable, which must be resolved in link phase
                 // stmt.args[1] = index of global that holds the value, which must be resolved in link phase
                 // For now these must directly hold intermediate values which represent the above final values.
@@ -151,14 +156,13 @@ pub fn generate(
 
                 if (bin_op.rhs.toIndex()) |air_inst_idx| {
                     // rhs is the result of an air instruction
-                    // @Todo @Cleanup can .load-ed instructions be used more than once? If so, removing from loaded_values does not make sense.
-                    const kvp = function.loaded_values.fetchRemove(air_inst_idx).?;
-                    log.debug("rhs = {f}: {t}", .{ air_inst_idx, kvp.value });
-                    switch (kvp.value) {
+                    const loaded_value = function.loaded_values.get(air_inst_idx).?;
+                    log.debug("rhs = {f}: {t}", .{ air_inst_idx, loaded_value });
+                    switch (loaded_value) {
                         .void, .immediate => unreachable,
                         .local, .global => {},
                     }
-                    stmt.args[0] = kvp.value;
+                    stmt.args[0] = loaded_value;
                 } else {
                     // rhs is a constant Value
                     const val: Value = .fromInterned(bin_op.rhs.toInterned().?);
@@ -170,8 +174,6 @@ pub fn generate(
                     const gop = try function.immediates.getOrPutValue(zcu.gpa, val.toIntern(), resolved_value);
                     stmt.args[0] = .{ .immediate = @intCast(gop.index) };
                 }
-
-                try function.statements.append(zcu.gpa, stmt);
             },
             .load => {
                 const ty_op = air_data[@intFromEnum(inst_idx)].ty_op;
@@ -192,6 +194,10 @@ pub fn generate(
                 // @Incomplete
                 // I don't want to allocate a local for every intermediate value. That means having some sort of register allocator (here register meaning QC globals).
                 // That probably means refactoring how registers are tracked and stored; probably close to how the Wasm or Aarch64 backends do it (pool of live values).
+                // Using a register allocator for locals across functions would be neat. Functions that are guaranteed not to share the same callstack can share local
+                // registers, saving memory.
+
+                // actually, how are locals allocated in qcc?
 
                 // Track the instruction as being live, so it can be fetched in subsequent instructions (like store).
                 if (ty_op.operand.toIndex()) |air_inst_idx| {
@@ -210,6 +216,67 @@ pub fn generate(
                         @panic("@Todo .load non-global");
                     }
                 }
+            },
+            .add, .sub, .mul => |op| {
+                // Both lhs and rhs are the same type (either float or int).
+                // They are either an air_inst_idx or a Value, neither are pointers.
+                const bin_op = air_data[@intFromEnum(inst_idx)].bin_op;
+                // @Todo assert both operands are floats
+                const stmt = try function.statements.addOne(zcu.gpa);
+                stmt.* = .{ .op = switch (op) {
+                    .add => .add_f,
+                    .sub => .sub_f,
+                    .mul => .mul_f,
+                    else => unreachable,
+                } };
+
+                if (bin_op.lhs.toIndex()) |air_inst_idx| {
+                    const value: QValue = if (function.locals.getIndex(air_inst_idx)) |local_idx|
+                        .{ .local = @intCast(local_idx) }
+                    else
+                        function.loaded_values.get(air_inst_idx).?;
+                    switch (value) {
+                        .void, .immediate => unreachable,
+                        .local, .global => {},
+                    }
+                    stmt.args[0] = value;
+                } else {
+                    const val: Value = .fromInterned(bin_op.lhs.toInterned().?);
+                    assert(try function.getQCType(val.typeOf(zcu)) == .float); // @Todo handle all QC types
+                    const resolved_value: f32 = val.toFloat(f32, zcu);
+
+                    const gop = try function.immediates.getOrPutValue(zcu.gpa, val.toIntern(), resolved_value);
+                    stmt.args[0] = .{ .immediate = @intCast(gop.index) };
+                }
+
+                if (bin_op.rhs.toIndex()) |air_inst_idx| {
+                    const value: QValue = if (function.locals.getIndex(air_inst_idx)) |local_idx|
+                        .{ .local = @intCast(local_idx) }
+                    else
+                        function.loaded_values.get(air_inst_idx).?;
+                    switch (value) {
+                        .void, .immediate => unreachable,
+                        .local, .global => {},
+                    }
+                    stmt.args[1] = value;
+                } else {
+                    const val: Value = .fromInterned(bin_op.rhs.toInterned().?);
+                    assert(try function.getQCType(val.typeOf(zcu)) == .float); // @Todo handle all QC types
+                    const resolved_value: f32 = val.toFloat(f32, zcu);
+
+                    const gop = try function.immediates.getOrPutValue(zcu.gpa, val.toIntern(), resolved_value);
+                    stmt.args[1] = .{ .immediate = @intCast(gop.index) };
+                }
+
+                // output register
+                // @Todo here we're indescriminantly allocating a new local for the result,
+                // which is incredibly wasteful since the result will probably be used only once.
+                // Instead we should allocate from a pool of locals, reusing them when they're no longer needed.
+                // In other words, a register allocator.
+                const gop = try function.locals.getOrPutValue(zcu.gpa, inst_idx, .float);
+                assert(!gop.found_existing);
+                stmt.args[2] = .{ .local = @intCast(gop.index) };
+                try function.loaded_values.putNoClobber(zcu.gpa, inst_idx, stmt.args[2]);
             },
             .ret, .ret_safe => {
                 const un_op = air_data[@intFromEnum(inst_idx)].un_op;
