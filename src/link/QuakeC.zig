@@ -462,6 +462,7 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
         const offset: u32 = @intCast(globals.items.len);
         assert(local == .float); // @Todo handle all QC types
         globals.appendAssumeCapacity(0);
+        // @Todo don't add defs for temp variables
         globaldefs.appendAssumeCapacity(.{
             .type = .{ .tag = .float, .save_global = false },
             .offset = @intCast(offset),
