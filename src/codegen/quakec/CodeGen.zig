@@ -97,7 +97,7 @@ pub fn generate(
     liveness: *const ?Air.Liveness,
 ) codegen.CodeGenError!Mir {
     _ = src_loc; // autofix
-    std.debug.assert(lf.tag == .quakec); // @Cleanup or do dev.check(.quakec_backend) instead?
+    assert(lf.tag == .quakec); // @Cleanup or do dev.check(.quakec_backend) instead?
 
     const live = liveness.*.?;
     const zcu = pt.zcu;
@@ -147,8 +147,6 @@ pub fn generate(
 
                 if (ptr_info.packed_offset.host_size != 0) return function.fail("QuakeC backend does not support non-ABI-aligned pointers", .{});
                 if (bin_op.rhs.toInterned()) |intern| if (ip.isUndef(intern)) continue; // skip store of undefined. If this store is part of a declaration then the linker will ensure the variable is zeroed.
-
-                assert(ptr_info.child == .f32_type); // @Todo handle all QC types
 
                 const rhs = try function.resolveOperand(bin_op.rhs);
                 const lhs = try function.resolvePtrOperand(bin_op.lhs);
@@ -269,7 +267,7 @@ fn getQCType(cg: CodeGen, ty: Type) !Mir.ValueType {
     return switch (ty.toIntern()) {
         .f32_type => .float,
         // @Todo handle all QC types
-        else => cg.fail("invalid type: {f}", .{ty.fmt(cg.pt)}),
+        else => cg.fail("unsupported quakec backend type: {f}", .{ty.fmt(cg.pt)}),
     };
 }
 
