@@ -17,19 +17,21 @@ locals: []const ValueType,
 globals: []const InternPool.Nav.Index,
 immediates: []const f32, // @Todo handle other QC types
 
-pub const QValue = union(enum) {
-    void: void,
-    /// index into locals
-    local: u32,
-    /// index into immediates
-    immediate: u32,
-    /// index into globals
-    global: u32,
-};
-
 pub const Statement = struct {
     op: Opcode,
-    args: [3]QValue = @splat(.void),
+    args: [3]Arg = @splat(.void),
+
+    pub const Arg = union(enum) {
+        void: void,
+        /// index of statement for calculating a jump offset
+        jump_to_stmt: u32,
+        /// index into locals
+        local: u32,
+        /// index into immediates
+        immediate: u32,
+        /// index into globals
+        global: u32,
+    };
 };
 
 pub fn deinit(mir: *@This(), gpa: std.mem.Allocator) void {

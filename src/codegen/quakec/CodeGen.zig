@@ -48,6 +48,8 @@ pub fn legalizeFeatures(_: *const std.Target) ?*const Air.Legalize.Features {
 
 pt: Zcu.PerThread,
 func_index: InternPool.Index,
+air: *const Air,
+live: Air.Liveness,
 
 num_params: u8 = 0,
 
@@ -59,6 +61,13 @@ num_params: u8 = 0,
 /// lifetimes of values used during computation and allocate them to the
 /// appropriate memory regions. A memory region may be recycled when its value dies.
 live_values: std.AutoArrayHashMapUnmanaged(Air.Inst.Index, ValueSlot) = .empty,
+
+blocks: std.AutoHashMapUnmanaged(Air.Inst.Index, struct {
+    /// Indices of jump statements in the block body to fixup and point to end of block
+    fixups: std.ArrayList(u32),
+    /// Always an index into `frame`
+    result_slot: ?u32,
+}) = .empty,
 
 /// List of value slots in the function "stack" frame.
 /// @Todo vectors are explicitly ignored for now and will require a refactor.
@@ -98,34 +107,74 @@ pub fn generate(
 ) codegen.CodeGenError!Mir {
     _ = src_loc; // autofix
     assert(lf.tag == .quakec); // @Cleanup or do dev.check(.quakec_backend) instead?
-
-    const live = liveness.*.?;
     const zcu = pt.zcu;
-    const ip = &zcu.intern_pool;
-
-    // @Cleanup
-    // air.dump(pt, live);
-    // std.debug.print("starting codegen:\n", .{});
 
     var function: CodeGen = .{
         .func_index = func_index,
         .pt = pt,
+        .air = air,
+        .live = liveness.*.?,
     };
     defer function.deinit();
 
-    // genBody
+    // @Cleanup
+    // air.dump(pt, function.live);
+    // std.debug.print("\n\nstarting codegen:\n", .{});
+
+    try function.genBody(air.getMainBody());
+
+    var mir: Mir = .{
+        .statements = &.{}, // assigned after errdefer
+        .locals = &.{}, // assigned after errdefer
+        .immediates = &.{}, // assigned after errdefer
+        .globals = &.{}, // assigned after errdefer
+        .num_params = function.num_params,
+    };
+    errdefer mir.deinit(zcu.gpa);
+    mir.statements = try function.statements.toOwnedSlice(zcu.gpa);
+    mir.locals = try zcu.gpa.dupe(Mir.ValueType, function.frame.items);
+    mir.immediates = try zcu.gpa.dupe(f32, function.immediates.values());
+    mir.globals = try zcu.gpa.dupe(InternPool.Nav.Index, function.globals.keys());
+    return mir;
+}
+
+fn deinit(cg: *CodeGen) void {
+    const gpa = cg.pt.zcu.gpa;
+    cg.statements.deinit(gpa);
+    cg.live_values.deinit(gpa);
+    {
+        var iter = cg.blocks.valueIterator();
+        while (iter.next()) |block| block.fixups.deinit(gpa);
+        cg.blocks.deinit(gpa);
+    }
+    cg.frame.deinit(gpa);
+    cg.free_frame_slots.deinit(gpa);
+    cg.immediates.deinit(gpa);
+    cg.globals.deinit(gpa);
+    cg.* = undefined;
+}
+
+fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
+    const live = function.live;
+    const pt = function.pt;
+    const zcu = pt.zcu;
+    const ip = &zcu.intern_pool;
+    const air = function.air;
+
     const air_tags: []const Air.Inst.Tag = air.instructions.items(.tag);
     const air_data: []const Air.Inst.Data = air.instructions.items(.data);
-    for (air.getMainBody()) |inst_idx| {
+    for (body) |inst_idx| {
         if (live.isUnused(inst_idx) and !air.mustLower(inst_idx, &pt.zcu.intern_pool))
             continue;
 
         // @Cleanup
+        // errdefer {
         air.dumpInst(inst_idx, pt, live);
         std.debug.print("\n", .{});
+        // }
 
         switch (air_tags[@intFromEnum(inst_idx)]) {
-            else => |air_tag| return function.fail("unimplemented air: {t}", .{air_tag}),
+            else => |air_tag| return function.fail("unimplemented air: {f} {t}", .{ inst_idx, air_tag }),
             .alloc => {
                 const ty = air_data[@intFromEnum(inst_idx)].ty;
                 const qc_ty = try function.getQCType(ty.childType(pt.zcu));
@@ -177,7 +226,7 @@ pub fn generate(
                 if (live.isUnused(inst_idx)) {
                     // Unused mustLower load (e.g. volatile): @Todo perform the
                     // read once discard targets are representable (needs a
-                    // Mir.QValue variant resolving to OFS_NULL; note a 3-word
+                    // Mir.Statement.Arg variant resolving to OFS_NULL; note a 3-word
                     // discard must NOT target OFS_NULL, it would clobber
                     // OFS_RETURN). For now emit nothing.
                 } else {
@@ -279,6 +328,91 @@ pub fn generate(
                 const slot = try function.frameAlloc(.float, .temp);
                 try function.live_values.put(zcu.gpa, inst_idx, .{ .temp = slot });
             },
+            .block => {
+                const ty_pl = air_data[@intFromEnum(inst_idx)].ty_pl;
+                const extra = air.extraData(Air.Block, ty_pl.payload);
+                const block_ty = ty_pl.ty.toType();
+                const block_body: []const Air.Inst.Index = @ptrCast(air.extra.items[extra.end..][0..extra.data.body_len]);
+
+                // The block may have a return value, which is filled by .br instructions in the body
+                const block_result_slot: ?u32 = if (!live.isUnused(inst_idx) and block_ty.hasRuntimeBitsIgnoreComptime(zcu)) blk: {
+                    const slot = try function.frameAlloc(try function.getQCType(block_ty), .temp);
+                    try function.live_values.put(zcu.gpa, inst_idx, .{ .temp = slot });
+                    break :blk slot;
+                } else null;
+
+                try function.blocks.putNoClobber(zcu.gpa, inst_idx, .{
+                    .fixups = .empty,
+                    .result_slot = block_result_slot,
+                });
+                try function.genBody(block_body);
+                const block_end = function.statements.items.len;
+
+                // apply fixups to body
+                var block_data = function.blocks.fetchRemove(inst_idx).?.value;
+                defer block_data.fixups.deinit(zcu.gpa);
+                for (block_data.fixups.items) |fixup_idx| {
+                    const stmt = &function.statements.items[fixup_idx];
+                    switch (stmt.op) {
+                        .goto => stmt.args[0].jump_to_stmt = @intCast(block_end),
+                        else => unreachable,
+                    }
+                }
+            },
+            .br => {
+                const br = air_data[@intFromEnum(inst_idx)].br;
+                const block = function.blocks.getPtr(br.block_inst).?;
+
+                if (block.result_slot) |frame_slot| {
+                    const src = try function.resolveOperand(br.operand);
+                    try function.statements.append(zcu.gpa, .{
+                        .op = .store_f,
+                        .args = .{ src, .{ .local = frame_slot }, .void },
+                    });
+                }
+
+                // emit jump to block end
+                // @Todo omit jump if next statement is the block end,
+                // e.g. we're the second branch in an if-else
+                try function.statements.append(zcu.gpa, .{
+                    .op = .goto,
+                    .args = .{ .{ .jump_to_stmt = 0 }, .void, .void },
+                });
+                // record jump offset needs fixup
+                try block.fixups.append(zcu.gpa, @intCast(function.statements.items.len - 1));
+
+                if (live.operandDies(inst_idx, 0)) try function.killValue(br.operand);
+            },
+            .cond_br => {
+                const pl_op = air_data[@intFromEnum(inst_idx)].pl_op;
+
+                // ifnot condition +then_body_len
+                // then body
+                // goto +else_body_len
+                // else body
+
+                const condition = try function.resolveOperand(pl_op.operand);
+                if (live.operandDies(inst_idx, 0)) try function.killValue(pl_op.operand);
+
+                const extra = air.extraData(Air.CondBr, pl_op.payload);
+                const then_body: []const Air.Inst.Index = @ptrCast(air.extra.items[extra.end..][0..extra.data.then_body_len]);
+                const else_body: []const Air.Inst.Index = @ptrCast(air.extra.items[extra.end + extra.data.then_body_len ..][0..extra.data.else_body_len]);
+                const liveness_cond_br = live.getCondBr(inst_idx);
+
+                const ifnot_idx = function.statements.items.len;
+                try function.statements.append(zcu.gpa, .{
+                    .op = .ifnot,
+                    .args = .{ condition, .{ .jump_to_stmt = 0 }, .void },
+                });
+
+                for (liveness_cond_br.then_deaths) |dead_inst| try function.killValue(dead_inst.toRef());
+                try function.genBody(then_body); // .br instruction in the body will handle jumping past the other branch
+                // fixup the jump offset
+                function.statements.items[ifnot_idx].args[1].jump_to_stmt = @intCast(function.statements.items.len);
+
+                for (liveness_cond_br.else_deaths) |dead_inst| try function.killValue(dead_inst.toRef());
+                try function.genBody(else_body);
+            },
             .ret, .ret_safe => {
                 const un_op = air_data[@intFromEnum(inst_idx)].un_op;
                 if (un_op != .void_value) return function.fail("@Todo handle return values", .{});
@@ -287,34 +421,10 @@ pub fn generate(
                 // meaningless for void functions (and overlaps OFS_RETURN when
                 // args[0] is OFS_NULL).
                 try function.statements.append(zcu.gpa, .{ .op = .done });
+                // No need to kill the operand value because the function is over
             },
         }
     }
-
-    var mir: Mir = .{
-        .statements = &.{}, // assigned after errdefer
-        .locals = &.{}, // assigned after errdefer
-        .immediates = &.{}, // assigned after errdefer
-        .globals = &.{}, // assigned after errdefer
-        .num_params = function.num_params,
-    };
-    errdefer mir.deinit(zcu.gpa);
-    mir.statements = try function.statements.toOwnedSlice(zcu.gpa);
-    mir.locals = try zcu.gpa.dupe(Mir.ValueType, function.frame.items);
-    mir.immediates = try zcu.gpa.dupe(f32, function.immediates.values());
-    mir.globals = try zcu.gpa.dupe(InternPool.Nav.Index, function.globals.keys());
-    return mir;
-}
-
-fn deinit(cg: *CodeGen) void {
-    const gpa = cg.pt.zcu.gpa;
-    cg.statements.deinit(gpa);
-    cg.live_values.deinit(gpa);
-    cg.frame.deinit(gpa);
-    cg.free_frame_slots.deinit(gpa);
-    cg.immediates.deinit(gpa);
-    cg.globals.deinit(gpa);
-    cg.* = undefined;
 }
 
 fn getQCType(cg: CodeGen, ty: Type) !Mir.ValueType {
@@ -340,7 +450,7 @@ fn fail(cg: CodeGen, comptime fmt: []const u8, args: anytype) error{ OutOfMemory
 
 /// Resolves an AIR operand to a MIR statement argument. Instruction results
 /// come from `live_values` and constants are interned into `immediates`.
-fn resolveOperand(cg: *CodeGen, ref: Air.Inst.Ref) !Mir.QValue {
+fn resolveOperand(cg: *CodeGen, ref: Air.Inst.Ref) !Mir.Statement.Arg {
     if (ref.toIndex()) |inst_idx| {
         const in_flight = cg.live_values.get(inst_idx) orelse
             return cg.fail("internal error: no live value for %{d}", .{@intFromEnum(inst_idx)});
@@ -355,7 +465,7 @@ fn resolveOperand(cg: *CodeGen, ref: Air.Inst.Ref) !Mir.QValue {
 
 /// Resolves an AIR pointer operand to a MIR statement argument.
 /// Returns the slot of the pointee.
-fn resolvePtrOperand(cg: *CodeGen, ref: Air.Inst.Ref) !Mir.QValue {
+fn resolvePtrOperand(cg: *CodeGen, ref: Air.Inst.Ref) !Mir.Statement.Arg {
     if (ref.toIndex()) |inst_idx| {
         const in_flight = cg.live_values.get(inst_idx) orelse
             return cg.fail(
@@ -378,7 +488,7 @@ fn resolvePtrOperand(cg: *CodeGen, ref: Air.Inst.Ref) !Mir.QValue {
     return .{ .global = @intCast(gop.index) };
 }
 
-fn toStmtArg(in_flight: ValueSlot) Mir.QValue {
+fn toStmtArg(in_flight: ValueSlot) Mir.Statement.Arg {
     return switch (in_flight) {
         .temp => |slot| .{ .local = slot },
         .local => |slot| .{ .local = slot },
@@ -393,6 +503,7 @@ fn toStmtArg(in_flight: ValueSlot) Mir.QValue {
 /// Passing an interned Value or an already killed live value is a no-op.
 fn killValue(cg: *CodeGen, operand: Air.Inst.Ref) !void {
     const inst_idx = operand.toIndex() orelse return;
+    log.debug("killing value: {f}", .{inst_idx});
     const entry = cg.live_values.fetchSwapRemove(inst_idx) orelse return;
     switch (entry.value) {
         .temp => |slot| try cg.free_frame_slots.append(cg.pt.zcu.gpa, slot),
@@ -406,6 +517,7 @@ fn killValue(cg: *CodeGen, operand: Air.Inst.Ref) !void {
 /// @Todo vectors are explicitly ignored for now and will require a refactor.
 fn frameAlloc(cg: *CodeGen, ty: Mir.ValueType, mode: enum { local, temp }) !u32 {
     assert(ty != .vector);
+    // @Todo this should probably add the slot to live_values too
     if (mode == .temp) {
         if (cg.free_frame_slots.pop()) |slot| {
             cg.frame.items[slot] = ty;

@@ -60,6 +60,8 @@
 // VM builtins need a way to specify which builtin id they bind to. Not sure if callconv is the best way to do that. Maybe a custom @builtin?
 // entity/world fields should be possible with addrspace() syntax.
 
+// @Todo support omitting global/fielddefs when strip flag is true
+
 // Strategy: Generate MIR in CodeGen, only link that MIR here.
 
 const std = @import("std");
@@ -517,11 +519,12 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
     const first_statement: u31 = @intCast(statements.items.len);
 
     // link statements
-    for (mir.statements) |stmt| {
+    for (mir.statements, 0..) |stmt, i| {
         var result: Statement = .{ .op = stmt.op, .args = undefined };
         for (stmt.args, &result.args) |mir_arg, *res_arg| {
             switch (mir_arg) {
                 .void => res_arg.* = 0,
+                .jump_to_stmt => |index| res_arg.* =  @intCast(@as(i64, index) - @as(i64, @intCast(i))), // @Todo handle int out-of-range error
                 // lookup allocated global offset
                 .local => |index| res_arg.* = @intCast(allocated_globals.get(.{ .local = index }).?),
                 .immediate => |index| res_arg.* = @intCast(allocated_globals.get(.{ .immediate = index }).?),
