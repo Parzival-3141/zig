@@ -225,6 +225,60 @@ pub fn generate(
                 });
                 try function.live_values.put(zcu.gpa, inst_idx, .{ .temp = slot });
             },
+            .cmp_gt, .cmp_gte, .cmp_lt, .cmp_lte => |op| {
+                const bin_op = air_data[@intFromEnum(inst_idx)].bin_op;
+
+                const a = try function.resolveOperand(bin_op.lhs);
+                const b = try function.resolveOperand(bin_op.rhs);
+
+                if (live.operandDies(inst_idx, 0)) try function.killValue(bin_op.lhs);
+                if (live.operandDies(inst_idx, 1)) try function.killValue(bin_op.rhs);
+
+                const slot = try function.frameAlloc(.float, .temp);
+                try function.statements.append(zcu.gpa, .{
+                    .op = switch (op) {
+                        .cmp_gt => .gt,
+                        .cmp_gte => .ge,
+                        .cmp_lt => .lt,
+                        .cmp_lte => .le,
+                        else => unreachable,
+                    },
+                    .args = .{ a, b, .{ .local = slot } },
+                });
+                try function.live_values.put(zcu.gpa, inst_idx, .{ .temp = slot });
+            },
+            .bitcast => {
+                const ty_op = air_data[@intFromEnum(inst_idx)].ty_op;
+                // bitcasts are essentially a no-op since all lowered types are the same size.
+                // We only validate the cast makes sense here.
+                // @Todo I'm not 100% sure this correct behavior
+                const wanted_ty = ty_op.ty.toType();
+                const wanted_bitsize = wanted_ty.bitSize(zcu);
+                if (wanted_bitsize > 32) return function.fail(
+                    "@bitCast()-ing values greater than the word size is unsupported (size: {d})",
+                    .{wanted_bitsize},
+                );
+
+                // we still need to track the value though
+                if (live.operandDies(inst_idx, 0)) try function.killValue(ty_op.operand);
+                const slot = try function.frameAlloc(.float, .temp);
+                try function.live_values.put(zcu.gpa, inst_idx, .{ .temp = slot });
+            },
+            .float_from_int => {
+                const ty_op = air_data[@intFromEnum(inst_idx)].ty_op;
+                // float_from_int is also essentially a no-op since ints aren't allowed yet anyway.
+                // We only validate the cast makes sense here.
+                const ty = ty_op.ty.toInterned().?;
+                if (ty != .f32_type) return function.fail(
+                    "only f32s are supported, got {f}",
+                    .{Type.fromInterned(ty).fmt(pt)},
+                );
+
+                // we still need to track the value though
+                if (live.operandDies(inst_idx, 0)) try function.killValue(ty_op.operand);
+                const slot = try function.frameAlloc(.float, .temp);
+                try function.live_values.put(zcu.gpa, inst_idx, .{ .temp = slot });
+            },
             .ret, .ret_safe => {
                 const un_op = air_data[@intFromEnum(inst_idx)].un_op;
                 if (un_op != .void_value) return function.fail("@Todo handle return values", .{});
