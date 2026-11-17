@@ -229,7 +229,8 @@ pub fn build(b: *std.Build) !void {
     exe_options.addOption(bool, "llvm_has_arc", llvm_has_arc);
     exe_options.addOption(bool, "llvm_has_xtensa", llvm_has_xtensa);
     exe_options.addOption(bool, "debug_gpa", debug_gpa);
-    exe_options.addOption(DevEnv, "dev", b.option(DevEnv, "dev", "Build a compiler with a reduced feature set for development of specific features") orelse if (only_c) .bootstrap else .full);
+    const dev_env: DevEnv = b.option(DevEnv, "dev", "Build a compiler with a reduced feature set for development of specific features") orelse if (only_c) .bootstrap else .full;
+    exe_options.addOption(DevEnv, "dev", dev_env);
     exe_options.addOption(ValueInterpretMode, "value_interpret_mode", value_interpret_mode);
 
     if (link_libc) {
@@ -630,6 +631,15 @@ pub fn build(b: *std.Build) !void {
     const test_incremental_step = b.step("test-incremental", "Run the incremental compilation test cases");
     try tests.addIncrementalTests(b, test_incremental_step);
     test_step.dependOn(test_incremental_step);
+
+    const test_quakec_step = b.step("test-quakec", "Run the QuakeC backend behavior tests");
+    @import("test/quakec.zig").add(b, test_quakec_step, .{
+        .compiler_exe = exe,
+        .dev_env = dev_env,
+        .runner_path = b.option([]const u8, "qcvm-runner", "Path to the qcvm-based test runner binary"),
+        .test_filters = test_filters,
+    });
+    if (dev_env == .quakec) test_step.dependOn(test_quakec_step);
 }
 
 fn addWasiUpdateStep(b: *std.Build, version: [:0]const u8) !void {
