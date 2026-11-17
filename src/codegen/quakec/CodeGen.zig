@@ -69,6 +69,16 @@ blocks: std.AutoHashMapUnmanaged(Air.Inst.Index, struct {
     result_slot: ?u32,
 }) = .empty,
 
+/// Record of how `live_values` are modified when emitting a branch.
+/// Use this data to restore the pre-branch state so the peer branch can be emitted correctly.
+branch_undo_stack: std.ArrayList(struct {
+    inst: Air.Inst.Index,
+    slot: ValueSlot,
+    slot_kind: Mir.ValueType,
+    action: enum { created, killed },
+}) = .empty,
+branch_depth: usize = 0,
+
 /// List of value slots in the function "stack" frame.
 /// @Todo vectors are explicitly ignored for now and will require a refactor.
 frame: std.ArrayList(Mir.ValueType) = .empty,
@@ -147,6 +157,7 @@ fn deinit(cg: *CodeGen) void {
         while (iter.next()) |block| block.fixups.deinit(gpa);
         cg.blocks.deinit(gpa);
     }
+    cg.branch_undo_stack.deinit(gpa);
     cg.frame.deinit(gpa);
     cg.free_frame_slots.deinit(gpa);
     cg.immediates.deinit(gpa);
@@ -178,9 +189,7 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
             .alloc => {
                 const ty = air_data[@intFromEnum(inst_idx)].ty;
                 const qc_ty = try function.getQCType(ty.childType(pt.zcu));
-
-                const slot = try function.frameAlloc(qc_ty, .local);
-                try function.live_values.put(zcu.gpa, inst_idx, .{ .local = slot });
+                _ = try function.frameAllocLiveValue(inst_idx, qc_ty, .local);
             },
             .dbg_stmt, .dbg_empty_stmt => {}, // ignored, quakec doesn't support debug info
             .dbg_var_ptr, .dbg_var_val, .dbg_arg_inline => {}, // ignored, quakec doesn't support debug info
@@ -235,12 +244,12 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                     // (e.g. a later store to the source, or a builtin writing
                     // a global).
                     // @UpgradePath alias + materialize-on-hazard removes the move.
-                    const slot = try function.frameAlloc(qc_ty, .temp);
+
+                    const slot = try function.frameAllocLiveValue(inst_idx, qc_ty, .temp);
                     try function.statements.append(zcu.gpa, .{
                         .op = .store_f,
                         .args = .{ src, .{ .local = slot }, .void },
                     });
-                    try function.live_values.put(zcu.gpa, inst_idx, .{ .temp = slot });
                 }
 
                 if (live.operandDies(inst_idx, 0)) try function.killValue(ty_op.operand);
@@ -262,7 +271,7 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 if (live.operandDies(inst_idx, 0)) try function.killValue(bin_op.lhs);
                 if (live.operandDies(inst_idx, 1)) try function.killValue(bin_op.rhs);
 
-                const slot = try function.frameAlloc(qc_ty, .temp);
+                const slot = try function.frameAllocLiveValue(inst_idx, qc_ty, .temp);
                 try function.statements.append(zcu.gpa, .{
                     .op = switch (op) {
                         .add => .add_f,
@@ -272,7 +281,6 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                     },
                     .args = .{ a, b, .{ .local = slot } },
                 });
-                try function.live_values.put(zcu.gpa, inst_idx, .{ .temp = slot });
             },
             .cmp_gt, .cmp_gte, .cmp_lt, .cmp_lte => |op| {
                 const bin_op = air_data[@intFromEnum(inst_idx)].bin_op;
@@ -283,7 +291,7 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 if (live.operandDies(inst_idx, 0)) try function.killValue(bin_op.lhs);
                 if (live.operandDies(inst_idx, 1)) try function.killValue(bin_op.rhs);
 
-                const slot = try function.frameAlloc(.float, .temp);
+                const slot = try function.frameAllocLiveValue(inst_idx, .float, .temp);
                 try function.statements.append(zcu.gpa, .{
                     .op = switch (op) {
                         .cmp_gt => .gt,
@@ -294,7 +302,6 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                     },
                     .args = .{ a, b, .{ .local = slot } },
                 });
-                try function.live_values.put(zcu.gpa, inst_idx, .{ .temp = slot });
             },
             .bitcast => {
                 const ty_op = air_data[@intFromEnum(inst_idx)].ty_op;
@@ -310,8 +317,7 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
 
                 // we still need to track the value though
                 if (live.operandDies(inst_idx, 0)) try function.killValue(ty_op.operand);
-                const slot = try function.frameAlloc(.float, .temp);
-                try function.live_values.put(zcu.gpa, inst_idx, .{ .temp = slot });
+                _ = try function.frameAllocLiveValue(inst_idx, .float, .temp);
             },
             .float_from_int => {
                 const ty_op = air_data[@intFromEnum(inst_idx)].ty_op;
@@ -325,8 +331,7 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
 
                 // we still need to track the value though
                 if (live.operandDies(inst_idx, 0)) try function.killValue(ty_op.operand);
-                const slot = try function.frameAlloc(.float, .temp);
-                try function.live_values.put(zcu.gpa, inst_idx, .{ .temp = slot });
+                _ = try function.frameAllocLiveValue(inst_idx, .float, .temp);
             },
             .block => {
                 const ty_pl = air_data[@intFromEnum(inst_idx)].ty_pl;
@@ -335,11 +340,10 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 const block_body: []const Air.Inst.Index = @ptrCast(air.extra.items[extra.end..][0..extra.data.body_len]);
 
                 // The block may have a return value, which is filled by .br instructions in the body
-                const block_result_slot: ?u32 = if (!live.isUnused(inst_idx) and block_ty.hasRuntimeBitsIgnoreComptime(zcu)) blk: {
-                    const slot = try function.frameAlloc(try function.getQCType(block_ty), .temp);
-                    try function.live_values.put(zcu.gpa, inst_idx, .{ .temp = slot });
-                    break :blk slot;
-                } else null;
+                const block_result_slot: ?u32 = if (!live.isUnused(inst_idx) and block_ty.hasRuntimeBitsIgnoreComptime(zcu))
+                    try function.frameAllocLiveValue(inst_idx, try function.getQCType(block_ty), .temp)
+                else
+                    null;
 
                 try function.blocks.putNoClobber(zcu.gpa, inst_idx, .{
                     .fixups = .empty,
@@ -405,13 +409,24 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                     .args = .{ condition, .{ .jump_to_stmt = 0 }, .void },
                 });
 
+                const undo_start = function.branch_undo_stack.items.len;
+                function.branch_depth += 1;
+
                 for (liveness_cond_br.then_deaths) |dead_inst| try function.killValue(dead_inst.toRef());
                 try function.genBody(then_body); // .br instruction in the body will handle jumping past the other branch
                 // fixup the jump offset
                 function.statements.items[ifnot_idx].args[1].jump_to_stmt = @intCast(function.statements.items.len);
 
+                try function.restoreLiveValues(undo_start);
+                function.branch_undo_stack.shrinkRetainingCapacity(undo_start);
+                function.branch_depth -= 1;
+
                 for (liveness_cond_br.else_deaths) |dead_inst| try function.killValue(dead_inst.toRef());
                 try function.genBody(else_body);
+
+                // We may still be inside an outer branch, meaning the else body also appended to the undo stack,
+                // so we need to discard those undos too.
+                function.branch_undo_stack.shrinkRetainingCapacity(undo_start);
             },
             .ret, .ret_safe => {
                 const un_op = air_data[@intFromEnum(inst_idx)].un_op;
@@ -505,19 +520,85 @@ fn killValue(cg: *CodeGen, operand: Air.Inst.Ref) !void {
     const inst_idx = operand.toIndex() orelse return;
     log.debug("killing value: {f}", .{inst_idx});
     const entry = cg.live_values.fetchSwapRemove(inst_idx) orelse return;
+    if (cg.branch_depth > 0) {
+        try cg.branch_undo_stack.append(cg.pt.zcu.gpa, .{
+            .inst = inst_idx,
+            .slot = entry.value,
+            .slot_kind = switch (entry.value) {
+                .temp, .local => |slot| cg.frame.items[slot],
+                .global => @panic("@Incomplete"),
+            },
+            .action = .killed,
+        });
+    }
     switch (entry.value) {
         .temp => |slot| try cg.free_frame_slots.append(cg.pt.zcu.gpa, slot),
         .local, .global => {},
     }
 }
 
+fn saveLiveValue(
+    cg: *CodeGen,
+    inst_idx: Air.Inst.Index,
+    slot: ValueSlot,
+    kind: Mir.ValueType,
+) !void {
+    try cg.live_values.putNoClobber(cg.pt.zcu.gpa, inst_idx, slot);
+    if (cg.branch_depth > 0)
+        try cg.branch_undo_stack.append(cg.pt.zcu.gpa, .{
+            .inst = inst_idx,
+            .slot = slot,
+            .slot_kind = kind,
+            .action = .created,
+        });
+}
+
+fn restoreLiveValues(cg: *CodeGen, undo_start: usize) !void {
+    if (undo_start >= cg.branch_undo_stack.items.len) return;
+    for (0..cg.branch_undo_stack.items.len - undo_start) |_| {
+        const entry = cg.branch_undo_stack.pop().?;
+
+        // Local branch slots are not restored/recycled here, even though they could be.
+        // Recycling them would save frame space for other variables outside the branch,
+        // but then we could have multiple globaldefs referencing the same memory location,
+        // on top of creating another edge case. It's a trade off between simplicity and space savings.
+
+        // reverse the recorded action
+        switch (entry.action) {
+            .created => switch (entry.slot) {
+                .temp => |slot| {
+                    assert(std.meta.eql(cg.live_values.fetchSwapRemove(entry.inst).?.value, entry.slot));
+                    assert(cg.frame.items[slot] == entry.slot_kind);
+                    try cg.free_frame_slots.append(cg.pt.zcu.gpa, slot);
+                },
+                .local, .global => {}, // these slots are permanently allocated
+            },
+            .killed => {
+                try cg.live_values.putNoClobber(cg.pt.zcu.gpa, entry.inst, entry.slot);
+                switch (entry.slot) {
+                    .temp => |slot| {
+                        cg.frame.items[slot] = entry.slot_kind;
+                        for (cg.free_frame_slots.items, 0..) |free, i| {
+                            if (free == slot) {
+                                _ = cg.free_frame_slots.swapRemove(i);
+                                break;
+                            }
+                        } else unreachable;
+                    },
+                    .local, .global => {}, // these slots are permanently allocated
+                }
+            },
+        }
+    }
+}
+
+const FrameAllocMode = enum { local, temp };
 /// Returns a frame slot for a value to live in.
 /// If in temp mode: allocates or reuses a recyclable slot for an intermediate value.
 /// If in local mode: allocates a permanent slot for a variable, doesn't reuse slots.
 /// @Todo vectors are explicitly ignored for now and will require a refactor.
-fn frameAlloc(cg: *CodeGen, ty: Mir.ValueType, mode: enum { local, temp }) !u32 {
+fn frameAlloc(cg: *CodeGen, ty: Mir.ValueType, mode: FrameAllocMode) !u32 {
     assert(ty != .vector);
-    // @Todo this should probably add the slot to live_values too
     if (mode == .temp) {
         if (cg.free_frame_slots.pop()) |slot| {
             cg.frame.items[slot] = ty;
@@ -526,4 +607,20 @@ fn frameAlloc(cg: *CodeGen, ty: Mir.ValueType, mode: enum { local, temp }) !u32 
     }
     try cg.frame.append(cg.pt.zcu.gpa, ty);
     return @intCast(cg.frame.items.len - 1);
+}
+
+/// See `frameAlloc()` and `saveLiveValue()`
+fn frameAllocLiveValue(
+    cg: *CodeGen,
+    inst: Air.Inst.Index,
+    ty: Mir.ValueType,
+    mode: FrameAllocMode,
+) !u32 {
+    const slot = try cg.frameAlloc(ty, mode);
+    try cg.saveLiveValue(
+        inst,
+        if (mode == .temp) .{ .temp = slot } else .{ .local = slot },
+        ty,
+    );
+    return slot;
 }
