@@ -127,9 +127,7 @@ pub fn generate(
     };
     defer function.deinit();
 
-    // @Cleanup
-    // air.dump(pt, function.live);
-    // std.debug.print("\n\nstarting codegen:\n", .{});
+    log.debug("{f}\n\nstarting codegen:", .{AirDump{ .cg = &function }});
 
     try function.genBody(air.getMainBody());
 
@@ -178,10 +176,8 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
         if (live.isUnused(inst_idx) and !air.mustLower(inst_idx, &pt.zcu.intern_pool))
             continue;
 
-        // @Cleanup
         // errdefer {
-        air.dumpInst(inst_idx, pt, live);
-        std.debug.print("\n", .{});
+        log.debug("{f}", .{AirDump{ .cg = function, .inst = inst_idx }});
         // }
 
         switch (air_tags[@intFromEnum(inst_idx)]) {
@@ -624,3 +620,14 @@ fn frameAllocLiveValue(
     );
     return slot;
 }
+
+const AirDump = struct {
+    cg: *const CodeGen,
+    inst: ?Air.Inst.Index = null,
+    pub fn format(d: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (d.inst) |inst|
+            d.cg.air.writeInst(w, inst, d.cg.pt, d.cg.live)
+        else
+            d.cg.air.write(w, d.cg.pt, d.cg.live);
+    }
+};
