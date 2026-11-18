@@ -408,7 +408,9 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 const undo_start = function.branch_undo_stack.items.len;
                 function.branch_depth += 1;
 
+                log.debug("then_deaths:", .{});
                 for (liveness_cond_br.then_deaths) |dead_inst| try function.killValue(dead_inst.toRef());
+                log.debug("end_then_deaths", .{});
                 try function.genBody(then_body); // .br instruction in the body will handle jumping past the other branch
                 // fixup the jump offset
                 function.statements.items[ifnot_idx].args[1].jump_to_stmt = @intCast(function.statements.items.len);
@@ -417,7 +419,9 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 function.branch_undo_stack.shrinkRetainingCapacity(undo_start);
                 function.branch_depth -= 1;
 
+                log.debug("else_deaths:", .{});
                 for (liveness_cond_br.else_deaths) |dead_inst| try function.killValue(dead_inst.toRef());
+                log.debug("end_else_deaths", .{});
                 try function.genBody(else_body);
 
                 // We may still be inside an outer branch, meaning the else body also appended to the undo stack,
@@ -558,6 +562,8 @@ fn restoreLiveValues(cg: *CodeGen, undo_start: usize) !void {
         // Recycling them would save frame space for other variables outside the branch,
         // but then we could have multiple globaldefs referencing the same memory location,
         // on top of creating another edge case. It's a trade off between simplicity and space savings.
+
+        log.debug("undo {t}: {f}", .{ entry.action, entry.inst });
 
         // reverse the recorded action
         switch (entry.action) {
