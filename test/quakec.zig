@@ -7,6 +7,7 @@ const CaseSet = struct {
     name: []const u8,
     source: []const u8,
     cases: []const Case,
+    disabled: bool = false,
 };
 
 /// Behavior test cases.
@@ -288,6 +289,34 @@ pub const case_sets = [_]CaseSet{
             .{ .input = -1, .expected = 2 },
         },
     },
+    .{
+        .disabled = true,
+        .name = "stuff",
+        .source =
+        \\const x: f32 = 2;
+        \\var input: f32 = 0;
+        \\var result: f32 = 0;
+        \\
+        \\export fn main() void {
+        \\    const t: f32 = input;
+        \\    var s: f32 = 2.5 * (t * t);
+        \\    s *= 0.5;
+        \\    s += x * t;
+        \\    result = s;
+        \\
+        \\    const cond: bool = result > 20;
+        \\    result = if (cond) 
+        \\        @floatFromInt(@intFromBool( cond))
+        \\    else 
+        \\        input;
+        \\}
+        ,
+        .cases = &.{
+            .{ .input = 0, .expected = 0 },
+            .{ .input = 2, .expected = 2 },
+            .{ .input = 4, .expected = 1 },
+        },
+    },
 };
 
 pub fn add(
@@ -316,6 +345,7 @@ pub fn add(
 
     const wf = b.addWriteFiles();
     for (case_sets) |set| {
+        if (set.disabled) continue;
         for (opts.test_filters) |filter| {
             if (std.mem.indexOf(u8, set.name, filter) != null) break;
         } else if (opts.test_filters.len > 0) continue; // name does not match any filter
@@ -323,6 +353,7 @@ pub fn add(
         const src = wf.add(b.fmt("cases/{s}.zig", .{set.name}), set.source);
         const compile = b.addRunArtifact(opts.compiler_exe);
         compile.addArgs(&.{ "build-exe", "-fno-llvm", "-fno-lld", "-target", "quakec-freestanding" });
+        // compile.addArgs(&.{ "--debug-log", "codegen" });
         compile.addFileArg(src);
         compile.addArgs(&.{ "--name", set.name });
         const dat = compile.addPrefixedOutputFileArg("-femit-bin=", b.fmt("{s}.dat", .{set.name}));

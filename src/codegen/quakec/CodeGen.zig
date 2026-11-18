@@ -301,33 +301,41 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
             },
             .bitcast => {
                 const ty_op = air_data[@intFromEnum(inst_idx)].ty_op;
-                // bitcasts are essentially a no-op since all lowered types are the same size.
-                // We only validate the cast makes sense here.
-                // @Todo I'm not 100% sure this correct behavior
                 const wanted_ty = ty_op.ty.toType();
                 const wanted_bitsize = wanted_ty.bitSize(zcu);
                 if (wanted_bitsize > 32) return function.fail(
-                    "@bitCast()-ing values greater than the word size is unsupported (size: {d})",
+                    "@bitCast()-ing values greater than 32 bits is unsupported (size: {d})",
                     .{wanted_bitsize},
                 );
 
-                // we still need to track the value though
+                const qc_ty = try function.getQCType(wanted_ty);
+
+                // @Todo bitcasts should be a no-op since all lowered types are the same size,
+                // but we need to adhere to the live_value semantics which requires a move.
+                // Same move policy as .load, save to temp so in-flight value isn't clobbered
+                // @UpgradePath alias + materialize-on-hazard removes the move.
+                const src = try function.resolveOperand(ty_op.operand);
                 if (live.operandDies(inst_idx, 0)) try function.killValue(ty_op.operand);
-                _ = try function.frameAllocLiveValue(inst_idx, .float, .temp);
+
+                const slot = try function.frameAllocLiveValue(inst_idx, qc_ty, .temp);
+                try function.statements.append(zcu.gpa, .{
+                    .op = .store_f,
+                    .args = .{ src, .{ .local = slot }, .void },
+                });
             },
             .float_from_int => {
                 const ty_op = air_data[@intFromEnum(inst_idx)].ty_op;
-                // float_from_int is also essentially a no-op since ints aren't allowed yet anyway.
-                // We only validate the cast makes sense here.
                 const ty = ty_op.ty.toInterned().?;
                 if (ty != .f32_type) return function.fail(
                     "only f32s are supported, got {f}",
                     .{Type.fromInterned(ty).fmt(pt)},
                 );
 
-                // we still need to track the value though
-                if (live.operandDies(inst_idx, 0)) try function.killValue(ty_op.operand);
-                _ = try function.frameAllocLiveValue(inst_idx, .float, .temp);
+                // @Todo the plan for ints is either to ban them outright (breaking a lot of the language)
+                // or require them to be logically representable as f32s (u24 and i25 max). In-bounds int
+                // math should work fine, and f32/i25/u24 casts are implicit in >=0.16.0!
+                // I like the second option, but until then this is illegal behavior.
+                return function.fail("integers are not implemented yet: {f} {t}", .{ inst_idx, Air.Inst.Tag.float_from_int });
             },
             .block => {
                 const ty_pl = air_data[@intFromEnum(inst_idx)].ty_pl;
@@ -459,6 +467,7 @@ fn isValidQCType(ty: Type) bool {
 
 fn fail(cg: CodeGen, comptime fmt: []const u8, args: anytype) error{ OutOfMemory, CodegenFail } {
     const zcu = cg.pt.zcu;
+    // @Todo show the line we failed on, not just the function
     const func = zcu.funcInfo(cg.func_index);
     return zcu.codegenFail(func.owner_nav, fmt, args);
 }

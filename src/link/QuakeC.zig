@@ -524,7 +524,7 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
         for (stmt.args, &result.args) |mir_arg, *res_arg| {
             switch (mir_arg) {
                 .void => res_arg.* = 0,
-                .jump_to_stmt => |index| res_arg.* =  @intCast(@as(i64, index) - @as(i64, @intCast(i))), // @Todo handle int out-of-range error
+                .jump_to_stmt => |index| res_arg.* = @intCast(@as(i64, index) - @as(i64, @intCast(i))), // @Todo handle int out-of-range error
                 // lookup allocated global offset
                 .local => |index| res_arg.* = @intCast(allocated_globals.get(.{ .local = index }).?),
                 .immediate => |index| res_arg.* = @intCast(allocated_globals.get(.{ .immediate = index }).?),
