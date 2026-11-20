@@ -12,17 +12,17 @@ map: std.AutoArrayHashMapUnmanaged(void, void) = .empty,
 items: std.MultiArrayList(struct {
     tag: Tag,
     data: u32,
-}) = .{},
-extra: std.ArrayListUnmanaged(u32) = .empty,
-limbs: std.ArrayListUnmanaged(Limb) = .empty,
-strings: std.ArrayListUnmanaged(u8) = .empty,
+}) = .empty,
+extra: std.ArrayList(u32) = .empty,
+limbs: std.ArrayList(Limb) = .empty,
+strings: std.ArrayList(u8) = .empty,
 
 const KeyAdapter = struct {
     interner: *const Interner,
 
     pub fn eql(adapter: KeyAdapter, a: Key, b_void: void, b_map_index: usize) bool {
         _ = b_void;
-        return adapter.interner.get(@as(Ref, @enumFromInt(b_map_index))).eql(a);
+        return adapter.interner.get(@as(Ref, @fromBackingInt(@intCast(b_map_index)))).eql(a);
     }
 
     pub fn hash(adapter: KeyAdapter, a: Key) u32 {
@@ -65,6 +65,7 @@ pub const Key = union(enum) {
     float: Float,
     complex: Complex,
     bytes: []const u8,
+    pointer: Pointer,
 
     pub const Float = union(enum) {
         f16: f16,
@@ -79,6 +80,12 @@ pub const Key = union(enum) {
         cf64: [2]f64,
         cf80: [2]f80,
         cf128: [2]f128,
+    };
+    pub const Pointer = struct {
+        /// NodeIndex of decl or compound literal whose address we are offsetting from
+        node: u32,
+        /// Offset in bytes
+        offset: Ref,
     };
 
     pub fn hash(key: Key) u32 {
@@ -95,13 +102,13 @@ pub const Key = union(enum) {
             .float => |repr| switch (repr) {
                 inline else => |data| std.hash.autoHash(
                     &hasher,
-                    @as(std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(data))), @bitCast(data)),
+                    @as(@Int(.unsigned, @bitSizeOf(@TypeOf(data))), @bitCast(data)),
                 ),
             },
             .complex => |repr| switch (repr) {
                 inline else => |data| std.hash.autoHash(
                     &hasher,
-                    @as(std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(data))), @bitCast(data)),
+                    @as(@Int(.unsigned, @bitSizeOf(@TypeOf(data))), @bitCast(data)),
                 ),
             },
             .int => |repr| {
@@ -198,6 +205,10 @@ pub const Key = union(enum) {
             else => {},
         }
         return null;
+    }
+
+    pub fn toBigInt(key: Key, space: *Tag.Int.BigIntSpace) BigIntConst {
+        return key.int.toBigInt(space);
     }
 };
 
@@ -303,6 +314,8 @@ pub const Tag = enum(u8) {
     bytes,
     /// `data` is `Record`
     record_ty,
+    /// `data` is Pointer
+    pointer,
 
     pub const Array = struct {
         len0: u32,
@@ -320,6 +333,11 @@ pub const Tag = enum(u8) {
     pub const Vector = struct {
         len: u32,
         child: Ref,
+    };
+
+    pub const Pointer = struct {
+        node: u32,
+        offset: Ref,
     };
 
     pub const Int = struct {
@@ -564,7 +582,7 @@ pub fn put(i: *Interner, gpa: Allocator, key: Key) !Ref {
     if (key.toRef()) |some| return some;
     const adapter: KeyAdapter = .{ .interner = i };
     const gop = try i.map.getOrPutAdapted(gpa, key, adapter);
-    if (gop.found_existing) return @enumFromInt(gop.index);
+    if (gop.found_existing) return @fromBackingInt(@intCast(gop.index));
     try i.items.ensureUnusedCapacity(gpa, 1);
 
     switch (key) {
@@ -603,6 +621,15 @@ pub fn put(i: *Interner, gpa: Allocator, key: Key) !Ref {
                 .data = try i.addExtra(gpa, Tag.Vector{
                     .len = info.len,
                     .child = info.child,
+                }),
+            });
+        },
+        .pointer => |info| {
+            i.items.appendAssumeCapacity(.{
+                .tag = .pointer,
+                .data = try i.addExtra(gpa, Tag.Pointer{
+                    .node = info.node,
+                    .offset = info.offset,
                 }),
             });
         },
@@ -706,7 +733,7 @@ pub fn put(i: *Interner, gpa: Allocator, key: Key) !Ref {
             });
         },
         .record_ty => |elems| {
-            try i.extra.ensureUnusedCapacity(gpa, @typeInfo(Tag.Record).@"struct".fields.len +
+            try i.extra.ensureUnusedCapacity(gpa, @typeInfo(Tag.Record).@"struct".field_names.len +
                 elems.len);
             i.items.appendAssumeCapacity(.{
                 .tag = .record_ty,
@@ -724,22 +751,23 @@ pub fn put(i: *Interner, gpa: Allocator, key: Key) !Ref {
         => unreachable,
     }
 
-    return @enumFromInt(gop.index);
+    return @fromBackingInt(@intCast(gop.index));
 }
 
 fn addExtra(i: *Interner, gpa: Allocator, extra: anytype) Allocator.Error!u32 {
-    const fields = @typeInfo(@TypeOf(extra)).@"struct".fields;
-    try i.extra.ensureUnusedCapacity(gpa, fields.len);
+    const field_count = @typeInfo(@TypeOf(extra)).@"struct".field_names.len;
+    try i.extra.ensureUnusedCapacity(gpa, field_count);
     return i.addExtraAssumeCapacity(extra);
 }
 
 fn addExtraAssumeCapacity(i: *Interner, extra: anytype) u32 {
     const result = @as(u32, @intCast(i.extra.items.len));
-    inline for (@typeInfo(@TypeOf(extra)).@"struct".fields) |field| {
-        i.extra.appendAssumeCapacity(switch (field.type) {
-            Ref => @intFromEnum(@field(extra, field.name)),
-            u32 => @field(extra, field.name),
-            else => @compileError("bad field type: " ++ @typeName(field.type)),
+    const info = @typeInfo(@TypeOf(extra)).@"struct";
+    inline for (info.field_names, info.field_types) |field_name, field_type| {
+        i.extra.appendAssumeCapacity(switch (field_type) {
+            Ref => @backingInt(@field(extra, field_name)),
+            u32 => @field(extra, field_name),
+            else => @compileError("bad field type: " ++ @typeName(field_type)),
         });
     }
     return result;
@@ -772,7 +800,7 @@ pub fn get(i: *const Interner, ref: Ref) Key {
         else => {},
     }
 
-    const item = i.items.get(@intFromEnum(ref));
+    const item = i.items.get(@backingInt(ref));
     const data = item.data;
     return switch (item.tag) {
         .int_ty => .{ .int_ty = @intCast(data) },
@@ -790,6 +818,13 @@ pub fn get(i: *const Interner, ref: Ref) Key {
             return .{ .vector_ty = .{
                 .len = vector_ty.len,
                 .child = vector_ty.child,
+            } };
+        },
+        .pointer => {
+            const pointer = i.extraData(Tag.Pointer, data);
+            return .{ .pointer = .{
+                .node = pointer.node,
+                .offset = pointer.offset,
             } };
         },
         .u32 => .{ .int = .{ .u64 = data } },
@@ -857,17 +892,17 @@ fn extraData(i: *const Interner, comptime T: type, index: usize) T {
 
 fn extraDataTrail(i: *const Interner, comptime T: type, index: usize) struct { data: T, end: u32 } {
     var result: T = undefined;
-    const fields = @typeInfo(T).@"struct".fields;
-    inline for (fields, 0..) |field, field_i| {
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types, 0..) |field_name, field_type, field_i| {
         const int32 = i.extra.items[field_i + index];
-        @field(result, field.name) = switch (field.type) {
-            Ref => @enumFromInt(int32),
+        @field(result, field_name) = switch (field_type) {
+            Ref => @fromBackingInt(int32),
             u32 => int32,
-            else => @compileError("bad field type: " ++ @typeName(field.type)),
+            else => @compileError("bad field type: " ++ @typeName(field_type)),
         };
     }
     return .{
         .data = result,
-        .end = @intCast(index + fields.len),
+        .end = @intCast(index + info.field_names.len),
     };
 }

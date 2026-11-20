@@ -38,8 +38,8 @@ project(zig
 )
 
 set(ZIG_VERSION_MAJOR 0)
-set(ZIG_VERSION_MINOR 15)
-set(ZIG_VERSION_PATCH 2)
+set(ZIG_VERSION_MINOR 17)
+set(ZIG_VERSION_PATCH 1)
 set(ZIG_VERSION "" CACHE STRING "Override Zig version string. Default is to find out with git.")
 
 if("${ZIG_VERSION}" STREQUAL "")
@@ -133,9 +133,9 @@ else()
     set(ZIG_SYSTEM_LIBCXX "stdc++" CACHE STRING "system libcxx name for build.zig")
 endif()
 
-find_package(llvm 20)
-find_package(clang 20)
-find_package(lld 20)
+find_package(llvm 22)
+find_package(clang 22)
+find_package(lld 22)
 
 if(ZIG_STATIC_ZLIB)
     if (MSVC)
@@ -197,7 +197,6 @@ set(ZIG_CPP_SOURCES
     # These are planned to stay even when we are self-hosted.
     src/zig_llvm.cpp
     src/zig_llvm-ar.cpp
-    src/zig_clang.cpp
     src/zig_clang_driver.cpp
     src/zig_clang_cc1_main.cpp
     src/zig_clang_cc1as_main.cpp
@@ -206,183 +205,6 @@ set(ZIG_CPP_SOURCES
 set(ZIG_STAGE2_SOURCES
     "${ZIG_CONFIG_ZIG_OUT}"
     lib/compiler_rt.zig
-    lib/compiler_rt/absv.zig
-    lib/compiler_rt/absvdi2.zig
-    lib/compiler_rt/absvsi2.zig
-    lib/compiler_rt/absvti2.zig
-    lib/compiler_rt/adddf3.zig
-    lib/compiler_rt/addf3.zig
-    lib/compiler_rt/addo.zig
-    lib/compiler_rt/addsf3.zig
-    lib/compiler_rt/addtf3.zig
-    lib/compiler_rt/addvsi3.zig
-    lib/compiler_rt/addxf3.zig
-    lib/compiler_rt/arm.zig
-    lib/compiler_rt/atomics.zig
-    lib/compiler_rt/aulldiv.zig
-    lib/compiler_rt/aullrem.zig
-    lib/compiler_rt/bswap.zig
-    lib/compiler_rt/ceil.zig
-    lib/compiler_rt/clear_cache.zig
-    lib/compiler_rt/cmp.zig
-    lib/compiler_rt/cmpdf2.zig
-    lib/compiler_rt/cmpsf2.zig
-    lib/compiler_rt/cmptf2.zig
-    lib/compiler_rt/cmpxf2.zig
-    lib/compiler_rt/common.zig
-    lib/compiler_rt/comparef.zig
-    lib/compiler_rt/cos.zig
-    lib/compiler_rt/count0bits.zig
-    lib/compiler_rt/divdf3.zig
-    lib/compiler_rt/divsf3.zig
-    lib/compiler_rt/divtf3.zig
-    lib/compiler_rt/divti3.zig
-    lib/compiler_rt/divxf3.zig
-    lib/compiler_rt/emutls.zig
-    lib/compiler_rt/exp.zig
-    lib/compiler_rt/exp2.zig
-    lib/compiler_rt/extenddftf2.zig
-    lib/compiler_rt/extenddfxf2.zig
-    lib/compiler_rt/extendf.zig
-    lib/compiler_rt/extendhfsf2.zig
-    lib/compiler_rt/extendhftf2.zig
-    lib/compiler_rt/extendhfxf2.zig
-    lib/compiler_rt/extendsfdf2.zig
-    lib/compiler_rt/extendsftf2.zig
-    lib/compiler_rt/extendsfxf2.zig
-    lib/compiler_rt/extendxftf2.zig
-    lib/compiler_rt/fabs.zig
-    lib/compiler_rt/fixdfdi.zig
-    lib/compiler_rt/fixdfsi.zig
-    lib/compiler_rt/fixdfti.zig
-    lib/compiler_rt/fixhfdi.zig
-    lib/compiler_rt/fixhfsi.zig
-    lib/compiler_rt/fixhfti.zig
-    lib/compiler_rt/fixsfdi.zig
-    lib/compiler_rt/fixsfsi.zig
-    lib/compiler_rt/fixsfti.zig
-    lib/compiler_rt/fixtfdi.zig
-    lib/compiler_rt/fixtfsi.zig
-    lib/compiler_rt/fixtfti.zig
-    lib/compiler_rt/fixunsdfdi.zig
-    lib/compiler_rt/fixunsdfsi.zig
-    lib/compiler_rt/fixunsdfti.zig
-    lib/compiler_rt/fixunshfdi.zig
-    lib/compiler_rt/fixunshfsi.zig
-    lib/compiler_rt/fixunshfti.zig
-    lib/compiler_rt/fixunssfdi.zig
-    lib/compiler_rt/fixunssfsi.zig
-    lib/compiler_rt/fixunssfti.zig
-    lib/compiler_rt/fixunstfdi.zig
-    lib/compiler_rt/fixunstfsi.zig
-    lib/compiler_rt/fixunstfti.zig
-    lib/compiler_rt/fixunsxfdi.zig
-    lib/compiler_rt/fixunsxfsi.zig
-    lib/compiler_rt/fixunsxfti.zig
-    lib/compiler_rt/fixxfdi.zig
-    lib/compiler_rt/fixxfsi.zig
-    lib/compiler_rt/fixxfti.zig
-    lib/compiler_rt/float_from_int.zig
-    lib/compiler_rt/floatdidf.zig
-    lib/compiler_rt/floatdihf.zig
-    lib/compiler_rt/floatdisf.zig
-    lib/compiler_rt/floatditf.zig
-    lib/compiler_rt/floatdixf.zig
-    lib/compiler_rt/floatsidf.zig
-    lib/compiler_rt/floatsihf.zig
-    lib/compiler_rt/floatsisf.zig
-    lib/compiler_rt/floatsitf.zig
-    lib/compiler_rt/floatsixf.zig
-    lib/compiler_rt/floattidf.zig
-    lib/compiler_rt/floattihf.zig
-    lib/compiler_rt/floattisf.zig
-    lib/compiler_rt/floattitf.zig
-    lib/compiler_rt/floattixf.zig
-    lib/compiler_rt/floatundidf.zig
-    lib/compiler_rt/floatundihf.zig
-    lib/compiler_rt/floatundisf.zig
-    lib/compiler_rt/floatunditf.zig
-    lib/compiler_rt/floatundixf.zig
-    lib/compiler_rt/floatunsidf.zig
-    lib/compiler_rt/floatunsihf.zig
-    lib/compiler_rt/floatunsisf.zig
-    lib/compiler_rt/floatunsitf.zig
-    lib/compiler_rt/floatunsixf.zig
-    lib/compiler_rt/floatuntidf.zig
-    lib/compiler_rt/floatuntihf.zig
-    lib/compiler_rt/floatuntisf.zig
-    lib/compiler_rt/floatuntitf.zig
-    lib/compiler_rt/floatuntixf.zig
-    lib/compiler_rt/floor.zig
-    lib/compiler_rt/fma.zig
-    lib/compiler_rt/fmax.zig
-    lib/compiler_rt/fmin.zig
-    lib/compiler_rt/fmod.zig
-    lib/compiler_rt/gedf2.zig
-    lib/compiler_rt/gesf2.zig
-    lib/compiler_rt/getf2.zig
-    lib/compiler_rt/gexf2.zig
-    lib/compiler_rt/int.zig
-    lib/compiler_rt/int_from_float.zig
-    lib/compiler_rt/log.zig
-    lib/compiler_rt/log10.zig
-    lib/compiler_rt/log2.zig
-    lib/compiler_rt/modti3.zig
-    lib/compiler_rt/mulXi3.zig
-    lib/compiler_rt/muldf3.zig
-    lib/compiler_rt/mulf3.zig
-    lib/compiler_rt/mulo.zig
-    lib/compiler_rt/mulsf3.zig
-    lib/compiler_rt/multf3.zig
-    lib/compiler_rt/mulvsi3.zig
-    lib/compiler_rt/mulxf3.zig
-    lib/compiler_rt/negXi2.zig
-    lib/compiler_rt/negdf2.zig
-    lib/compiler_rt/negsf2.zig
-    lib/compiler_rt/negtf2.zig
-    lib/compiler_rt/negv.zig
-    lib/compiler_rt/negxf2.zig
-    lib/compiler_rt/os_version_check.zig
-    lib/compiler_rt/parity.zig
-    lib/compiler_rt/popcount.zig
-    lib/compiler_rt/rem_pio2.zig
-    lib/compiler_rt/rem_pio2_large.zig
-    lib/compiler_rt/rem_pio2f.zig
-    lib/compiler_rt/round.zig
-    lib/compiler_rt/shift.zig
-    lib/compiler_rt/sin.zig
-    lib/compiler_rt/sincos.zig
-    lib/compiler_rt/sqrt.zig
-    lib/compiler_rt/stack_probe.zig
-    lib/compiler_rt/subdf3.zig
-    lib/compiler_rt/subo.zig
-    lib/compiler_rt/subsf3.zig
-    lib/compiler_rt/subtf3.zig
-    lib/compiler_rt/subvdi3.zig
-    lib/compiler_rt/subvsi3.zig
-    lib/compiler_rt/subxf3.zig
-    lib/compiler_rt/tan.zig
-    lib/compiler_rt/trig.zig
-    lib/compiler_rt/trunc.zig
-    lib/compiler_rt/truncdfhf2.zig
-    lib/compiler_rt/truncdfsf2.zig
-    lib/compiler_rt/truncf.zig
-    lib/compiler_rt/truncsfhf2.zig
-    lib/compiler_rt/trunctfdf2.zig
-    lib/compiler_rt/trunctfhf2.zig
-    lib/compiler_rt/trunctfsf2.zig
-    lib/compiler_rt/trunctfxf2.zig
-    lib/compiler_rt/truncxfdf2.zig
-    lib/compiler_rt/truncxfhf2.zig
-    lib/compiler_rt/truncxfsf2.zig
-    lib/compiler_rt/udivmod.zig
-    lib/compiler_rt/udivmodei4.zig
-    lib/compiler_rt/udivmodti4.zig
-    lib/compiler_rt/udivti3.zig
-    lib/compiler_rt/umodti3.zig
-    lib/compiler_rt/unorddf2.zig
-    lib/compiler_rt/unordsf2.zig
-    lib/compiler_rt/unordtf2.zig
     lib/std/BitStack.zig
     lib/std/Build.zig
     lib/std/Build/Cache.zig
@@ -411,18 +233,14 @@ set(ZIG_STAGE2_SOURCES
     lib/std/Target/wasm.zig
     lib/std/Target/x86.zig
     lib/std/Thread.zig
-    lib/std/Thread/Futex.zig
-    lib/std/Thread/Mutex.zig
-    lib/std/Thread/Pool.zig
-    lib/std/Thread/ResetEvent.zig
-    lib/std/Thread/WaitGroup.zig
     lib/std/array_hash_map.zig
     lib/std/array_list.zig
     lib/std/ascii.zig
     lib/std/atomic.zig
     lib/std/base64.zig
     lib/std/buf_map.zig
-    lib/std/builtin.zig
+    lib/std/lang.zig
+    lib/std/lang/assembly.zig
     lib/std/c.zig
     lib/std/coff.zig
     lib/std/crypto.zig
@@ -440,17 +258,13 @@ set(ZIG_STAGE2_SOURCES
     lib/std/fmt.zig
     lib/std/fmt/parse_float.zig
     lib/std/fs.zig
-    lib/std/fs/AtomicFile.zig
-    lib/std/fs/Dir.zig
-    lib/std/fs/File.zig
-    lib/std/fs/get_app_data_dir.zig
     lib/std/fs/path.zig
     lib/std/hash.zig
     lib/std/hash/auto_hash.zig
     lib/std/hash/wyhash.zig
     lib/std/hash_map.zig
     lib/std/heap.zig
-    lib/std/heap/arena_allocator.zig
+    lib/std/heap/ArenaAllocator.zig
     lib/std/json.zig
     lib/std/leb128.zig
     lib/std/log.zig
@@ -502,7 +316,6 @@ set(ZIG_STAGE2_SOURCES
     lib/std/zig/Server.zig
     lib/std/zig/WindowsSdk.zig
     lib/std/zig/Zir.zig
-    lib/std/zig/c_builtins.zig
     lib/std/zig/string_literal.zig
     lib/std/zig/system.zig
     lib/std/zig/system/NativePaths.zig
@@ -518,28 +331,19 @@ set(ZIG_STAGE2_SOURCES
     src/Air/Liveness.zig
     src/Air/Liveness/Verify.zig
     src/Air/print.zig
-    src/Air/types_resolved.zig
     src/Builtin.zig
     src/Compilation.zig
     src/Compilation/Config.zig
-    src/DarwinPosixSpawn.zig
     src/InternPool.zig
-    src/Package.zig
-    src/Package/Fetch.zig
-    src/Package/Fetch/git.zig
-    src/Package/Manifest.zig
-    src/Package/Module.zig
     src/RangeSet.zig
     src/Sema.zig
-    src/Sema/bitcast.zig
+    src/Sema/reinterpret.zig
     src/Sema/comptime_ptr_access.zig
+    src/Sema/type_resolution.zig
     src/Type.zig
     src/Value.zig
     src/Zcu.zig
     src/Zcu/PerThread.zig
-    src/clang.zig
-    src/clang_options.zig
-    src/clang_options_data.zig
     src/codegen.zig
     src/codegen/aarch64.zig
     src/codegen/aarch64/abi.zig
@@ -550,22 +354,36 @@ set(ZIG_STAGE2_SOURCES
     src/codegen/aarch64/Mir.zig
     src/codegen/aarch64/Select.zig
     src/codegen/c.zig
-    src/codegen/c/Type.zig
+    src/codegen/c/type.zig
+    src/codegen/c/type/render_defs.zig
     src/codegen/llvm.zig
     src/codegen/llvm/bindings.zig
+    src/codegen/loongarch/abi.zig
+    src/codegen/loongarch/encoding.zig
+    src/codegen/loongarch/decode_tree.zon
+    src/codegen/loongarch/inst_formats.zon
+    src/codegen/loongarch/Assemble.zig
+    src/codegen/loongarch/Disassemble.zig
+    src/codegen/loongarch/Mir.zig
+    src/codegen/loongarch/bits.zig
+    src/codegen/loongarch/Select.zig
+    src/codegen/loongarch.zig
+    src/codegen/s390x/abi.zig
     src/crash_report.zig
     src/dev.zig
     src/libs/freebsd.zig
     src/libs/glibc.zig
     src/libs/netbsd.zig
-    src/introspect.zig
+    src/libs/openbsd.zig
     src/libs/libcxx.zig
     src/libs/libtsan.zig
     src/libs/libunwind.zig
     src/link.zig
     src/link/C.zig
+    src/link/ConstPool.zig
     src/link/Coff.zig
     src/link/Dwarf.zig
+    src/link/Dwarf2.zig
     src/link/Elf.zig
     src/link/Elf/Archive.zig
     src/link/Elf/Atom.zig
@@ -583,7 +401,7 @@ set(ZIG_STAGE2_SOURCES
     src/link/Elf/relocatable.zig
     src/link/Elf/relocation.zig
     src/link/Elf/synthetic_sections.zig
-    src/link/Goff.zig
+    src/link/Elf2.zig
     src/link/LdScript.zig
     src/link/Lld.zig
     src/link/MachO.zig
@@ -612,13 +430,13 @@ set(ZIG_STAGE2_SOURCES
     src/link/MachO/synthetic.zig
     src/link/MachO/Thunk.zig
     src/link/MachO/uuid.zig
+    src/link/MappedFile.zig
     src/link/Queue.zig
     src/link/StringTable.zig
     src/link/Wasm.zig
     src/link/Wasm/Archive.zig
     src/link/Wasm/Flush.zig
     src/link/Wasm/Object.zig
-    src/link/Xcoff.zig
     src/link/aarch64.zig
     src/link/riscv.zig
     src/link/table_section.zig
@@ -639,7 +457,6 @@ set(ZIG_STAGE2_SOURCES
     src/register_manager.zig
     src/target.zig
     src/tracy.zig
-    src/translate_c.zig
     src/libs/wasi_libc.zig
 )
 
@@ -737,20 +554,22 @@ endforeach()
 include(CheckSymbolExists)
 
 string(TOLOWER "${CMAKE_HOST_SYSTEM_NAME}" ZIG_HOST_TARGET_OS)
-if(ZIG_HOST_TARGET_OS STREQUAL "darwin")
+if(ZIG_HOST_TARGET_OS STREQUAL "android")
+  set(ZIG_HOST_TARGET_OS "linux")
+  set(ZIG_HOST_TARGET_IS_ANDROID TRUE)
+elseif(ZIG_HOST_TARGET_OS STREQUAL "darwin")
   set(ZIG_HOST_TARGET_OS "macos")
+elseif(ZIG_HOST_TARGET_OS STREQUAL "gnu")
+  set(ZIG_HOST_TARGET_OS "hurd")
+elseif(ZIG_HOST_TARGET_OS STREQUAL "serenityos")
+  set(ZIG_HOST_TARGET_OS "serenity")
 elseif(ZIG_HOST_TARGET_OS STREQUAL "sunos")
-  check_symbol_exists(__illumos__ "" ZIG_HOST_TARGET_HAS_ILLUMOS_MACRO)
-  if (ZIG_HOST_TARGET_HAS_ILLUMOS_MACRO)
-    set(ZIG_HOST_TARGET_OS "illumos")
-  else()
-    set(ZIG_HOST_TARGET_OS "solaris")
-  endif()
+  set(ZIG_HOST_TARGET_OS "illumos")
 endif()
 
 string(TOLOWER "${CMAKE_HOST_SYSTEM_PROCESSOR}" ZIG_HOST_TARGET_ARCH)
 if(ZIG_HOST_TARGET_ARCH MATCHES "^i[3-9]86$")
-  if (ZIG_HOST_TARGET_OS MATCHES "(solaris|illumos)")
+  if (ZIG_HOST_TARGET_OS STREQUAL "illumos")
     set(ZIG_HOST_TARGET_ARCH "x86_64")
   else()
     set(ZIG_HOST_TARGET_ARCH "x86")
@@ -772,15 +591,28 @@ if(ZIG_HOST_TARGET_ARCH MATCHES "^arm(eb)?$")
 endif()
 string(REGEX REPLACE "^ppc((64)?(le)?)$" "powerpc\\1" ZIG_HOST_TARGET_ARCH "${ZIG_HOST_TARGET_ARCH}")
 
+set(ZIG_HOST_TARGET_ABI "")
 if(MSVC)
   set(ZIG_HOST_TARGET_ABI "-msvc")
 elseif(MINGW)
   set(ZIG_HOST_TARGET_ABI "-gnu")
-elseif(ZIG_HOST_TARGET_ARCH MATCHES "^(arm|thumb)hf?(eb)?$")
-  string(REGEX REPLACE "^(arm|thumb)hf?((eb)?)$" "\\1\\2" ZIG_HOST_TARGET_ARCH "${ZIG_HOST_TARGET_ARCH}")
-  set(ZIG_HOST_TARGET_ABI "-eabihf")
+elseif(ZIG_HOST_TARGET_IS_ANDROID)
+  if(ZIG_HOST_TARGET_ARCH STREQUAL "arm")
+    set(ZIG_HOST_TARGET_ABI "-androideabi")
+  else()
+    set(ZIG_HOST_TARGET_ABI "-android")
+  endif()
 else()
-  set(ZIG_HOST_TARGET_ABI "")
+  check_symbol_exists(__GLIBC__ "features.h" ZIG_HOST_TARGET_IS_GLIBC)
+  if(ZIG_HOST_TARGET_IS_GLIBC)
+    if(ZIG_HOST_TARGET_ARCH MATCHES "^arm(eb)?$" OR ZIG_HOST_TARGET_ARCH MATCHES "^thumb(eb)?$" OR ZIG_HOST_TARGET_ARCH MATCHES "^powerpc(le)?$")
+      set(ZIG_HOST_TARGET_ABI "-gnueabihf")
+    elseif(ZIG_HOST_TARGET_ARCH MATCHES "^mips(el)?$")
+      set(ZIG_HOST_TARGET_ABI "-gnueabi")
+    else()
+      set(ZIG_HOST_TARGET_ABI "-gnu")
+    endif()
+  endif()
 endif()
 
 set(ZIG_HOST_TARGET_TRIPLE "${ZIG_HOST_TARGET_ARCH}-${ZIG_HOST_TARGET_OS}${ZIG_HOST_TARGET_ABI}" CACHE STRING "Host zig target triple.")
@@ -791,18 +623,33 @@ if(MSVC)
   set(ZIG2_COMPILE_FLAGS "/Od")
   set(ZIG2_LINK_FLAGS "/STACK:16777216 /FORCE:MULTIPLE")
 else()
-  set(ZIG_WASM2C_COMPILE_FLAGS "-std=c99 -O2")
-  set(ZIG1_COMPILE_FLAGS "-std=c99 -Os")
-  set(ZIG2_COMPILE_FLAGS "-std=c99 -O0 -fno-sanitize=undefined -fno-stack-protector")
-  if(APPLE)
-    set(ZIG2_LINK_FLAGS "-Wl,-stack_size,0x10000000")
-  elseif(MINGW)
-    set(ZIG2_LINK_FLAGS "-Wl,--stack,0x10000000")
-  # Solaris/illumos ld(1) does not provide a --stack-size option.
-  elseif(CMAKE_HOST_SOLARIS)
-    unset(ZIG2_LINK_FLAGS)
-  else()
-    set(ZIG2_LINK_FLAGS "-Wl,-z,stack-size=0x10000000")
+  set(ZIG_WASM2C_COMPILE_FLAGS "-std=c99")
+  set(ZIG1_COMPILE_FLAGS "-std=c99 -Oz -fno-strict-aliasing")
+  set(ZIG2_COMPILE_FLAGS "-std=c99 -Oz -fno-sanitize=undefined -fno-stack-protector -fno-strict-aliasing")
+  if(CMAKE_C_COMPILER_ID STREQUAL "Clang" AND ZIG_HOST_TARGET_ARCH STREQUAL "s390x")
+    string(REPLACE -Oz -O0 ZIG2_COMPILE_FLAGS "${ZIG2_COMPILE_FLAGS}") # llvm 22 assertion failure
+  endif()
+  # Must match the condition in build.zig.
+  if(ZIG_HOST_TARGET_ARCH MATCHES "^(arm|thumb)(eb)?$" OR ZIG_HOST_TARGET_ARCH EQUAL "hexagon" OR ZIG_HOST_TARGET_ARCH MATCHES "^powerpc(64)?(le)?$")
+    set(ZIG1_COMPILE_FLAGS "${ZIG1_COMPILE_FLAGS} -ffunction-sections -fdata-sections")
+    set(ZIG2_COMPILE_FLAGS "${ZIG2_COMPILE_FLAGS} -ffunction-sections -fdata-sections")
+  endif()
+  if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    # Prevent GCC from miscompiling 'zig2.c'. See also 'GCC_BUG_119085_PRESENT' workaround details in 'bootstrap.c'.
+    if (
+      (CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL "10.0" AND
+       CMAKE_C_COMPILER_VERSION VERSION_LESS_EQUAL "13.4") OR
+      (CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL "14.0" AND
+       CMAKE_C_COMPILER_VERSION VERSION_LESS_EQUAL "14.3") OR
+      (CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL "15.0" AND
+       CMAKE_C_COMPILER_VERSION VERSION_LESS "15.2")
+    )
+      set(ZIG2_COMPILE_FLAGS "${ZIG2_COMPILE_FLAGS} -fno-tree-sra")
+    endif()
+
+    # Prevent GCC from spamming false positive `-Waddress-of-packed-member` warnings in 'zig2.c'.
+    # See also 'GCC_BUG_94081_PRESENT' workaround details in 'bootstrap.c'.
+    set(ZIG2_COMPILE_FLAGS "${ZIG2_COMPILE_FLAGS} -Wno-address-of-packed-member")
   endif()
 endif()
 
@@ -841,10 +688,8 @@ set(BUILD_ZIG2_ARGS
   -femit-bin="${ZIG2_C_SOURCE}"
   -target "${ZIG_HOST_TARGET_TRIPLE}"
   --dep "build_options"
-  --dep "aro"
   "-Mroot=src/main.zig"
   "-Mbuild_options=${ZIG_CONFIG_ZIG_OUT}"
-  "-Maro=lib/compiler/aro/aro.zig"
 )
 
 add_custom_command(
@@ -857,7 +702,7 @@ add_custom_command(
 
 set(BUILD_COMPILER_RT_ARGS
   "${PROJECT_SOURCE_DIR}/lib"
-  build-obj -ofmt=c -OReleaseSmall
+  build-obj -ofmt=c -lc -OReleaseSmall
   --name compiler_rt
   -femit-bin="${ZIG_COMPILER_RT_C_SOURCE}"
   -target "${ZIG_HOST_TARGET_TRIPLE}"
@@ -899,13 +744,8 @@ if(MSVC OR MINGW)
 endif()
 
 
-# "-Dno-langref" is hardcoded because stage2 builds lack the `@cImport`
-# feature, which some of the doctests rely on.
-
-# To obtain this document, run `zig build` against stage3 rather than stage2.
-# Note that the `langref` step can be used to isolate this task.
 set(ZIG_BUILD_ARGS
-  --zig-lib-dir "${PROJECT_SOURCE_DIR}/lib"
+  "--zig-lib=${PROJECT_SOURCE_DIR}/lib"
 
   "-Dversion-string=${RESOLVED_ZIG_VERSION}"
   "-Dtarget=${ZIG_TARGET_TRIPLE}"
@@ -913,8 +753,6 @@ set(ZIG_BUILD_ARGS
 
   -Denable-llvm
   "-Dconfig_h=${ZIG_CONFIG_H_OUT}"
-
-  -Dno-langref
 )
 
 set(ZIG_EXTRA_BUILD_ARGS "" CACHE STRING "Extra zig build args")
@@ -971,7 +809,7 @@ set(ZIG2_WORKING_DIR "${PROJECT_SOURCE_DIR}")
 
 add_custom_command(
   OUTPUT "${PROJECT_BINARY_DIR}/stage3/bin/zig"
-  COMMAND zig2 build --prefix "${PROJECT_BINARY_DIR}/stage3" ${ZIG_BUILD_ARGS}
+  COMMAND zig2 build ${ZIG_BUILD_ARGS} --prefix "${PROJECT_BINARY_DIR}/stage3"
   COMMENT "Building stage3"
   WORKING_DIRECTORY "${ZIG2_WORKING_DIR}"
 )

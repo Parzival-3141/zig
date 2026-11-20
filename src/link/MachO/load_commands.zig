@@ -3,12 +3,13 @@ const assert = std.debug.assert;
 const log = std.log.scoped(.link);
 const macho = std.macho;
 const mem = std.mem;
-const Writer = std.io.Writer;
+const Writer = std.Io.Writer;
+const Allocator = std.mem.Allocator;
 
-const Allocator = mem.Allocator;
 const DebugSymbols = @import("DebugSymbols.zig");
 const Dylib = @import("Dylib.zig");
 const MachO = @import("../MachO.zig");
+const link = @import("../../link.zig");
 
 pub const default_dyld_path: [*:0]const u8 = "/usr/lib/dyld";
 
@@ -61,6 +62,10 @@ pub fn calcLoadCommandsSize(macho_file: *MachO, assume_max_path_len: bool) !u32 
             install_name,
             assume_max_path_len,
         );
+    }
+    // LC_ENCRYPTION_INFO_64
+    if (macho_file.needsEncryptionInfo()) {
+        sizeofcmds += @sizeOf(macho.encryption_info_command_64);
     }
     // LC_RPATH
     {
@@ -163,40 +168,47 @@ pub fn calcLoadCommandsSizeObject(macho_file: *MachO) u32 {
     return @as(u32, @intCast(sizeofcmds));
 }
 
-pub fn calcMinHeaderPadSize(macho_file: *MachO) !u32 {
-    var padding: u32 = (try calcLoadCommandsSize(macho_file, false)) + (macho_file.headerpad_size orelse 0);
-    log.debug("minimum requested headerpad size 0x{x}", .{padding + @sizeOf(macho.mach_header_64)});
+pub fn calcMinHeaderSize(macho_file: *MachO) !u32 {
+    var padding: u32 = (try calcLoadCommandsSize(macho_file, false)) +
+        (macho_file.headerpad_size orelse MachO.default_headerpad_size);
+    log.debug("minimum requested header + padding size 0x{x}", .{padding + @sizeOf(macho.mach_header_64)});
 
     if (macho_file.headerpad_max_install_names) {
         const min_headerpad_size: u32 = try calcLoadCommandsSize(macho_file, true);
-        log.debug("headerpad_max_install_names minimum headerpad size 0x{x}", .{
+        log.debug("headerpad_max_install_names minimum header + padding size 0x{x}", .{
             min_headerpad_size + @sizeOf(macho.mach_header_64),
         });
         padding = @max(padding, min_headerpad_size);
     }
 
     const offset = @sizeOf(macho.mach_header_64) + padding;
-    log.debug("actual headerpad size 0x{x}", .{offset});
+    log.debug("actual header + padding size 0x{x}", .{offset});
 
-    return offset;
+    // Encryption is done at page granularity, so if the output needs a load
+    // command for encryption info, ensure that the header + load commands have
+    // at least one full, unencrypted page.
+    return if (macho_file.needsEncryptionInfo())
+        mem.alignForward(u32, offset, macho_file.getPageSize())
+    else
+        offset;
 }
 
-pub fn writeDylinkerLC(writer: anytype) !void {
+pub fn writeDylinkerLC(writer: *Writer) !void {
     const name_len = mem.sliceTo(default_dyld_path, 0).len;
     const cmdsize = @as(u32, @intCast(mem.alignForward(
         u64,
         @sizeOf(macho.dylinker_command) + name_len,
         @sizeOf(u64),
     )));
-    try writer.writeStruct(macho.dylinker_command{
+    try writer.writeStruct(@as(macho.dylinker_command, .{
         .cmd = .LOAD_DYLINKER,
         .cmdsize = cmdsize,
         .name = @sizeOf(macho.dylinker_command),
-    });
+    }), .little);
     try writer.writeAll(mem.sliceTo(default_dyld_path, 0));
     const padding = cmdsize - @sizeOf(macho.dylinker_command) - name_len;
     if (padding > 0) {
-        try writer.writeByteNTimes(0, padding);
+        try writer.splatByteAll(0, padding);
     }
 }
 
@@ -208,14 +220,14 @@ const WriteDylibLCCtx = struct {
     compatibility_version: u32 = 0x10000,
 };
 
-pub fn writeDylibLC(ctx: WriteDylibLCCtx, writer: anytype) !void {
+pub fn writeDylibLC(ctx: WriteDylibLCCtx, writer: *Writer) !void {
     const name_len = ctx.name.len + 1;
     const cmdsize = @as(u32, @intCast(mem.alignForward(
         u64,
         @sizeOf(macho.dylib_command) + name_len,
         @sizeOf(u64),
     )));
-    try writer.writeStruct(macho.dylib_command{
+    try writer.writeStruct(@as(macho.dylib_command, .{
         .cmd = ctx.cmd,
         .cmdsize = cmdsize,
         .dylib = .{
@@ -224,16 +236,16 @@ pub fn writeDylibLC(ctx: WriteDylibLCCtx, writer: anytype) !void {
             .current_version = ctx.current_version,
             .compatibility_version = ctx.compatibility_version,
         },
-    });
+    }), .little);
     try writer.writeAll(ctx.name);
     try writer.writeByte(0);
     const padding = cmdsize - @sizeOf(macho.dylib_command) - name_len;
     if (padding > 0) {
-        try writer.writeByteNTimes(0, padding);
+        try writer.splatByteAll(0, padding);
     }
 }
 
-pub fn writeDylibIdLC(macho_file: *MachO, writer: anytype) !void {
+pub fn writeDylibIdLC(macho_file: *MachO, writer: *Writer) !void {
     const comp = macho_file.base.comp;
     const gpa = comp.gpa;
     assert(comp.config.output_mode == .Lib and comp.config.link_mode == .dynamic);
@@ -259,55 +271,56 @@ pub fn writeDylibIdLC(macho_file: *MachO, writer: anytype) !void {
     }, writer);
 }
 
-pub fn writeRpathLC(rpath: []const u8, writer: anytype) !void {
+pub fn writeEncryptionInfoLC(macho_file: *MachO, writer: *Writer) !void {
+    try writer.writeAll(mem.asBytes(&macho.encryption_info_command_64{
+        .cryptoff = macho_file.header_size.?,
+        .cryptsize = @as(u32, @intCast(macho_file.getTextSegment().filesize)) - macho_file.header_size.?,
+    }));
+}
+
+pub fn writeRpathLC(rpath: []const u8, writer: *Writer) !void {
     const rpath_len = rpath.len + 1;
     const cmdsize = @as(u32, @intCast(mem.alignForward(
         u64,
         @sizeOf(macho.rpath_command) + rpath_len,
         @sizeOf(u64),
     )));
-    try writer.writeStruct(macho.rpath_command{
+    try writer.writeStruct(@as(macho.rpath_command, .{
         .cmdsize = cmdsize,
         .path = @sizeOf(macho.rpath_command),
-    });
+    }), .little);
     try writer.writeAll(rpath);
     try writer.writeByte(0);
     const padding = cmdsize - @sizeOf(macho.rpath_command) - rpath_len;
     if (padding > 0) {
-        try writer.writeByteNTimes(0, padding);
+        try writer.splatByteAll(0, padding);
     }
 }
 
-pub fn writeVersionMinLC(platform: MachO.Platform, sdk_version: ?std.SemanticVersion, writer: anytype) !void {
+pub fn writeVersionMinLC(platform: MachO.Platform, sdk_version: ?link.DarwinSdkVersion, writer: *Writer) !void {
     const cmd: macho.LC = switch (platform.os_tag) {
         .macos => .VERSION_MIN_MACOSX,
-        .ios => .VERSION_MIN_IPHONEOS,
+        .ios, .maccatalyst => .VERSION_MIN_IPHONEOS,
         .tvos => .VERSION_MIN_TVOS,
         .watchos => .VERSION_MIN_WATCHOS,
         else => unreachable,
     };
     try writer.writeAll(mem.asBytes(&macho.version_min_command{
         .cmd = cmd,
-        .version = platform.toAppleVersion(),
-        .sdk = if (sdk_version) |ver|
-            MachO.semanticVersionToAppleVersion(ver)
-        else
-            platform.toAppleVersion(),
+        .version = @backingInt(platform.version),
+        .sdk = @backingInt(sdk_version orelse platform.version),
     }));
 }
 
-pub fn writeBuildVersionLC(platform: MachO.Platform, sdk_version: ?std.SemanticVersion, writer: anytype) !void {
+pub fn writeBuildVersionLC(platform: MachO.Platform, sdk_version: ?link.DarwinSdkVersion, writer: *Writer) !void {
     const cmdsize = @sizeOf(macho.build_version_command) + @sizeOf(macho.build_tool_version);
-    try writer.writeStruct(macho.build_version_command{
+    try writer.writeStruct(@as(macho.build_version_command, .{
         .cmdsize = cmdsize,
         .platform = platform.toApplePlatform(),
-        .minos = platform.toAppleVersion(),
-        .sdk = if (sdk_version) |ver|
-            MachO.semanticVersionToAppleVersion(ver)
-        else
-            platform.toAppleVersion(),
+        .minos = @backingInt(platform.version),
+        .sdk = @backingInt(sdk_version orelse platform.version),
         .ntools = 1,
-    });
+    }), .little);
     try writer.writeAll(mem.asBytes(&macho.build_tool_version{
         .tool = .ZIG,
         .version = 0x0,

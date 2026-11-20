@@ -13,24 +13,25 @@
 //! - __vsprintf_chk
 
 const std = @import("std");
-const common = @import("./common.zig");
+const compiler_rt = @import("../compiler_rt.zig");
+const symbol = compiler_rt.symbol;
 const builtin = @import("builtin");
 
-extern fn memset(dest: ?[*]u8, c: u8, n: usize) callconv(.c) ?[*]u8;
+extern fn memset(dest: ?[*]u8, c: c_int, n: usize) callconv(.c) ?[*]u8;
 extern fn memcpy(noalias dest: ?[*]u8, noalias src: ?[*]const u8, n: usize) callconv(.c) ?[*]u8;
 extern fn memmove(dest: ?[*]u8, src: ?[*]const u8, n: usize) callconv(.c) ?[*]u8;
 
 comptime {
-    @export(&__stack_chk_fail, .{ .name = "__stack_chk_fail", .linkage = common.linkage, .visibility = common.visibility });
-    @export(&__chk_fail, .{ .name = "__chk_fail", .linkage = common.linkage, .visibility = common.visibility });
-    @export(&__stack_chk_guard, .{ .name = "__stack_chk_guard", .linkage = common.linkage, .visibility = common.visibility });
-    @export(&__strcpy_chk, .{ .name = "__strcpy_chk", .linkage = common.linkage, .visibility = common.visibility });
-    @export(&__strncpy_chk, .{ .name = "__strncpy_chk", .linkage = common.linkage, .visibility = common.visibility });
-    @export(&__strcat_chk, .{ .name = "__strcat_chk", .linkage = common.linkage, .visibility = common.visibility });
-    @export(&__strncat_chk, .{ .name = "__strncat_chk", .linkage = common.linkage, .visibility = common.visibility });
-    @export(&__memcpy_chk, .{ .name = "__memcpy_chk", .linkage = common.linkage, .visibility = common.visibility });
-    @export(&__memmove_chk, .{ .name = "__memmove_chk", .linkage = common.linkage, .visibility = common.visibility });
-    @export(&__memset_chk, .{ .name = "__memset_chk", .linkage = common.linkage, .visibility = common.visibility });
+    symbol(&__stack_chk_fail, if (builtin.os.tag == .openbsd) "__stack_smash_handler" else "__stack_chk_fail");
+    symbol(&__chk_fail, "__chk_fail");
+    symbol(&__stack_chk_guard, if (builtin.os.tag == .openbsd) "__guard_local" else "__stack_chk_guard");
+    symbol(&__strcpy_chk, "__strcpy_chk");
+    symbol(&__strncpy_chk, "__strncpy_chk");
+    symbol(&__strcat_chk, "__strcat_chk");
+    symbol(&__strncat_chk, "__strncat_chk");
+    symbol(&__memcpy_chk, "__memcpy_chk");
+    symbol(&__memmove_chk, "__memmove_chk");
+    symbol(&__memset_chk, "__memset_chk");
 }
 
 fn __stack_chk_fail() callconv(.c) noreturn {
@@ -43,10 +44,10 @@ fn __chk_fail() callconv(.c) noreturn {
 
 // TODO: Initialize the canary with random data
 var __stack_chk_guard: usize = blk: {
-    var buf = [1]u8{0} ** @sizeOf(usize);
+    var buf: [@sizeOf(usize)]u8 = @splat(0);
     buf[@sizeOf(usize) - 1] = 255;
     buf[@sizeOf(usize) - 2] = '\n';
-    break :blk @as(usize, @bitCast(buf));
+    break :blk @bitCast(buf);
 };
 
 fn __strcpy_chk(dest: [*:0]u8, src: [*:0]const u8, dest_n: usize) callconv(.c) [*:0]u8 {
@@ -137,7 +138,7 @@ fn __memmove_chk(dest: ?[*]u8, src: ?[*]const u8, n: usize, dest_n: usize) callc
     return memmove(dest, src, n);
 }
 
-fn __memset_chk(dest: ?[*]u8, c: u8, n: usize, dest_n: usize) callconv(.c) ?[*]u8 {
+fn __memset_chk(dest: ?[*]u8, c: c_int, n: usize, dest_n: usize) callconv(.c) ?[*]u8 {
     if (dest_n < n) __chk_fail();
     return memset(dest, c, n);
 }

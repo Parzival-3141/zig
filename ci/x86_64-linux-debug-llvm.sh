@@ -5,19 +5,13 @@
 set -x
 set -e
 
-ARCH="$(uname -m)"
-TARGET="$ARCH-linux-musl"
+TARGET="x86_64-linux-musl"
 MCPU="baseline"
-CACHE_BASENAME="zig+llvm+lld+clang-$TARGET-0.15.0-dev.233+7c85dc460"
+CACHE_BASENAME="zig+llvm+lld+clang-$TARGET-0.17.0-dev.203+073889523"
 PREFIX="$HOME/deps/$CACHE_BASENAME"
 ZIG="$PREFIX/bin/zig"
 
-export PATH="$HOME/deps/wasmtime-v29.0.0-$ARCH-linux:$HOME/deps/qemu-linux-x86_64-10.0.2/bin:$HOME/local/bin:$PATH"
-
-# Make the `zig version` number consistent.
-# This will affect the cmake command below.
-git fetch --unshallow || true
-git fetch --tags
+export PATH="$HOME/deps/wasmtime-v46.0.1-x86_64-linux:$HOME/deps/qemu-linux-x86_64-11.1.1.1/bin:$HOME/local/bin:$PATH"
 
 # Override the cache directories because they won't actually help other CI runs
 # which will be testing alternate versions of zig, and ultimately would just
@@ -25,16 +19,15 @@ git fetch --tags
 export ZIG_GLOBAL_CACHE_DIR="$PWD/zig-global-cache"
 export ZIG_LOCAL_CACHE_DIR="$PWD/zig-local-cache"
 
-mkdir build-debug-llvm
+mkdir -p build-debug-llvm
 cd build-debug-llvm
-
-export CC="$ZIG cc -target $TARGET -mcpu=$MCPU"
-export CXX="$ZIG c++ -target $TARGET -mcpu=$MCPU"
 
 cmake .. \
   -DCMAKE_INSTALL_PREFIX="stage3-debug" \
   -DCMAKE_PREFIX_PATH="$PREFIX" \
   -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_C_COMPILER="$ZIG;cc;-target;$TARGET;-mcpu=$MCPU" \
+  -DCMAKE_CXX_COMPILER="$ZIG;c++;-target;$TARGET;-mcpu=$MCPU" \
   -DZIG_TARGET_TRIPLE="$TARGET" \
   -DZIG_TARGET_MCPU="$MCPU" \
   -DZIG_STATIC=ON \
@@ -42,29 +35,39 @@ cmake .. \
   -DZIG_EXTRA_BUILD_ARGS="-Duse-llvm=true" \
   -GNinja
 
-# Now cmake will use zig as the C/C++ compiler. We reset the environment variables
-# so that installation and testing do not get affected by them.
-unset CC
-unset CXX
-
 ninja install
 
-# simultaneously test building self-hosted without LLVM and with 32-bit arm
+# Must be done after zig cc is finished.
+export ZIG_LIB_DIR="$PWD/../lib"
+
+# Simultaneously test building self-hosted without LLVM and with 32-bit arm
 stage3-debug/bin/zig build \
+  --maxrss "${ZSF_MAX_RSS:-0}" \
   -Dtarget=arm-linux-musleabihf \
   -Dno-lib
 
-stage3-debug/bin/zig build test docs \
-  --maxrss 21000000000 \
-  -Dlldb=$HOME/deps/lldb-zig/Debug-e0a42bb34/bin/lldb \
+stage3-debug/bin/zig build install test docs \
+  --maxrss "${ZSF_MAX_RSS:-0}" \
+  --prefix stage4-debug \
+  --search-prefix "$PREFIX" \
+  --libc-runtimes "$HOME/deps/glibc-2.43-musl-1.2.5" \
+  --test-timeout 12m \
   -fqemu \
   -fwasmtime \
-  -Dstatic-llvm \
+  -Dversion-string="$(stage3-debug/bin/zig version)" \
+  -Dtarget=$TARGET \
+  -Dcpu=$MCPU \
+  -Duse-llvm \
+  -Duse-zig-libcxx \
+  -Denable-llvm \
+  -Dno-lib \
   -Dskip-freebsd \
   -Dskip-netbsd \
+  -Dskip-openbsd \
   -Dskip-windows \
-  -Dskip-macos \
-  -Dtarget=native-native-musl \
-  --search-prefix "$PREFIX" \
-  --zig-lib-dir "$PWD/../lib" \
-  -Denable-superhtml
+  -Dskip-darwin \
+  -Denable-superhtml \
+  -Dlldb="$HOME/deps/lldb-zig/Debug-86a744cac9/bin/lldb" \
+  -Dlibc-test-path="$HOME/deps/libc-test-b95fe84"
+
+stage4-debug/bin/zig test ../test/behavior.zig

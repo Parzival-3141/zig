@@ -1,31 +1,33 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const common = @import("common.zig");
-const normalize = common.normalize;
-const wideMultiply = common.wideMultiply;
-
-pub const panic = common.panic;
+const compiler_rt = @import("../compiler_rt.zig");
+const symbol = compiler_rt.symbol;
+const normalize = compiler_rt.normalize;
+const wideMultiply = compiler_rt.wideMultiply;
 
 comptime {
-    if (common.want_ppc_abi) {
-        @export(&__divtf3, .{ .name = "__divkf3", .linkage = common.linkage, .visibility = common.visibility });
-    } else if (common.want_sparc_abi) {
-        @export(&_Qp_div, .{ .name = "_Qp_div", .linkage = common.linkage, .visibility = common.visibility });
+    if (compiler_rt.want_ppc_abi) {
+        symbol(&__divtf3, "__divkf3");
+    } else if (compiler_rt.want_sparc64_abi) {
+        symbol(&_Qp_div, "_Qp_div");
+    } else if (compiler_rt.want_sparc32_abi) {
+        symbol(&__divtf3, "_Q_div");
+    } else {
+        symbol(&__divtf3, "__divtf3");
     }
-    @export(&__divtf3, .{ .name = "__divtf3", .linkage = common.linkage, .visibility = common.visibility });
 }
 
-pub fn __divtf3(a: f128, b: f128) callconv(.c) f128 {
-    return div(a, b);
+fn __divtf3(a: compiler_rt.f128.Abi, b: compiler_rt.f128.Abi) callconv(.c) compiler_rt.f128.Abi {
+    return compiler_rt.f128.toAbi(div_f128(compiler_rt.f128.fromAbi(a), compiler_rt.f128.fromAbi(b)));
 }
 
 fn _Qp_div(c: *f128, a: *const f128, b: *const f128) callconv(.c) void {
-    c.* = div(a.*, b.*);
+    c.* = div_f128(a.*, b.*);
 }
 
-inline fn div(a: f128, b: f128) f128 {
-    const Z = std.meta.Int(.unsigned, 128);
+pub fn div_f128(a: f128, b: f128) f128 {
+    const Z = @Int(.unsigned, 128);
 
     const significandBits = std.math.floatMantissaBits(f128);
     const exponentBits = std.math.floatExponentBits(f128);
@@ -223,10 +225,29 @@ inline fn div(a: f128, b: f128) f128 {
                 // The rounded result is normal; return it.
                 return @bitCast(absResult | quotientSign);
             }
+            // Result is denormal with exponent 0
+            return @bitCast(absResult | quotientSign);
+        } else {
+            // For denormals with writtenExponent < 0,
+            // the implicit bit must be shifted into the mantissa (IEEE 754)
+            const shiftAmount = @as(u7, @intCast(1 - writtenExponent));
+
+            // Check for underflow
+            if (shiftAmount > significandBits) {
+                return @bitCast(quotientSign);
+            }
+
+            // Round the quotient before pushing
+            const shouldRound = (residual << 1) > bSignificand;
+            const roundedQuotient = quotient +% @as(u113, @intFromBool(shouldRound));
+
+            // Move to the denormal range and apply the mask
+            const denormQuotient = roundedQuotient >> shiftAmount;
+            const absResult = denormQuotient & significandMask;
+
+            //  Add sign to denormal mantissa and return
+            return @bitCast(absResult | quotientSign);
         }
-        // Flush denormals to zero.  In the future, it would be nice to add
-        // code to round them correctly.
-        return @bitCast(quotientSign);
     } else {
         const round = @intFromBool((residual << 1) >= bSignificand);
         // Clear the implicit bit

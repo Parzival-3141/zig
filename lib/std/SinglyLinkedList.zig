@@ -85,7 +85,9 @@ pub fn prepend(list: *SinglyLinkedList, new_node: *Node) void {
     list.first = new_node;
 }
 
-pub fn remove(list: *SinglyLinkedList, node: *Node) void {
+/// Remove `node` from the list.
+/// Asserts that `node` is in the list.
+pub fn remove(list: *SinglyLinkedList, node: *const Node) void {
     if (list.first == node) {
         list.first = node.next;
     } else {

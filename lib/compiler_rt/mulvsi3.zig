@@ -1,17 +1,17 @@
-const mulv = @import("mulo.zig");
-const common = @import("./common.zig");
 const testing = @import("std").testing;
 
-pub const panic = common.panic;
+const mulv = @import("mulo.zig");
+const compiler_rt = @import("../compiler_rt.zig");
+const symbol = compiler_rt.symbol;
 
 comptime {
-    @export(&__mulvsi3, .{ .name = "__mulvsi3", .linkage = common.linkage, .visibility = common.visibility });
+    symbol(&__mulvsi3, "__mulvsi3");
 }
 
 pub fn __mulvsi3(a: i32, b: i32) callconv(.c) i32 {
     var overflow: c_int = 0;
     const sum = mulv.__mulosi4(a, b, &overflow);
-    if (overflow != 0) @panic("compiler-rt: integer overflow");
+    if (overflow != 0) @panic("integer overflow");
     return sum;
 }
 

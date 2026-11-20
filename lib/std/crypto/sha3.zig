@@ -1,7 +1,10 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const assert = std.debug.assert;
 const math = std.math;
 const mem = std.mem;
+
+const kangarootwelve = @import("kangarootwelve.zig");
 
 const KeccakState = std.crypto.core.keccak.State;
 
@@ -24,6 +27,9 @@ pub const KMac256 = KMac(256);
 
 pub const TupleHash128 = TupleHash(128);
 pub const TupleHash256 = TupleHash(256);
+
+pub const KT128 = kangarootwelve.KT128;
+pub const KT256 = kangarootwelve.KT256;
 
 /// TurboSHAKE128 is a XOF (a secure hash function with a variable output length), with a 128 bit security level.
 /// It is based on the same permutation as SHA3 and SHAKE128, but which much higher performance.
@@ -52,7 +58,7 @@ pub fn Keccak(comptime f: u11, comptime output_bits: u11, comptime default_delim
         st: State,
 
         /// The output length, in bytes.
-        pub const digest_length = std.math.divCeil(comptime_int, output_bits, 8) catch unreachable;
+        pub const digest_length: comptime_int = @divCeil(output_bits, 8);
         /// The block length, or rate, in bytes.
         pub const block_length = State.rate;
         /// The delimiter can be overwritten in the options.
@@ -81,16 +87,10 @@ pub fn Keccak(comptime f: u11, comptime output_bits: u11, comptime default_delim
             self.st.squeeze(out[0..]);
         }
 
-        pub const Error = error{};
-        pub const Writer = std.io.GenericWriter(*Self, Error, write);
-
-        fn write(self: *Self, bytes: []const u8) Error!usize {
-            self.update(bytes);
-            return bytes.len;
-        }
-
-        pub fn writer(self: *Self) Writer {
-            return .{ .context = self };
+        pub fn finalResult(d: *Self) [digest_length]u8 {
+            var result: [digest_length]u8 = undefined;
+            d.final(&result);
+            return result;
         }
     };
 }
@@ -191,18 +191,6 @@ fn ShakeLike(comptime security_level: u11, comptime default_delim: u8, comptime 
         pub fn fillBlock(self: *Self) void {
             self.st.fillBlock();
         }
-
-        pub const Error = error{};
-        pub const Writer = std.io.GenericWriter(*Self, Error, write);
-
-        fn write(self: *Self, bytes: []const u8) Error!usize {
-            self.update(bytes);
-            return bytes.len;
-        }
-
-        pub fn writer(self: *Self) Writer {
-            return .{ .context = self };
-        }
     };
 }
 
@@ -283,18 +271,6 @@ fn CShakeLike(comptime security_level: u11, comptime default_delim: u8, comptime
         /// Align the input to a block boundary.
         pub fn fillBlock(self: *Self) void {
             self.shaker.fillBlock();
-        }
-
-        pub const Error = error{};
-        pub const Writer = std.io.GenericWriter(*Self, Error, write);
-
-        fn write(self: *Self, bytes: []const u8) Error!usize {
-            self.update(bytes);
-            return bytes.len;
-        }
-
-        pub fn writer(self: *Self) Writer {
-            return .{ .context = self };
         }
     };
 }
@@ -390,18 +366,6 @@ fn KMacLike(comptime security_level: u11, comptime default_delim: u8, comptime r
             ctx.update(msg);
             ctx.final(out);
         }
-
-        pub const Error = error{};
-        pub const Writer = std.io.GenericWriter(*Self, Error, write);
-
-        fn write(self: *Self, bytes: []const u8) Error!usize {
-            self.update(bytes);
-            return bytes.len;
-        }
-
-        pub fn writer(self: *Self) Writer {
-            return .{ .context = self };
-        }
     };
 }
 
@@ -477,22 +441,10 @@ fn TupleHashLike(comptime security_level: u11, comptime default_delim: u8, compt
         pub fn squeeze(self: *Self, out: []u8) void {
             if (!self.xof_mode) {
                 const encoded_out_len = comptime NistLengthEncoding.encode(.right, 0);
-                self.update(encoded_out_len.slice());
+                self.cshaker.update(encoded_out_len.slice());
                 self.xof_mode = true;
             }
             self.cshaker.squeeze(out);
-        }
-
-        pub const Error = error{};
-        pub const Writer = std.io.GenericWriter(*Self, Error, write);
-
-        fn write(self: *Self, bytes: []const u8) Error!usize {
-            self.update(bytes);
-            return bytes.len;
-        }
-
-        pub fn writer(self: *Self) Writer {
-            return .{ .context = self };
         }
     };
 }
@@ -518,7 +470,7 @@ pub const NistLengthEncoding = enum {
     /// Encode a length according to NIST SP 800-185.
     pub fn encode(comptime encoding: NistLengthEncoding, len: usize) Length {
         const len_bits = @bitSizeOf(@TypeOf(len)) - @clz(len) + 3;
-        const len_bytes = std.math.divCeil(usize, len_bits, 8) catch unreachable;
+        const len_bytes = @divCeil(len_bits, 8);
 
         var res = Length{ .len = len_bytes + 1 };
         if (encoding == .right) {
@@ -539,6 +491,10 @@ pub const NistLengthEncoding = enum {
 };
 
 const htest = @import("test.zig");
+
+test {
+    _ = kangarootwelve;
+}
 
 test "sha3-224 single" {
     try htest.assertEqualHash(Sha3_224, "6b4e03423667dbb73b6e15454f0eb1abd4597f9a1b078e3f5b5a6bc7", "");
@@ -593,7 +549,7 @@ test "sha3-256 streaming" {
 }
 
 test "sha3-256 aligned final" {
-    var block = [_]u8{0} ** Sha3_256.block_length;
+    var block: [Sha3_256.block_length]u8 = @splat(0);
     var out: [Sha3_256.digest_length]u8 = undefined;
 
     var h = Sha3_256.init(.{});
@@ -664,7 +620,7 @@ test "sha3-512 streaming" {
 }
 
 test "sha3-512 aligned final" {
-    var block = [_]u8{0} ** Sha3_512.block_length;
+    var block: [Sha3_512.block_length]u8 = @splat(0);
     var out: [Sha3_512.digest_length]u8 = undefined;
 
     var h = Sha3_512.init(.{});
@@ -814,6 +770,15 @@ test "TupleHash-128" {
     var out: [32]u8 = undefined;
     st.final(&out);
     try htest.assertEqual("3938d49ade8ec0f0c305ac63497b2d2e8b2f650714f9667cc41816b1c11ffd20", &out);
+}
+
+test "TupleHashXOF-128 as a XOF" {
+    var st = TupleHash128.init();
+    st.update(&.{ 0x00, 0x01, 0x02 });
+    st.update(&.{ 0x10, 0x11, 0x12, 0x13, 0x14, 0x15 });
+    var out: [32]u8 = undefined;
+    st.squeeze(&out);
+    try htest.assertEqual("2f103cd7c32320353495c68de1a8129245c6325f6f2a3d608d92179c96e68488", &out);
 }
 
 test "TupleHash-256" {

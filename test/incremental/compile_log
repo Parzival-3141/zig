@@ -1,30 +1,46 @@
-#target=x86_64-linux-selfhosted
-#target=x86_64-linux-cbe
-#target=x86_64-windows-cbe
-#target=wasm32-wasi-selfhosted
+#exe {
+-Mroot=main.zig
+#}
 
-#update=initial version with no compile log
-#file=main.zig
+#write main.zig {
 const std = @import("std");
 pub fn main() !void {
-    try std.fs.File.stdout().writeAll("Hello, World!\n");
+    try std.Io.File.stdout().writeStreamingAll(io, "Hello, World!\n");
 }
-#expect_stdout="Hello, World!\n"
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+no compile log#}
+#check stdout {
+Hello, World!
+#}
 
-#update=add compile log
-#file=main.zig
+#write main.zig {
 const std = @import("std");
 pub fn main() !void {
-    try std.fs.File.stdout().writeAll("Hello, World!\n");
+    try std.Io.File.stdout().writeStreamingAll(io, "Hello, World!\n");
     @compileLog("this is a log");
 }
-#expect_error=main.zig:4:5: error: found compile log statement
-#expect_compile_log=@as(*const [13:0]u8, "this is a log")
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+add compile log#}
+#check errors {
+main.zig:4:5: error: found compile log statement
 
-#update=remove compile log
-#file=main.zig
+Compile Log Output:
+@as(*const [13:0]u8, "this is a log")
+#}
+
+#write main.zig {
 const std = @import("std");
 pub fn main() !void {
-    try std.fs.File.stdout().writeAll("Hello, World!\n");
+    try std.Io.File.stdout().writeStreamingAll(io, "Hello, World!\n");
 }
-#expect_stdout="Hello, World!\n"
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+remove compile log#}
+#check stdout {
+Hello, World!
+#}

@@ -75,7 +75,6 @@ const log = std.log.scoped(.link);
 const QuakeC = @This();
 const Path = std.Build.Cache.Path;
 const Zcu = @import("../Zcu.zig");
-const Module = @import("../Package/Module.zig");
 const InternPool = @import("../InternPool.zig");
 const Alignment = InternPool.Alignment;
 const Compilation = @import("../Compilation.zig");
@@ -120,14 +119,15 @@ pub fn createEmpty(
     const target = &comp.root_mod.resolved_target.result;
     assert(target.ofmt == .quakec);
     assert(comp.config.output_mode == .Exe);
+    const io = comp.io;
 
     log.debug("createEmpty", .{});
 
-    const file = try emit.root_dir.handle.createFile(emit.sub_path, .{
+    const file = try emit.root_dir.handle.createFile(io, emit.sub_path, .{
         // Truncation is done on `flush`.
         .truncate = false,
     });
-    errdefer file.close();
+    errdefer file.close(io);
 
     const qc_file = try arena.create(QuakeC);
     qc_file.* = .{
@@ -174,11 +174,7 @@ pub fn updateFunc(
     pt: Zcu.PerThread,
     func_index: InternPool.Index,
     anymir: *codegen.AnyMir,
-) link.File.UpdateNavError!void {
-    if (build_options.skip_non_native and builtin.object_format != .quakec) {
-        @panic("Attempted to compile for object format that was disabled by build configuration");
-    }
-
+) link.Error!void {
     dev.check(.quakec_backend);
 
     const mir = &anymir.quakec;
@@ -214,18 +210,15 @@ pub fn updateNav(
     self: *QuakeC,
     pt: Zcu.PerThread,
     nav_index: InternPool.Nav.Index,
-) link.File.UpdateNavError!void {
+) link.Error!void {
     _ = self; // autofix
-    if (build_options.skip_non_native and builtin.object_format != .quakec) {
-        @panic("Attempted to compile for object format that was disabled by build configuration");
-    }
     const zcu = pt.zcu;
     const ip = &zcu.intern_pool;
     const nav = ip.getNav(nav_index);
+    const nav_res = nav.resolved.?;
 
-    const nav_init = switch (ip.indexToKey(nav.status.fully_resolved.val)) {
+    const nav_init = switch (ip.indexToKey(nav_res.value)) {
         .func => .none,
-        .variable => |variable| variable.init,
         .@"extern" => |ext| {
             _ = ext; // autofix
             @panic("@Todo updateNav extern");
@@ -246,11 +239,11 @@ pub fn updateNav(
             // }
             // return;
         },
-        else => nav.status.fully_resolved.val,
+        else => nav_res.value,
     };
     log.debug("@Todo updateNav {f}", .{nav.fqn.fmt(ip)});
 
-    // const nav_init, const chased_nav_index = switch (ip.indexToKey(nav.status.fully_resolved.val)) {
+    // const nav_init, const chased_nav_index = switch (ip.indexToKey(nav.resolved.?.value)) {
     //     .func => return, // global const which is a function alias
     //     .@"extern" => |ext| {
     //         // const name = ext.name.toSlice(ip);
@@ -267,7 +260,7 @@ pub fn updateNav(
     //         @panic("TODO updateNav extern");
     //     },
     //     .variable => |variable| .{ variable.init, variable.owner_nav },
-    //     else => .{ nav.status.fully_resolved.val, nav_index },
+    //     else => .{ nav.resolved.?.value, nav_index },
     // };
     // log.debug("updateNav {f} {d}", .{ nav.fqn.fmt(ip), chased_nav_index });
 
@@ -280,8 +273,10 @@ pub fn updateLineNumber(
     self: *QuakeC,
     pt: Zcu.PerThread,
     ti_id: InternPool.TrackedInst.Index,
+    line: u32,
 ) !void {
     _ = self; // autofix
+    _ = line;
 
     const zcu = pt.zcu;
     const ip = &zcu.intern_pool;
@@ -294,7 +289,7 @@ pub fn updateLineNumber(
         file.sub_file_path,
         decl.src_line + 1,
         decl.src_column + 1,
-        @intFromEnum(inst_info.inst),
+        @backingInt(inst_info.inst),
         file.zir.?.nullTerminatedString(decl.name),
     });
     @panic("@Todo updateLineNumber");
@@ -303,25 +298,21 @@ pub fn updateLineNumber(
 pub fn updateExports(
     self: *QuakeC,
     pt: Zcu.PerThread,
-    exported: Zcu.Exported,
     export_indices: []const Zcu.Export.Index,
 ) !void {
     _ = self;
-    if (build_options.skip_non_native and builtin.object_format != .quakec) {
-        @panic("Attempted to compile for object format that was disabled by build configuration");
-    }
 
     const zcu = pt.zcu;
     const ip = &zcu.intern_pool;
     for (export_indices) |export_idx| {
         const exp = export_idx.ptr(zcu);
         const name_slice = exp.opts.name.toSlice(ip);
-        switch (exported) {
+        switch (exp.exported) {
             .nav => |nav_index| {
-                log.debug("updateExports '{s}' nav={d}", .{ name_slice, @intFromEnum(nav_index) });
+                log.debug("updateExports '{s}' nav={d}", .{ name_slice, @backingInt(nav_index) });
             },
             .uav => |uav_index| {
-                log.debug("updateExports '{s}' uav={d}", .{ name_slice, @intFromEnum(uav_index) });
+                log.debug("updateExports '{s}' uav={d}", .{ name_slice, @backingInt(uav_index) });
             },
         }
     }
@@ -331,58 +322,10 @@ pub fn updateExports(
     // @panic("@Todo updateExports");
 }
 
-pub fn getNavVAddr(
-    self: *QuakeC,
-    pt: Zcu.PerThread,
-    nav_index: InternPool.Nav.Index,
-    reloc_info: link.File.RelocInfo,
-) !u64 {
-    _ = self; // autofix
-    _ = pt; // autofix
-    _ = nav_index; // autofix
-    _ = reloc_info; // autofix
-    @panic("@Todo");
-}
-
-pub fn lowerUav(
-    self: *QuakeC,
-    pt: Zcu.PerThread,
-    decl_val: InternPool.Index,
-    decl_align: InternPool.Alignment,
-    src_loc: Zcu.LazySrcLoc,
-) codegen.GenerateSymbolError!codegen.SymbolResult {
-    _ = self; // autofix
-    _ = pt; // autofix
-    _ = decl_val; // autofix
-    _ = decl_align; // autofix
-    _ = src_loc; // autofix
-    @panic("@Todo");
-}
-
-pub fn getUavVAddr(self: *QuakeC, decl_val: InternPool.Index, reloc_info: link.File.RelocInfo) !u64 {
-    _ = self; // autofix
-    _ = decl_val; // autofix
-    _ = reloc_info; // autofix
-    @panic("@Todo getUavVAddr");
-}
-
-pub fn deleteExport(
-    self: *QuakeC,
-    exported: Zcu.Exported,
-    name: InternPool.NullTerminatedString,
-) void {
-    const zcu = self.base.comp.zcu.?;
-    const ip = &zcu.intern_pool;
-    const name_slice = name.toSlice(ip);
-    switch (exported) {
-        .nav => |nav_index| {
-            log.debug("deleteExport '{s}' nav={d}", .{ name_slice, @intFromEnum(nav_index) });
-        },
-        .uav => |uav_index| {
-            log.debug("deleteExport '{s}' uav={d}", .{ name_slice, @intFromEnum(uav_index) });
-        },
-    }
-    @panic("@Todo deleteExport");
+pub fn loadInput(self: *QuakeC, _: link.Input) !void {
+    const comp = self.base.comp;
+    const diags = &comp.link_diags;
+    return diags.fail("quakec does not support linking files together", .{});
 }
 
 /// Commit pending changes and write headers. Takes into account final output mode.
@@ -392,7 +335,7 @@ pub fn flush(
     arena: Allocator,
     tid: Zcu.PerThread.Id,
     prog_node: std.Progress.Node,
-) link.File.FlushError!void {
+) link.Error!void {
     // The goal is to never use this because it's only needed if we need to
     // write to InternPool, but flush is too late to be writing to the
     // InternPool.
@@ -414,6 +357,7 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
     const zcu = self.base.comp.zcu.?;
     const ip = &zcu.intern_pool;
     const mir = self.func_mir.?;
+    const io = self.base.comp.io;
 
     assert(mir.num_params == 0); // @Todo @Cleanup handle parameter allocation later
     const num_globals = mir.immediates.len + mir.locals.len + mir.globals.len;
@@ -479,26 +423,19 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
     }
     for (mir.globals, 0..) |nav_idx, index| {
         const offset: u32 = @intCast(globals.items.len); // not to be confused with mir.globals!
-        // @Cleanup
-
-        // It's not very clear how you're supposed to transform an InternPool.Index into the desired data.
-        // Here I want to get the initial value of the Nav, but have to chase it through an Index in a subfield,
-        // to a Value, to an InternPool.Key.Variable, to another Index in a subfield, then back to a Value, and finally to a float.
-        // Also, the conversions to a Value are largely redundant since getVariable and toFloat immediately convert back to an Index to call indexToKey.
-        //
-        // This is probably obvious to those with a better understanding of InternPool's guts, but to an outsider it's like cutting through thick jungle.
-        // It doesn't have to be this way; InternPool seems conceptually simple. An overview of how it works, how it's supposed to be used and why,
-        // and how other data structures (Key, Tag, Index, Nav, Uav, Value, Type, etc.) relate to it, would go a long way.
-
-        // Also, I'm not sure but, I think in InternPool functions that accept a "val: Index" argument, val is the index of a Value.
 
         const nav = ip.getNav(nav_idx);
-        assert(nav.typeOf(ip) == .f32_type); // @Todo handle all QC types
-        assert(ip.isVariable(nav.status.fully_resolved.val));
-        // const nav_val: Value = .fromInterned(nav.status.fully_resolved.val);
-        // const init_val_idx = nav_val.getVariable(zcu).?.init;
-        const init_val_idx = ip.indexToKey(nav.status.fully_resolved.val).variable.init;
-        const init_value: f32 = if (!ip.isUndef(init_val_idx)) Value.fromInterned(init_val_idx).toFloat(f32, zcu) else 0;
+        const nav_res = nav.resolved.?;
+
+        // for now nav must be a non-extern variable
+        assert(nav_res.type == .f32_type); // @Todo handle all QC types
+        assert(nav.getExtern(ip) == null);
+        assert(!nav_res.@"const");
+
+        const init_value: f32 = if (nav_res.value != .none and !ip.isUndef(nav_res.value))
+            Value.fromInterned(nav_res.value).toFloat(f32, zcu)
+        else
+            0;
 
         globals.appendAssumeCapacity(init_value);
         globaldefs.appendAssumeCapacity(.{
@@ -590,7 +527,7 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
     }
 
     var buf: [64]u8 = undefined;
-    var file = self.base.file.?.writer(&buf);
+    var file = self.base.file.?.writer(io, &buf);
     try file.seekTo(@sizeOf(Header)); // skip incomplete header
 
     header.ofs_statements = @intCast(file.pos + file.interface.end);
@@ -606,7 +543,7 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
     try file.interface.writeSliceEndian(Function, functions.items, .little);
 
     header.ofs_globals = @intCast(file.pos + file.interface.end);
-    try file.interface.writeSliceEndian(f32, globals.items, .little);
+    try file.interface.writeSliceEndian(u32, @ptrCast(globals.items), .little);
 
     // write strings last to avoid realigning other sections
     header.ofs_strings = @intCast(file.pos + file.interface.end);

@@ -1,24 +1,26 @@
+const LibCDirs = @This();
+const builtin = @import("builtin");
+
+const std = @import("../std.zig");
+const Io = std.Io;
+const LibCInstallation = std.zig.LibCInstallation;
+const Allocator = std.mem.Allocator;
+const Path = std.Build.Cache.Path;
+
 libc_include_dir_list: []const []const u8,
 libc_installation: ?*const LibCInstallation,
 libc_framework_dir_list: []const []const u8,
 sysroot: ?[]const u8,
-darwin_sdk_layout: ?DarwinSdkLayout,
-
-/// The filesystem layout of darwin SDK elements.
-pub const DarwinSdkLayout = enum {
-    /// macOS SDK layout: TOP { /usr/include, /usr/lib, /System/Library/Frameworks }.
-    sdk,
-    /// Shipped libc layout: TOP { /lib/libc/include,  /lib/libc/darwin, <NONE> }.
-    vendored,
-};
 
 pub fn detect(
     arena: Allocator,
-    zig_lib_dir: []const u8,
+    io: Io,
+    zig_lib_dir: Path,
     target: *const std.Target,
     is_native_abi: bool,
     link_libc: bool,
     libc_installation: ?*const LibCInstallation,
+    environ_map: *const std.process.Environ.Map,
 ) LibCInstallation.FindError!LibCDirs {
     if (!link_libc) {
         return .{
@@ -26,7 +28,6 @@ pub fn detect(
             .libc_installation = null,
             .libc_framework_dir_list = &.{},
             .sysroot = null,
-            .darwin_sdk_layout = null,
         };
     }
 
@@ -38,7 +39,10 @@ pub fn detect(
     // using the system libc installation.
     if (is_native_abi and !target.isMinGW()) {
         const libc = try arena.create(LibCInstallation);
-        libc.* = LibCInstallation.findNative(.{ .allocator = arena, .target = target }) catch |err| switch (err) {
+        libc.* = LibCInstallation.findNative(arena, io, .{
+            .target = target,
+            .environ_map = environ_map,
+        }) catch |err| switch (err) {
             error.CCompilerExitCode,
             error.CCompilerCrashed,
             error.CCompilerCannotFindHeaders,
@@ -75,22 +79,24 @@ pub fn detect(
 
     if (use_system_abi) {
         const libc = try arena.create(LibCInstallation);
-        libc.* = try LibCInstallation.findNative(.{ .allocator = arena, .verbose = true, .target = target });
+        libc.* = try LibCInstallation.findNative(arena, io, .{
+            .verbose = true,
+            .target = target,
+            .environ_map = environ_map,
+        });
         return detectFromInstallation(arena, target, libc);
     }
 
     return .{
-        .libc_include_dir_list = &[0][]u8{},
+        .libc_include_dir_list = &.{},
         .libc_installation = null,
         .libc_framework_dir_list = &.{},
         .sysroot = null,
-        .darwin_sdk_layout = null,
     };
 }
 
 fn detectFromInstallation(arena: Allocator, target: *const std.Target, lci: *const LibCInstallation) !LibCDirs {
     var list = try std.array_list.Managed([]const u8).initCapacity(arena, 5);
-    var framework_list = std.array_list.Managed([]const u8).init(arena);
 
     list.appendAssumeCapacity(lci.include_dir.?);
 
@@ -115,54 +121,45 @@ fn detectFromInstallation(arena: Allocator, target: *const std.Target, lci: *con
     }
     if (target.os.tag == .haiku) {
         const include_dir_path = lci.include_dir.?;
-        const os_dir = try std.fs.path.join(arena, &[_][]const u8{ include_dir_path, "os" });
-        list.appendAssumeCapacity(os_dir);
-        // Errors.h
-        const os_support_dir = try std.fs.path.join(arena, &[_][]const u8{ include_dir_path, "os/support" });
-        list.appendAssumeCapacity(os_support_dir);
 
-        const config_dir = try std.fs.path.join(arena, &[_][]const u8{ include_dir_path, "config" });
-        list.appendAssumeCapacity(config_dir);
+        const subdirs = &[_][]const u8{
+            "os",                   "os/app",                  "os/device",               "os/drivers",
+            "os/game",              "os/interface",            "os/kernel",               "os/locale",
+            "os/mail",              "os/media",                "os/midi",                 "os/midi2",
+            "os/net",               "os/opengl",               "os/storage",              "os/support",
+            "os/translation",       "os/add-ons/graphics",     "os/add-ons/input_server", "os/add-ons/mail_daemon",
+            "os/add-ons/registrar", "os/add-ons/screen_saver", "os/add-ons/tracker",      "os/be_apps/NetPositive",
+            "os/be_apps/Tracker",   "bsd",                     "glibc",                   "gnu",
+        };
+        for (subdirs) |subdir| {
+            const path = try std.fs.path.join(arena, &[_][]const u8{ include_dir_path, subdir });
+            try list.append(path);
+        }
     }
 
-    var sysroot: ?[]const u8 = null;
-
-    if (target.os.tag.isDarwin()) d: {
-        const down1 = std.fs.path.dirname(lci.sys_include_dir.?) orelse break :d;
-        const down2 = std.fs.path.dirname(down1) orelse break :d;
-        try framework_list.append(try std.fs.path.join(arena, &.{ down2, "System", "Library", "Frameworks" }));
-        sysroot = down2;
-    }
+    const frameworks: []const []const u8 = if (target.os.tag.isDarwin()) try arena.dupe([]const u8, &.{
+        try std.fs.path.join(arena, &.{ lci.darwin_sdk_dir.?, "System", "Library", "Frameworks" }),
+    }) else &.{};
 
     return .{
         .libc_include_dir_list = list.items,
         .libc_installation = lci,
-        .libc_framework_dir_list = framework_list.items,
-        .sysroot = sysroot,
-        .darwin_sdk_layout = if (sysroot == null) null else .sdk,
+        .libc_framework_dir_list = frameworks,
+        .sysroot = if (target.os.tag.isDarwin()) lci.darwin_sdk_dir.? else null,
     };
 }
 
-pub fn detectFromBuilding(
-    arena: Allocator,
-    zig_lib_dir: []const u8,
-    target: *const std.Target,
-) !LibCDirs {
+pub fn detectFromBuilding(arena: Allocator, zig_lib_dir: Path, target: *const std.Target) !LibCDirs {
     const s = std.fs.path.sep_str;
 
     if (target.os.tag.isDarwin()) {
         const list = try arena.alloc([]const u8, 1);
-        list[0] = try std.fmt.allocPrint(
-            arena,
-            "{s}" ++ s ++ "libc" ++ s ++ "include" ++ s ++ "any-macos-any",
-            .{zig_lib_dir},
-        );
+        list[0] = try arena.print("{f}" ++ s ++ "libc" ++ s ++ "include" ++ s ++ "any-darwin-any", .{zig_lib_dir});
         return .{
             .libc_include_dir_list = list,
             .libc_installation = null,
             .libc_framework_dir_list = &.{},
             .sysroot = null,
-            .darwin_sdk_layout = .vendored,
         };
     }
 
@@ -176,6 +173,8 @@ pub fn detectFromBuilding(
         std.zig.target.freebsdArchNameHeaders(target.cpu.arch)
     else if (target.isNetBSDLibC())
         std.zig.target.netbsdArchNameHeaders(target.cpu.arch)
+    else if (target.isOpenBSDLibC())
+        std.zig.target.openbsdArchNameHeaders(target.cpu.arch)
     else
         @tagName(target.cpu.arch);
     const os_name = @tagName(target.os.tag);
@@ -187,27 +186,19 @@ pub fn detectFromBuilding(
         std.zig.target.netbsdAbiNameHeaders(target.abi)
     else
         @tagName(target.abi);
-    const arch_include_dir = try std.fmt.allocPrint(
-        arena,
-        "{s}" ++ s ++ "libc" ++ s ++ "include" ++ s ++ "{s}-{s}-{s}",
-        .{ zig_lib_dir, arch_name, os_name, abi_name },
-    );
-    const generic_include_dir = try std.fmt.allocPrint(
-        arena,
-        "{s}" ++ s ++ "libc" ++ s ++ "include" ++ s ++ "generic-{s}",
-        .{ zig_lib_dir, generic_name },
-    );
+    const arch_include_dir = try arena.print("{f}" ++ s ++ "libc" ++ s ++ "include" ++ s ++ "{s}-{s}-{s}", .{
+        zig_lib_dir, arch_name, os_name, abi_name,
+    });
+    const generic_include_dir = try arena.print("{f}" ++ s ++ "libc" ++ s ++ "include" ++ s ++ "generic-{s}", .{
+        zig_lib_dir, generic_name,
+    });
     const generic_arch_name = std.zig.target.osArchName(target);
-    const arch_os_include_dir = try std.fmt.allocPrint(
-        arena,
-        "{s}" ++ s ++ "libc" ++ s ++ "include" ++ s ++ "{s}-{s}-any",
-        .{ zig_lib_dir, generic_arch_name, os_name },
-    );
-    const generic_os_include_dir = try std.fmt.allocPrint(
-        arena,
-        "{s}" ++ s ++ "libc" ++ s ++ "include" ++ s ++ "any-{s}-any",
-        .{ zig_lib_dir, os_name },
-    );
+    const arch_os_include_dir = try arena.print("{f}" ++ s ++ "libc" ++ s ++ "include" ++ s ++ "{s}-{s}-any", .{
+        zig_lib_dir, generic_arch_name, os_name,
+    });
+    const generic_os_include_dir = try arena.print("{f}" ++ s ++ "libc" ++ s ++ "include" ++ s ++ "any-{s}-any", .{
+        zig_lib_dir, os_name,
+    });
 
     const list = try arena.alloc([]const u8, 4);
     list[0] = arch_include_dir;
@@ -220,16 +211,16 @@ pub fn detectFromBuilding(
         .libc_installation = null,
         .libc_framework_dir_list = &.{},
         .sysroot = null,
-        .darwin_sdk_layout = .vendored,
     };
 }
 
 fn libCGenericName(target: *const std.Target) [:0]const u8 {
     switch (target.os.tag) {
         .windows => return "mingw",
-        .macos, .ios, .tvos, .watchos, .visionos => return "darwin",
+        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => return "darwin",
         .freebsd => return "freebsd",
         .netbsd => return "netbsd",
+        .openbsd => return "openbsd",
         else => {},
     }
     switch (target.abi) {
@@ -254,23 +245,17 @@ fn libCGenericName(target: *const std.Target) [:0]const u8 {
         .ohos,
         .ohoseabi,
         => return "musl",
-        .code16,
         .eabi,
         .eabihf,
+        .abin32,
+        .x32,
         .ilp32,
         .android,
         .androideabi,
         .msvc,
         .itanium,
-        .cygnus,
         .simulator,
-        .macabi,
+        .call0,
         => unreachable,
     }
 }
-
-const LibCDirs = @This();
-const builtin = @import("builtin");
-const std = @import("../std.zig");
-const LibCInstallation = std.zig.LibCInstallation;
-const Allocator = std.mem.Allocator;

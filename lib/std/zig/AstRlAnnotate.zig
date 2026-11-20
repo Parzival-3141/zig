@@ -141,11 +141,7 @@ fn expr(astrl: *AstRlAnnotate, node: Ast.Node.Index, block: ?*Block, ri: ResultI
         .asm_input,
         => unreachable,
 
-        .@"errdefer" => {
-            _ = try astrl.expr(tree.nodeData(node).opt_token_and_node[1], block, ResultInfo.none);
-            return false;
-        },
-        .@"defer" => {
+        .@"defer", .@"errdefer" => {
             _ = try astrl.expr(tree.nodeData(node).node, block, ResultInfo.none);
             return false;
         },
@@ -273,12 +269,6 @@ fn expr(astrl: *AstRlAnnotate, node: Ast.Node.Index, block: ?*Block, ri: ResultI
             return false;
         },
 
-        .array_mult => {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            _ = try astrl.expr(lhs, block, ResultInfo.none);
-            _ = try astrl.expr(rhs, block, ResultInfo.type_only);
-            return false;
-        },
         .error_union, .merge_error_sets => {
             const lhs, const rhs = tree.nodeData(node).node_and_node;
             _ = try astrl.expr(lhs, block, ResultInfo.none);
@@ -310,7 +300,6 @@ fn expr(astrl: *AstRlAnnotate, node: Ast.Node.Index, block: ?*Block, ri: ResultI
         .unreachable_literal,
         .asm_simple,
         .@"asm",
-        .asm_legacy,
         .enum_literal,
         .error_value,
         .anyframe_literal,
@@ -340,14 +329,7 @@ fn expr(astrl: *AstRlAnnotate, node: Ast.Node.Index, block: ?*Block, ri: ResultI
             for (full.ast.params) |param_node| {
                 _ = try astrl.expr(param_node, block, ResultInfo.type_only);
             }
-            return switch (tree.nodeTag(node)) {
-                .call_one,
-                .call_one_comma,
-                .call,
-                .call_comma,
-                => false, // TODO: once function calls are passed result locations this will change
-                else => unreachable,
-            };
+            return false; // TODO: once function calls are passed result locations this will change
         },
 
         .@"return" => {
@@ -850,10 +832,6 @@ fn builtinCall(astrl: *AstRlAnnotate, block: ?*Block, ri: ResultInfo, node: Ast.
             _ = try astrl.expr(args[2], block, ResultInfo.type_only);
             return false;
         },
-        .c_import => {
-            _ = try astrl.expr(args[0], block, ResultInfo.none);
-            return false;
-        },
         .min, .max => {
             for (args) |arg_node| {
                 _ = try astrl.expr(arg_node, block, ResultInfo.none);
@@ -873,6 +851,7 @@ fn builtinCall(astrl: *AstRlAnnotate, block: ?*Block, ri: ResultInfo, node: Ast.
         // These builtins take no args and do not consume the result pointer.
         .src,
         .This,
+        .EnumLiteral,
         .return_address,
         .error_return_trace,
         .frame,
@@ -889,6 +868,19 @@ fn builtinCall(astrl: *AstRlAnnotate, block: ?*Block, ri: ResultInfo, node: Ast.
         .frame_address => return true,
         // These builtins take a single argument with a known result type, but do not consume their
         // result pointer.
+        .sqrt,
+        .sin,
+        .cos,
+        .tan,
+        .exp,
+        .exp2,
+        .log,
+        .log2,
+        .log10,
+        .floor,
+        .ceil,
+        .trunc,
+        .round,
         .size_of,
         .bit_size_of,
         .align_of,
@@ -897,12 +889,11 @@ fn builtinCall(astrl: *AstRlAnnotate, block: ?*Block, ri: ResultInfo, node: Ast.
         .int_from_bool,
         .int_from_error,
         .error_from_int,
+        .from_backing_int,
         .embed_file,
         .error_name,
         .set_runtime_safety,
-        .Type,
-        .c_undef,
-        .c_include,
+        .Tuple,
         .wasm_memory_size,
         .splat,
         .set_float_mode,
@@ -918,20 +909,7 @@ fn builtinCall(astrl: *AstRlAnnotate, block: ?*Block, ri: ResultInfo, node: Ast.
         // result pointer.
         .int_from_ptr,
         .int_from_enum,
-        .sqrt,
-        .sin,
-        .cos,
-        .tan,
-        .exp,
-        .exp2,
-        .log,
-        .log2,
-        .log10,
         .abs,
-        .floor,
-        .ceil,
-        .trunc,
-        .round,
         .tag_name,
         .type_name,
         .Frame,
@@ -939,6 +917,7 @@ fn builtinCall(astrl: *AstRlAnnotate, block: ?*Block, ri: ResultInfo, node: Ast.
         .float_from_int,
         .ptr_from_int,
         .enum_from_int,
+        .backing_int,
         .float_cast,
         .int_cast,
         .truncate,
@@ -959,6 +938,7 @@ fn builtinCall(astrl: *AstRlAnnotate, block: ?*Block, ri: ResultInfo, node: Ast.
         },
         .div_exact,
         .div_floor,
+        .div_ceil,
         .div_trunc,
         .mod,
         .rem,
@@ -991,11 +971,6 @@ fn builtinCall(astrl: *AstRlAnnotate, block: ?*Block, ri: ResultInfo, node: Ast.
         .wasm_memory_grow => {
             _ = try astrl.expr(args[0], block, ResultInfo.type_only);
             _ = try astrl.expr(args[1], block, ResultInfo.type_only);
-            return false;
-        },
-        .c_define => {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.none);
             return false;
         },
         .reduce => {
@@ -1063,6 +1038,52 @@ fn builtinCall(astrl: *AstRlAnnotate, block: ?*Block, ri: ResultInfo, node: Ast.
             _ = try astrl.expr(args[1], block, ResultInfo.none);
             _ = try astrl.expr(args[2], block, ResultInfo.none);
             _ = try astrl.expr(args[3], block, ResultInfo.none);
+            return false;
+        },
+        .Int => {
+            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+            return false;
+        },
+        .Pointer => {
+            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
+            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
+            return false;
+        },
+        .Fn => {
+            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
+            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
+            return false;
+        },
+        .Struct => {
+            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
+            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
+            _ = try astrl.expr(args[4], block, ResultInfo.type_only);
+            return false;
+        },
+        .Union => {
+            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
+            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
+            _ = try astrl.expr(args[4], block, ResultInfo.type_only);
+            return false;
+        },
+        .Enum => {
+            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
+            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
+            return false;
+        },
+        .SpirvType => {
+            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
             return false;
         },
         .Vector => {

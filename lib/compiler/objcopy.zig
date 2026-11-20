@@ -1,12 +1,13 @@
 const builtin = @import("builtin");
+
 const std = @import("std");
+const Io = std.Io;
 const mem = std.mem;
 const fs = std.fs;
 const elf = std.elf;
 const Allocator = std.mem.Allocator;
-const File = std.fs.File;
+const File = std.Io.File;
 const assert = std.debug.assert;
-
 const fatal = std.process.fatal;
 const Server = std.zig.Server;
 
@@ -16,20 +17,13 @@ var stdout_buffer: [1024]u8 = undefined;
 var input_buffer: [1024]u8 = undefined;
 var output_buffer: [1024]u8 = undefined;
 
-pub fn main() !void {
-    var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena_instance.deinit();
-    const arena = arena_instance.allocator();
-
-    var general_purpose_allocator: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    const gpa = general_purpose_allocator.allocator();
-
-    const args = try std.process.argsAlloc(arena);
-    return cmdObjCopy(gpa, arena, args[1..]);
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(arena);
+    return cmdObjCopy(arena, init.io, args[1..]);
 }
 
-fn cmdObjCopy(gpa: Allocator, arena: Allocator, args: []const []const u8) !void {
-    _ = gpa;
+fn cmdObjCopy(arena: Allocator, io: Io, args: []const []const u8) !void {
     var i: usize = 0;
     var opt_out_fmt: ?std.Target.ObjectFormat = null;
     var opt_input: ?[]const u8 = null;
@@ -57,7 +51,7 @@ fn cmdObjCopy(gpa: Allocator, arena: Allocator, args: []const []const u8) !void 
                 fatal("unexpected positional argument: '{s}'", .{arg});
             }
         } else if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help")) {
-            return std.fs.File.stdout().writeAll(usage);
+            return Io.File.stdout().writeStreamingAll(io, usage);
         } else if (mem.eql(u8, arg, "-O") or mem.eql(u8, arg, "--output-target")) {
             i += 1;
             if (i >= args.len) fatal("expected another argument after '{s}'", .{arg});
@@ -148,12 +142,12 @@ fn cmdObjCopy(gpa: Allocator, arena: Allocator, args: []const []const u8) !void 
     const input = opt_input orelse fatal("expected input parameter", .{});
     const output = opt_output orelse fatal("expected output parameter", .{});
 
-    const input_file = fs.cwd().openFile(input, .{}) catch |err| fatal("failed to open {s}: {t}", .{ input, err });
-    defer input_file.close();
+    const input_file = Io.Dir.cwd().openFile(io, input, .{}) catch |err| fatal("failed to open {s}: {t}", .{ input, err });
+    defer input_file.close(io);
 
-    const stat = input_file.stat() catch |err| fatal("failed to stat {s}: {t}", .{ input, err });
+    const stat = input_file.stat(io) catch |err| fatal("failed to stat {s}: {t}", .{ input, err });
 
-    var in: File.Reader = .initSize(input_file, &input_buffer, stat.size);
+    var in: File.Reader = .initSize(input_file, io, &input_buffer, stat.size);
 
     const elf_hdr = std.elf.Header.read(&in.interface) catch |err| switch (err) {
         error.ReadFailed => fatal("unable to read {s}: {t}", .{ input, in.err.? }),
@@ -174,12 +168,12 @@ fn cmdObjCopy(gpa: Allocator, arena: Allocator, args: []const []const u8) !void 
         }
     };
 
-    const mode = if (out_fmt != .elf or only_keep_debug) fs.File.default_mode else stat.mode;
+    const permissions: Io.File.Permissions = if (out_fmt != .elf or only_keep_debug) .default_file else stat.permissions;
 
-    var output_file = try fs.cwd().createFile(output, .{ .mode = mode });
-    defer output_file.close();
+    var output_file = try Io.Dir.cwd().createFile(io, output, .{ .permissions = permissions });
+    defer output_file.close(io);
 
-    var out = output_file.writer(&output_buffer);
+    var out = output_file.writer(io, &output_buffer);
 
     switch (out_fmt) {
         .hex, .raw => {
@@ -218,20 +212,20 @@ fn cmdObjCopy(gpa: Allocator, arena: Allocator, args: []const []const u8) !void 
     try out.end();
 
     if (listen) {
-        var stdin_reader = fs.File.stdin().reader(&stdin_buffer);
-        var stdout_writer = fs.File.stdout().writer(&stdout_buffer);
-        var server = try Server.init(.{
+        var stdin_reader = Io.File.stdin().reader(io, &stdin_buffer);
+        var stdout_writer = Io.File.stdout().writer(io, &stdout_buffer);
+        var server: Server = .{
             .in = &stdin_reader.interface,
             .out = &stdout_writer.interface,
-            .zig_version = builtin.zig_version_string,
-        });
+        };
+        try server.serveStringMessage(.zig_version, builtin.zig_version_string);
 
         var seen_update = false;
         while (true) {
             const hdr = try server.receiveMessage();
             switch (hdr.tag) {
                 .exit => {
-                    return std.process.cleanExit();
+                    return std.process.cleanExit(io);
                 },
                 .update => {
                     if (seen_update) fatal("zig objcopy only supports 1 update for now", .{});
@@ -240,13 +234,13 @@ fn cmdObjCopy(gpa: Allocator, arena: Allocator, args: []const []const u8) !void 
                     // The build system already knows what the output is at this point, we
                     // only need to communicate that the process has finished.
                     // Use the empty error bundle to indicate that the update is done.
-                    try server.serveErrorBundle(std.zig.ErrorBundle.empty);
+                    try server.serveErrorBundle(.error_bundle, std.zig.ErrorBundle.empty);
                 },
-                else => fatal("unsupported message: {s}", .{@tagName(hdr.tag)}),
+                else => fatal("unsupported message: {t}", .{hdr.tag}),
             }
         }
     }
-    return std.process.cleanExit();
+    return std.process.cleanExit(io);
 }
 
 const usage =
@@ -378,8 +372,8 @@ const BinaryElfSegment = struct {
 };
 
 const BinaryElfOutput = struct {
-    segments: std.ArrayListUnmanaged(*BinaryElfSegment),
-    sections: std.ArrayListUnmanaged(*BinaryElfSection),
+    segments: std.ArrayList(*BinaryElfSegment),
+    sections: std.ArrayList(*BinaryElfSection),
     allocator: Allocator,
     shstrtab: ?[]const u8,
 
@@ -394,8 +388,8 @@ const BinaryElfOutput = struct {
 
     pub fn parse(allocator: Allocator, in: *File.Reader, elf_hdr: elf.Header) !Self {
         var self: Self = .{
-            .segments = .{},
-            .sections = .{},
+            .segments = .empty,
+            .sections = .empty,
             .allocator = allocator,
             .shstrtab = null,
         };
@@ -415,7 +409,7 @@ const BinaryElfOutput = struct {
             const shstrtab_shdr = (try section_headers.next()).?;
 
             try in.seekTo(shstrtab_shdr.sh_offset);
-            break :blk try in.interface.readAlloc(allocator, shstrtab_shdr.sh_size);
+            break :blk try in.interface.readAllocAll(allocator, shstrtab_shdr.sh_size);
         };
 
         errdefer if (self.shstrtab) |shstrtab| allocator.free(shstrtab);
@@ -441,13 +435,13 @@ const BinaryElfOutput = struct {
 
         var program_headers = elf_hdr.iterateProgramHeaders(in);
         while (try program_headers.next()) |phdr| {
-            if (phdr.p_type == elf.PT_LOAD) {
+            if (phdr.type == .LOAD) {
                 const newSegment = try allocator.create(BinaryElfSegment);
 
-                newSegment.physicalAddress = phdr.p_paddr;
-                newSegment.virtualAddress = phdr.p_vaddr;
-                newSegment.fileSize = @intCast(phdr.p_filesz);
-                newSegment.elfOffset = phdr.p_offset;
+                newSegment.physicalAddress = phdr.paddr;
+                newSegment.virtualAddress = phdr.vaddr;
+                newSegment.fileSize = @intCast(phdr.filesz);
+                newSegment.elfOffset = phdr.offset;
                 newSegment.binaryOffset = 0;
                 newSegment.firstSection = null;
 
@@ -501,8 +495,8 @@ const BinaryElfOutput = struct {
         return self;
     }
 
-    fn sectionWithinSegment(section: *BinaryElfSection, segment: elf.Elf64_Phdr) bool {
-        return segment.p_offset <= section.elfOffset and (segment.p_offset + segment.p_filesz) >= (section.elfOffset + section.fileSize);
+    fn sectionWithinSegment(section: *BinaryElfSection, segment: elf.Elf64.Phdr) bool {
+        return segment.offset <= section.elfOffset and (segment.offset + segment.filesz) >= (section.elfOffset + section.fileSize);
     }
 
     fn sectionValidForOutput(shdr: anytype) bool {
@@ -606,7 +600,7 @@ const HexWriter = struct {
             const parts = addressParts(self.address);
             sum +%= parts[0];
             sum +%= parts[1];
-            sum +%= @intFromEnum(self.payload);
+            sum +%= @backingInt(self.payload);
             for (payload_bytes) |byte| {
                 sum +%= byte;
             }
@@ -621,10 +615,10 @@ const HexWriter = struct {
             const payload_bytes = self.getPayloadBytes();
             assert(payload_bytes.len <= max_payload_len);
 
-            const line = try std.fmt.bufPrint(&outbuf, ":{0X:0>2}{1X:0>4}{2X:0>2}{3X}{4X:0>2}" ++ linesep, .{
+            const line = try std.mem.print(&outbuf, ":{0X:0>2}{1X:0>4}{2X:0>2}{3X}{4X:0>2}" ++ linesep, .{
                 @as(u8, @intCast(payload_bytes.len)),
                 self.address,
-                @intFromEnum(self.payload),
+                @backingInt(self.payload),
                 payload_bytes,
                 self.checksum(),
             });
@@ -672,8 +666,10 @@ fn containsValidAddressRange(segments: []*BinaryElfSegment) bool {
 }
 
 fn padFile(out: *File.Writer, opt_size: ?u64) !void {
+    const io = out.io;
     const size = opt_size orelse return;
-    try out.file.setEndPos(size);
+    try out.file.setLength(io, size);
+    try out.seekTo(size);
 }
 
 test "HexWriter.Record.Address has correct payload and checksum" {

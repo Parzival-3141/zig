@@ -1,3 +1,20 @@
+const std = @import("std");
+const Io = std.Io;
+const elf = std.elf;
+const log = std.log.scoped(.link);
+const Path = std.Build.Cache.Path;
+const Allocator = std.mem.Allocator;
+
+const Archive = @import("Archive.zig");
+const Atom = @import("Atom.zig");
+const Cie = @import("eh_frame.zig").Cie;
+const Elf = @import("../Elf.zig");
+const LinkerDefined = @import("LinkerDefined.zig");
+const Object = @import("Object.zig");
+const SharedObject = @import("SharedObject.zig");
+const Symbol = @import("Symbol.zig");
+const ZigObject = @import("ZigObject.zig");
+
 pub const File = union(enum) {
     zig_object: *ZigObject,
     linker_defined: *LinkerDefined,
@@ -10,11 +27,11 @@ pub const File = union(enum) {
         };
     }
 
-    pub fn fmtPath(file: File) std.fmt.Formatter(File, formatPath) {
+    pub fn fmtPath(file: File) std.fmt.Alt(File, formatPath) {
         return .{ .data = file };
     }
 
-    fn formatPath(file: File, writer: *std.io.Writer) std.io.Writer.Error!void {
+    fn formatPath(file: File, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (file) {
             .zig_object => |zo| try writer.writeAll(zo.basename),
             .linker_defined => try writer.writeAll("(linker defined)"),
@@ -279,22 +296,6 @@ pub const File = union(enum) {
         shared_object: SharedObject,
     };
 
-    pub const Handle = std.fs.File;
+    pub const Handle = Io.File;
     pub const HandleIndex = Index;
 };
-
-const std = @import("std");
-const elf = std.elf;
-const log = std.log.scoped(.link);
-const Path = std.Build.Cache.Path;
-const Allocator = std.mem.Allocator;
-
-const Archive = @import("Archive.zig");
-const Atom = @import("Atom.zig");
-const Cie = @import("eh_frame.zig").Cie;
-const Elf = @import("../Elf.zig");
-const LinkerDefined = @import("LinkerDefined.zig");
-const Object = @import("Object.zig");
-const SharedObject = @import("SharedObject.zig");
-const Symbol = @import("Symbol.zig");
-const ZigObject = @import("ZigObject.zig");

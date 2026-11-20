@@ -1,5 +1,5 @@
 /* This file defines standard ELF types, structures, and macros.
-   Copyright (C) 1995-2025 Free Software Foundation, Inc.
+   Copyright (C) 1995-2026 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -798,7 +798,8 @@ typedef struct
 #define NT_X86_XSTATE	0x202		/* x86 extended state using xsave */
 #define NT_X86_SHSTK	0x204		/* x86 SHSTK state */
 #define NT_X86_XSAVE_LAYOUT	0x205		/* XSAVE layout description.  */
-#define NT_S390_HIGH_GPRS	0x300	/* s390 upper register halves */
+#define NT_S390_HIGH_GPRS	0x300	/* s390 upper register halves.  This was
+					   used in now removed s390-32 arch.  */
 #define NT_S390_TIMER	0x301		/* s390 timer register */
 #define NT_S390_TODCMP	0x302		/* s390 TOD clock comparator register */
 #define NT_S390_TODPREG	0x303		/* s390 TOD programmable register */
@@ -846,6 +847,7 @@ typedef struct
 #define NT_RISCV_VECTOR	0x901		/* RISC-V vector registers */
 #define NT_RISCV_TAGGED_ADDR_CTRL	0x902	/* RISC-V tagged
 						   address control */
+#define NT_RISCV_USER_CFI	0x903		/* RISC-V shadow stack state */
 #define NT_LOONGARCH_CPUCFG	0xa00	/* LoongArch CPU config registers.  */
 #define NT_LOONGARCH_CSR	0xa01	/* LoongArch control and
 					   status registers.  */
@@ -924,7 +926,7 @@ typedef struct
 #define DT_SYMTAB_SHNDX	34		/* Address of SYMTAB_SHNDX section */
 #define DT_RELRSZ	35		/* Total size of RELR relative relocations */
 #define DT_RELR		36		/* Address of RELR relative relocations */
-#define DT_RELRENT	37		/* Size of one RELR relative relocaction */
+#define DT_RELRENT	37		/* Size of one RELR relative relocation */
 #define	DT_NUM		38		/* Number used */
 #define DT_LOOS		0x6000000d	/* Start of OS-specific */
 #define DT_HIOS		0x6ffff000	/* End of OS-specific */
@@ -3470,7 +3472,9 @@ enum
 
 /* Valid values for the e_flags field.  */
 
-#define EF_S390_HIGH_GPRS    0x00000001  /* High GPRs kernel facility needed.  */
+#define EF_S390_HIGH_GPRS    0x00000001  /* High GPRs kernel facility needed.
+					    This was used in now removed s390-32
+					    arch.  */
 
 /* Additional s390 relocs */
 

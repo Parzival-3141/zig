@@ -5,17 +5,17 @@ const builtin = @import("builtin");
 
 fn ShardedTable(comptime Key: type, comptime mask_bit_count: comptime_int, comptime V: type) type {
     const key_bits = @typeInfo(Key).int.bits;
-    std.debug.assert(Key == std.meta.Int(.unsigned, key_bits));
+    std.debug.assert(Key == @Int(.unsigned, key_bits));
     std.debug.assert(key_bits >= mask_bit_count);
     const shard_key_bits = mask_bit_count;
-    const ShardKey = std.meta.Int(.unsigned, mask_bit_count);
+    const ShardKey = @Int(.unsigned, mask_bit_count);
     const shift_amount = key_bits - shard_key_bits;
     return struct {
         const Self = @This();
         shards: [1 << shard_key_bits]?*Node,
 
         pub fn create() Self {
-            return Self{ .shards = [_]?*Node{null} ** (1 << shard_key_bits) };
+            return .{ .shards = @splat(null) };
         }
 
         fn getShardKey(key: Key) ShardKey {
@@ -119,21 +119,12 @@ test "Saturating Shift Left where lhs is of a computed type" {
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
     const S = struct {
-        fn getIntShiftType(comptime T: type) type {
-            var unsigned_shift_type = @typeInfo(std.math.Log2Int(T)).int;
-            unsigned_shift_type.signedness = .signed;
-
-            return @Type(.{
-                .int = unsigned_shift_type,
-            });
-        }
-
         pub fn FixedPoint(comptime ValueType: type) type {
             return struct {
                 value: ValueType,
                 exponent: ShiftType,
 
-                const ShiftType: type = getIntShiftType(ValueType);
+                const ShiftType = @Int(.signed, @typeInfo(std.math.Log2Int(ValueType)).int.bits);
 
                 pub fn shiftExponent(self: @This(), shift: ShiftType) @This() {
                     const shiftAbs = @abs(shift);
@@ -156,11 +147,9 @@ test "Saturating Shift Left where lhs is of a computed type" {
 
 test "Saturating Shift Left" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest;
 
     const S = struct {
         fn shlSat(x: anytype, y: std.math.Log2Int(@TypeOf(x))) @TypeOf(x) {

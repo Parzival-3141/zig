@@ -1,11 +1,29 @@
 //! See the render function implementation for documentation of the fields.
+const LibCInstallation = @This();
+
+const builtin = @import("builtin");
+const is_darwin = builtin.target.os.tag.isDarwin();
+const is_windows = builtin.target.os.tag == .windows;
+const is_haiku = builtin.target.os.tag == .haiku;
+const is_serenity = builtin.target.os.tag == .serenity;
+
+const std = @import("std");
+const Io = std.Io;
+const Target = std.Target;
+const fs = std.fs;
+const Allocator = std.mem.Allocator;
+const Path = std.Build.Cache.Path;
+const Cache = std.Build.Cache;
+const log = std.log.scoped(.libc_installation);
+const Environ = std.process.Environ;
 
 include_dir: ?[]const u8 = null,
 sys_include_dir: ?[]const u8 = null,
 crt_dir: ?[]const u8 = null,
 msvc_lib_dir: ?[]const u8 = null,
 kernel32_lib_dir: ?[]const u8 = null,
-gcc_dir: ?[]const u8 = null,
+cc_dir: ?[]const u8 = null,
+darwin_sdk_dir: ?[]const u8 = null,
 
 pub const FindError = error{
     OutOfMemory,
@@ -23,19 +41,16 @@ pub const FindError = error{
     ZigIsTheCCompiler,
 };
 
-pub fn parse(
-    allocator: Allocator,
-    libc_file: []const u8,
-    target: *const std.Target,
-) !LibCInstallation {
+pub fn parse(allocator: Allocator, io: Io, libc_file: []const u8, target: *const std.Target) !LibCInstallation {
     var self: LibCInstallation = .{};
 
-    const fields = std.meta.fields(LibCInstallation);
+    const field_names = @typeInfo(LibCInstallation).@"struct".field_names;
     const FoundKey = struct {
         found: bool,
-        allocated: ?[:0]u8,
+        allocated: ?[]u8,
     };
-    var found_keys = [1]FoundKey{FoundKey{ .found = false, .allocated = null }} ** fields.len;
+
+    var found_keys: [field_names.len]FoundKey = @splat(.{ .found = false, .allocated = null });
     errdefer {
         self = .{};
         for (found_keys) |found_key| {
@@ -43,31 +58,34 @@ pub fn parse(
         }
     }
 
-    const contents = try std.fs.cwd().readFileAlloc(allocator, libc_file, std.math.maxInt(usize));
+    const contents = try Io.Dir.cwd().readFileAlloc(io, libc_file, allocator, .limited(std.math.maxInt(usize)));
     defer allocator.free(contents);
 
-    var it = std.mem.tokenizeScalar(u8, contents, '\n');
+    var it = std.mem.tokenizeAny(u8, contents, "\n\r");
     while (it.next()) |line| {
         if (line.len == 0 or line[0] == '#') continue;
         var line_it = std.mem.splitScalar(u8, line, '=');
         const name = line_it.first();
         const value = line_it.rest();
-        inline for (fields, 0..) |field, i| {
-            if (std.mem.eql(u8, name, field.name)) {
+        inline for (field_names, 0..) |field_name, i| {
+            // Allow `gcc_dir` as an alias for `cc_dir` for compatibility with older files.
+            if (std.mem.eql(u8, name, field_name) or
+                (std.mem.eql(u8, name, "gcc_dir") and std.mem.eql(u8, field_name, "cc_dir")))
+            {
                 found_keys[i].found = true;
                 if (value.len == 0) {
-                    @field(self, field.name) = null;
+                    @field(self, field_name) = null;
                 } else {
-                    found_keys[i].allocated = try allocator.dupeZ(u8, value);
-                    @field(self, field.name) = found_keys[i].allocated;
+                    found_keys[i].allocated = try allocator.dupe(u8, value);
+                    @field(self, field_name) = found_keys[i].allocated;
                 }
                 break;
             }
         }
     }
-    inline for (fields, 0..) |field, i| {
+    inline for (field_names, 0..) |field_name, i| {
         if (!found_keys[i].found) {
-            log.err("missing field: {s}", .{field.name});
+            log.err("missing field: {s}", .{field_name});
             return error.ParseError;
         }
     }
@@ -79,13 +97,17 @@ pub fn parse(
         log.err("sys_include_dir may not be empty", .{});
         return error.ParseError;
     }
-
-    const os_tag = target.os.tag;
-    if (self.crt_dir == null and !target.os.tag.isDarwin()) {
-        log.err("crt_dir may not be empty for {s}", .{@tagName(os_tag)});
+    if (self.crt_dir == null) {
+        log.err("crt_dir may not be empty", .{});
         return error.ParseError;
     }
 
+    const os_tag = target.os.tag;
+
+    if (self.cc_dir == null and (os_tag == .haiku or os_tag == .serenity or os_tag == .linux)) {
+        log.err("cc_dir may not be empty for {s}", .{@tagName(os_tag)});
+        return error.ParseError;
+    }
     if (self.msvc_lib_dir == null and os_tag == .windows and (target.abi == .msvc or target.abi == .itanium)) {
         log.err("msvc_lib_dir may not be empty for {s}-{s}", .{
             @tagName(os_tag),
@@ -100,9 +122,8 @@ pub fn parse(
         });
         return error.ParseError;
     }
-
-    if (self.gcc_dir == null and os_tag == .haiku) {
-        log.err("gcc_dir may not be empty for {s}", .{@tagName(os_tag)});
+    if (self.darwin_sdk_dir == null and os_tag.isDarwin()) {
+        log.err("darwin_sdk_dir may not be empty for {t}", .{os_tag});
         return error.ParseError;
     }
 
@@ -111,26 +132,23 @@ pub fn parse(
 
 pub fn render(self: LibCInstallation, out: *std.Io.Writer) !void {
     @setEvalBranchQuota(4000);
-    const include_dir = self.include_dir orelse "";
-    const sys_include_dir = self.sys_include_dir orelse "";
-    const crt_dir = self.crt_dir orelse "";
-    const msvc_lib_dir = self.msvc_lib_dir orelse "";
-    const kernel32_lib_dir = self.kernel32_lib_dir orelse "";
-    const gcc_dir = self.gcc_dir orelse "";
-
     try out.print(
         \\# The directory that contains `stdlib.h`.
-        \\# On POSIX-like systems, include directories be found with: `cc -E -Wp,-v -xc /dev/null`
+        \\# On POSIX, can be found with: `cc -E -Wp,-v -xc /dev/null`
         \\include_dir={s}
         \\
         \\# The system-specific include directory. May be the same as `include_dir`.
-        \\# On Windows it's the directory that includes `vcruntime.h`.
-        \\# On POSIX it's the directory that includes `sys/errno.h`.
+        \\# On Windows, it's the directory that includes `vcruntime.h`.
+        \\# On POSIX, it's the directory that includes `sys/errno.h`.
         \\sys_include_dir={s}
+        \\
+        \\# The directory that contains `crtbegin.o` and `crtend.o`. May be the same as `crt_dir`.
+        \\# On POSIX, can be found with `cc -print-file-name=crtbegin.o`.
+        \\# Only needed when targeting Haiku, Linux, or SerenityOS.
+        \\cc_dir={s}
         \\
         \\# The directory that contains `crt1.o` or `crt2.o`.
         \\# On POSIX, can be found with `cc -print-file-name=crt1.o`.
-        \\# Not needed when targeting MacOS.
         \\crt_dir={s}
         \\
         \\# The directory that contains `vcruntime.lib`.
@@ -141,73 +159,78 @@ pub fn render(self: LibCInstallation, out: *std.Io.Writer) !void {
         \\# Only needed when targeting MSVC on Windows.
         \\kernel32_lib_dir={s}
         \\
-        \\# The directory that contains `crtbeginS.o` and `crtendS.o`
-        \\# Only needed when targeting Haiku.
-        \\gcc_dir={s}
+        \\# The directory that contains `SDKSettings.json`
+        \\# Only needed when targeting Darwin.
+        \\darwin_sdk_dir={s}
         \\
     , .{
-        include_dir,
-        sys_include_dir,
-        crt_dir,
-        msvc_lib_dir,
-        kernel32_lib_dir,
-        gcc_dir,
+        self.include_dir orelse "",
+        self.sys_include_dir orelse "",
+        self.cc_dir orelse "",
+        self.crt_dir orelse "",
+        self.msvc_lib_dir orelse "",
+        self.kernel32_lib_dir orelse "",
+        self.darwin_sdk_dir orelse "",
     });
 }
 
 pub const FindNativeOptions = struct {
-    allocator: Allocator,
     target: *const std.Target,
+    environ_map: *const Environ.Map,
 
     /// If enabled, will print human-friendly errors to stderr.
     verbose: bool = false,
 };
 
 /// Finds the default, native libc.
-pub fn findNative(args: FindNativeOptions) FindError!LibCInstallation {
+pub fn findNative(gpa: Allocator, io: Io, args: FindNativeOptions) FindError!LibCInstallation {
     var self: LibCInstallation = .{};
 
     if (is_darwin and args.target.os.tag.isDarwin()) {
-        if (!std.zig.system.darwin.isSdkInstalled(args.allocator))
+        if (!std.zig.system.darwin.isSdkInstalled(gpa, io))
             return error.DarwinSdkNotFound;
-        const sdk = std.zig.system.darwin.getSdk(args.allocator, args.target) orelse
+        self.darwin_sdk_dir = std.zig.system.darwin.getSdk(gpa, io, args.target) orelse
             return error.DarwinSdkNotFound;
-        defer args.allocator.free(sdk);
 
-        self.include_dir = try fs.path.join(args.allocator, &.{
-            sdk, "usr/include",
-        });
-        self.sys_include_dir = try fs.path.join(args.allocator, &.{
-            sdk, "usr/include",
-        });
+        const sdk = self.darwin_sdk_dir.?;
+        self.include_dir = try fs.path.join(gpa, &.{ sdk, "usr/include" });
+        self.sys_include_dir = try fs.path.join(gpa, &.{ sdk, "usr/include" });
+        self.crt_dir = try fs.path.join(gpa, &.{ sdk, "usr/lib" });
         return self;
     } else if (is_windows) {
-        const sdk = std.zig.WindowsSdk.find(args.allocator, args.target.cpu.arch) catch |err| switch (err) {
+        const sdk = std.zig.WindowsSdk.find(gpa, io, args.target.cpu.arch, args.environ_map) catch |err| switch (err) {
             error.NotFound => return error.WindowsSdkNotFound,
             error.PathTooLong => return error.WindowsSdkNotFound,
-            error.OutOfMemory => return error.OutOfMemory,
+            error.OutOfMemory => |e| return e,
         };
-        defer sdk.free(args.allocator);
+        defer sdk.free(gpa);
 
-        try self.findNativeMsvcIncludeDir(args, sdk);
-        try self.findNativeMsvcLibDir(args, sdk);
-        try self.findNativeKernel32LibDir(args, sdk);
-        try self.findNativeIncludeDirWindows(args, sdk);
-        try self.findNativeCrtDirWindows(args, sdk);
+        try self.findNativeMsvcIncludeDir(gpa, io, sdk);
+        try self.findNativeMsvcLibDir(gpa, sdk);
+        try self.findNativeKernel32LibDir(gpa, io, args, sdk);
+        try self.findNativeIncludeDirWindows(gpa, io, sdk);
+        try self.findNativeCrtDirWindows(gpa, io, args.target, sdk);
     } else if (is_haiku) {
-        try self.findNativeIncludeDirPosix(args);
-        try self.findNativeGccDirHaiku(args);
-        self.crt_dir = try args.allocator.dupeZ(u8, "/system/develop/lib");
-    } else if (builtin.target.os.tag.isSolarish()) {
+        try self.findNativeIncludeDirPosix(gpa, io, args);
+        try self.findNativeGccDirPosix(gpa, io, args);
+        self.crt_dir = try gpa.dupe(u8, "/system/develop/lib");
+    } else if (is_serenity) {
+        try self.findNativeIncludeDirPosix(gpa, io, args);
+        try self.findNativeGccDirPosix(gpa, io, args);
+        self.crt_dir = try gpa.dupe(u8, "/usr/lib");
+    } else if (builtin.target.os.tag == .illumos) {
         // There is only one libc, and its headers/libraries are always in the same spot.
-        self.include_dir = try args.allocator.dupeZ(u8, "/usr/include");
-        self.sys_include_dir = try args.allocator.dupeZ(u8, "/usr/include");
-        self.crt_dir = try args.allocator.dupeZ(u8, "/usr/lib/64");
+        self.include_dir = try gpa.dupe(u8, "/usr/include");
+        self.sys_include_dir = try gpa.dupe(u8, "/usr/include");
+        self.crt_dir = try gpa.dupe(u8, "/usr/lib/64");
     } else if (std.process.can_spawn) {
-        try self.findNativeIncludeDirPosix(args);
+        try self.findNativeIncludeDirPosix(gpa, io, args);
         switch (builtin.target.os.tag) {
-            .freebsd, .netbsd, .openbsd, .dragonfly => self.crt_dir = try args.allocator.dupeZ(u8, "/usr/lib"),
-            .linux => try self.findNativeCrtDirPosix(args),
+            .freebsd, .netbsd, .openbsd, .dragonfly => self.crt_dir = try gpa.dupe(u8, "/usr/lib"),
+            .linux => {
+                try self.findNativeCrtDirPosix(gpa, io, args);
+                try self.findNativeGccDirPosix(gpa, io, args);
+            },
             else => {},
         }
     } else {
@@ -218,42 +241,36 @@ pub fn findNative(args: FindNativeOptions) FindError!LibCInstallation {
 
 /// Must be the same allocator passed to `parse` or `findNative`.
 pub fn deinit(self: *LibCInstallation, allocator: Allocator) void {
-    const fields = std.meta.fields(LibCInstallation);
-    inline for (fields) |field| {
-        if (@field(self, field.name)) |payload| {
+    inline for (@typeInfo(LibCInstallation).@"struct".field_names) |field_name| {
+        if (@field(self, field_name)) |payload| {
             allocator.free(payload);
         }
     }
     self.* = undefined;
 }
 
-fn findNativeIncludeDirPosix(self: *LibCInstallation, args: FindNativeOptions) FindError!void {
-    const allocator = args.allocator;
-
+fn findNativeIncludeDirPosix(self: *LibCInstallation, gpa: Allocator, io: Io, args: FindNativeOptions) FindError!void {
     // Detect infinite loops.
-    var env_map = std.process.getEnvMap(allocator) catch |err| switch (err) {
-        error.Unexpected => unreachable, // WASI-only
-        else => |e| return e,
-    };
-    defer env_map.deinit();
-    const skip_cc_env_var = if (env_map.get(inf_loop_env_key)) |phase| blk: {
+    var environ_map = try args.environ_map.clone(gpa);
+    defer environ_map.deinit();
+    const skip_cc_env_var = if (environ_map.get(inf_loop_env_key)) |phase| blk: {
         if (std.mem.eql(u8, phase, "1")) {
-            try env_map.put(inf_loop_env_key, "2");
+            try environ_map.put(inf_loop_env_key, "2");
             break :blk true;
         } else {
             return error.ZigIsTheCCompiler;
         }
     } else blk: {
-        try env_map.put(inf_loop_env_key, "1");
+        try environ_map.put(inf_loop_env_key, "1");
         break :blk false;
     };
 
     const dev_null = if (is_windows) "nul" else "/dev/null";
 
-    var argv = std.array_list.Managed([]const u8).init(allocator);
+    var argv = std.array_list.Managed([]const u8).init(gpa);
     defer argv.deinit();
 
-    try appendCcExe(&argv, skip_cc_env_var);
+    try appendCcExe(&argv, skip_cc_env_var, &environ_map);
     try argv.appendSlice(&.{
         "-E",
         "-Wp,-v",
@@ -261,29 +278,29 @@ fn findNativeIncludeDirPosix(self: *LibCInstallation, args: FindNativeOptions) F
         dev_null,
     });
 
-    const run_res = std.process.Child.run(.{
-        .allocator = allocator,
+    const run_res = std.process.run(gpa, io, .{
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
         .argv = argv.items,
-        .max_output_bytes = 1024 * 1024,
-        .env_map = &env_map,
+        .environ_map = &environ_map,
         // Some C compilers, such as Clang, are known to rely on argv[0] to find the path
         // to their own executable, without even bothering to resolve PATH. This results in the message:
         // error: unable to execute command: Executable "" doesn't exist!
         // So we use the expandArg0 variant of ChildProcess to give them a helping hand.
         .expand_arg0 = .expand,
     }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
+        error.OutOfMemory => |e| return e,
         else => {
             printVerboseInvocation(argv.items, null, args.verbose, null);
             return error.UnableToSpawnCCompiler;
         },
     };
     defer {
-        allocator.free(run_res.stdout);
-        allocator.free(run_res.stderr);
+        gpa.free(run_res.stdout);
+        gpa.free(run_res.stderr);
     }
     switch (run_res.term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             printVerboseInvocation(argv.items, null, args.verbose, run_res.stderr);
             return error.CCompilerExitCode;
         },
@@ -294,7 +311,7 @@ fn findNativeIncludeDirPosix(self: *LibCInstallation, args: FindNativeOptions) F
     }
 
     var it = std.mem.tokenizeAny(u8, run_res.stderr, "\n\r");
-    var search_paths = std.array_list.Managed([]const u8).init(allocator);
+    var search_paths = std.array_list.Managed([]const u8).init(gpa);
     defer search_paths.deinit();
     while (it.next()) |line| {
         if (line.len != 0 and line[0] == ' ') {
@@ -308,7 +325,7 @@ fn findNativeIncludeDirPosix(self: *LibCInstallation, args: FindNativeOptions) F
     const include_dir_example_file = if (is_haiku) "posix/stdlib.h" else "stdlib.h";
     const sys_include_dir_example_file = if (is_windows)
         "sys\\types.h"
-    else if (is_haiku)
+    else if (is_haiku or is_serenity)
         "errno.h"
     else
         "sys/errno.h";
@@ -318,7 +335,7 @@ fn findNativeIncludeDirPosix(self: *LibCInstallation, args: FindNativeOptions) F
         // search in reverse order
         const search_path_untrimmed = search_paths.items[search_paths.items.len - path_i - 1];
         const search_path = std.mem.trimStart(u8, search_path_untrimmed, " ");
-        var search_dir = fs.cwd().openDir(search_path, .{}) catch |err| switch (err) {
+        var search_dir = Io.Dir.cwd().openDir(io, search_path, .{}) catch |err| switch (err) {
             error.FileNotFound,
             error.NotDir,
             error.NoDevice,
@@ -326,11 +343,11 @@ fn findNativeIncludeDirPosix(self: *LibCInstallation, args: FindNativeOptions) F
 
             else => return error.FileSystem,
         };
-        defer search_dir.close();
+        defer search_dir.close(io);
 
         if (self.include_dir == null) {
-            if (search_dir.accessZ(include_dir_example_file, .{})) |_| {
-                self.include_dir = try allocator.dupeZ(u8, search_path);
+            if (search_dir.access(io, include_dir_example_file, .{})) |_| {
+                self.include_dir = try gpa.dupe(u8, search_path);
             } else |err| switch (err) {
                 error.FileNotFound => {},
                 else => return error.FileSystem,
@@ -338,8 +355,8 @@ fn findNativeIncludeDirPosix(self: *LibCInstallation, args: FindNativeOptions) F
         }
 
         if (self.sys_include_dir == null) {
-            if (search_dir.accessZ(sys_include_dir_example_file, .{})) |_| {
-                self.sys_include_dir = try allocator.dupeZ(u8, search_path);
+            if (search_dir.access(io, sys_include_dir_example_file, .{})) |_| {
+                self.sys_include_dir = try gpa.dupe(u8, search_path);
             } else |err| switch (err) {
                 error.FileNotFound => {},
                 else => return error.FileSystem,
@@ -357,22 +374,21 @@ fn findNativeIncludeDirPosix(self: *LibCInstallation, args: FindNativeOptions) F
 
 fn findNativeIncludeDirWindows(
     self: *LibCInstallation,
-    args: FindNativeOptions,
+    gpa: Allocator,
+    io: Io,
     sdk: std.zig.WindowsSdk,
 ) FindError!void {
-    const allocator = args.allocator;
-
     var install_buf: [2]std.zig.WindowsSdk.Installation = undefined;
     const installs = fillInstallations(&install_buf, sdk);
 
-    var result_buf = std.array_list.Managed(u8).init(allocator);
+    var result_buf = std.array_list.Managed(u8).init(gpa);
     defer result_buf.deinit();
 
     for (installs) |install| {
         result_buf.shrinkAndFree(0);
         try result_buf.print("{s}\\Include\\{s}\\ucrt", .{ install.path, install.version });
 
-        var dir = fs.cwd().openDir(result_buf.items, .{}) catch |err| switch (err) {
+        var dir = Io.Dir.cwd().openDir(io, result_buf.items, .{}) catch |err| switch (err) {
             error.FileNotFound,
             error.NotDir,
             error.NoDevice,
@@ -380,9 +396,9 @@ fn findNativeIncludeDirWindows(
 
             else => return error.FileSystem,
         };
-        defer dir.close();
+        defer dir.close(io);
 
-        dir.accessZ("stdlib.h", .{}) catch |err| switch (err) {
+        dir.access(io, "stdlib.h", .{}) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return error.FileSystem,
         };
@@ -396,21 +412,21 @@ fn findNativeIncludeDirWindows(
 
 fn findNativeCrtDirWindows(
     self: *LibCInstallation,
-    args: FindNativeOptions,
+    gpa: Allocator,
+    io: Io,
+    target: *const std.Target,
     sdk: std.zig.WindowsSdk,
 ) FindError!void {
-    const allocator = args.allocator;
-
     var install_buf: [2]std.zig.WindowsSdk.Installation = undefined;
     const installs = fillInstallations(&install_buf, sdk);
 
-    var result_buf = std.array_list.Managed(u8).init(allocator);
+    var result_buf = std.array_list.Managed(u8).init(gpa);
     defer result_buf.deinit();
 
-    const arch_sub_dir = switch (args.target.cpu.arch) {
+    const arch_sub_dir = switch (target.cpu.arch) {
         .x86 => "x86",
         .x86_64 => "x64",
-        .arm, .armeb => "arm",
+        .thumb => "arm",
         .aarch64 => "arm64",
         else => return error.UnsupportedArchitecture,
     };
@@ -419,7 +435,7 @@ fn findNativeCrtDirWindows(
         result_buf.shrinkAndFree(0);
         try result_buf.print("{s}\\Lib\\{s}\\ucrt\\{s}", .{ install.path, install.version, arch_sub_dir });
 
-        var dir = fs.cwd().openDir(result_buf.items, .{}) catch |err| switch (err) {
+        var dir = Io.Dir.cwd().openDir(io, result_buf.items, .{}) catch |err| switch (err) {
             error.FileNotFound,
             error.NotDir,
             error.NoDevice,
@@ -427,9 +443,9 @@ fn findNativeCrtDirWindows(
 
             else => return error.FileSystem,
         };
-        defer dir.close();
+        defer dir.close(io);
 
-        dir.accessZ("ucrt.lib", .{}) catch |err| switch (err) {
+        dir.access(io, "ucrt.lib", .{}) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return error.FileSystem,
         };
@@ -440,9 +456,9 @@ fn findNativeCrtDirWindows(
     return error.LibCRuntimeNotFound;
 }
 
-fn findNativeCrtDirPosix(self: *LibCInstallation, args: FindNativeOptions) FindError!void {
-    self.crt_dir = try ccPrintFileName(.{
-        .allocator = args.allocator,
+fn findNativeCrtDirPosix(self: *LibCInstallation, gpa: Allocator, io: Io, args: FindNativeOptions) FindError!void {
+    self.crt_dir = try ccPrintFileName(gpa, io, .{
+        .environ_map = args.environ_map,
         .search_basename = switch (args.target.os.tag) {
             .linux => if (args.target.abi.isAndroid()) "crtbegin_dynamic.o" else "crt1.o",
             else => "crt1.o",
@@ -452,9 +468,9 @@ fn findNativeCrtDirPosix(self: *LibCInstallation, args: FindNativeOptions) FindE
     });
 }
 
-fn findNativeGccDirHaiku(self: *LibCInstallation, args: FindNativeOptions) FindError!void {
-    self.gcc_dir = try ccPrintFileName(.{
-        .allocator = args.allocator,
+fn findNativeGccDirPosix(self: *LibCInstallation, gpa: Allocator, io: Io, args: FindNativeOptions) FindError!void {
+    self.cc_dir = try ccPrintFileName(gpa, io, .{
+        .environ_map = args.environ_map,
         .search_basename = "crtbeginS.o",
         .want_dirname = .only_dir,
         .verbose = args.verbose,
@@ -463,21 +479,21 @@ fn findNativeGccDirHaiku(self: *LibCInstallation, args: FindNativeOptions) FindE
 
 fn findNativeKernel32LibDir(
     self: *LibCInstallation,
+    gpa: Allocator,
+    io: Io,
     args: FindNativeOptions,
     sdk: std.zig.WindowsSdk,
 ) FindError!void {
-    const allocator = args.allocator;
-
     var install_buf: [2]std.zig.WindowsSdk.Installation = undefined;
     const installs = fillInstallations(&install_buf, sdk);
 
-    var result_buf = std.array_list.Managed(u8).init(allocator);
+    var result_buf = std.array_list.Managed(u8).init(gpa);
     defer result_buf.deinit();
 
     const arch_sub_dir = switch (args.target.cpu.arch) {
         .x86 => "x86",
         .x86_64 => "x64",
-        .arm, .armeb => "arm",
+        .thumb => "arm",
         .aarch64 => "arm64",
         else => return error.UnsupportedArchitecture,
     };
@@ -486,7 +502,7 @@ fn findNativeKernel32LibDir(
         result_buf.shrinkAndFree(0);
         try result_buf.print("{s}\\Lib\\{s}\\um\\{s}", .{ install.path, install.version, arch_sub_dir });
 
-        var dir = fs.cwd().openDir(result_buf.items, .{}) catch |err| switch (err) {
+        var dir = Io.Dir.cwd().openDir(io, result_buf.items, .{}) catch |err| switch (err) {
             error.FileNotFound,
             error.NotDir,
             error.NoDevice,
@@ -494,9 +510,9 @@ fn findNativeKernel32LibDir(
 
             else => return error.FileSystem,
         };
-        defer dir.close();
+        defer dir.close(io);
 
-        dir.accessZ("kernel32.lib", .{}) catch |err| switch (err) {
+        dir.access(io, "kernel32.lib", .{}) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return error.FileSystem,
         };
@@ -509,19 +525,18 @@ fn findNativeKernel32LibDir(
 
 fn findNativeMsvcIncludeDir(
     self: *LibCInstallation,
-    args: FindNativeOptions,
+    gpa: Allocator,
+    io: Io,
     sdk: std.zig.WindowsSdk,
 ) FindError!void {
-    const allocator = args.allocator;
-
     const msvc_lib_dir = sdk.msvc_lib_dir orelse return error.LibCStdLibHeaderNotFound;
     const up1 = fs.path.dirname(msvc_lib_dir) orelse return error.LibCStdLibHeaderNotFound;
     const up2 = fs.path.dirname(up1) orelse return error.LibCStdLibHeaderNotFound;
 
-    const dir_path = try fs.path.join(allocator, &[_][]const u8{ up2, "include" });
-    errdefer allocator.free(dir_path);
+    const dir_path = try fs.path.join(gpa, &[_][]const u8{ up2, "include" });
+    errdefer gpa.free(dir_path);
 
-    var dir = fs.cwd().openDir(dir_path, .{}) catch |err| switch (err) {
+    var dir = Io.Dir.cwd().openDir(io, dir_path, .{}) catch |err| switch (err) {
         error.FileNotFound,
         error.NotDir,
         error.NoDevice,
@@ -529,9 +544,9 @@ fn findNativeMsvcIncludeDir(
 
         else => return error.FileSystem,
     };
-    defer dir.close();
+    defer dir.close(io);
 
-    dir.accessZ("vcruntime.h", .{}) catch |err| switch (err) {
+    dir.access(io, "vcruntime.h", .{}) catch |err| switch (err) {
         error.FileNotFound => return error.LibCStdLibHeaderNotFound,
         else => return error.FileSystem,
     };
@@ -541,72 +556,66 @@ fn findNativeMsvcIncludeDir(
 
 fn findNativeMsvcLibDir(
     self: *LibCInstallation,
-    args: FindNativeOptions,
+    gpa: Allocator,
     sdk: std.zig.WindowsSdk,
 ) FindError!void {
-    const allocator = args.allocator;
     const msvc_lib_dir = sdk.msvc_lib_dir orelse return error.LibCRuntimeNotFound;
-    self.msvc_lib_dir = try allocator.dupe(u8, msvc_lib_dir);
+    self.msvc_lib_dir = try gpa.dupe(u8, msvc_lib_dir);
 }
 
 pub const CCPrintFileNameOptions = struct {
-    allocator: Allocator,
+    environ_map: *const Environ.Map,
     search_basename: []const u8,
     want_dirname: enum { full_path, only_dir },
     verbose: bool = false,
 };
 
 /// caller owns returned memory
-fn ccPrintFileName(args: CCPrintFileNameOptions) ![:0]u8 {
-    const allocator = args.allocator;
-
+fn ccPrintFileName(gpa: Allocator, io: Io, args: CCPrintFileNameOptions) ![]u8 {
     // Detect infinite loops.
-    var env_map = std.process.getEnvMap(allocator) catch |err| switch (err) {
-        error.Unexpected => unreachable, // WASI-only
-        else => |e| return e,
-    };
-    defer env_map.deinit();
-    const skip_cc_env_var = if (env_map.get(inf_loop_env_key)) |phase| blk: {
+    var environ_map = try args.environ_map.clone(gpa);
+    defer environ_map.deinit();
+    const skip_cc_env_var = if (environ_map.get(inf_loop_env_key)) |phase| blk: {
         if (std.mem.eql(u8, phase, "1")) {
-            try env_map.put(inf_loop_env_key, "2");
+            try environ_map.put(inf_loop_env_key, "2");
             break :blk true;
         } else {
             return error.ZigIsTheCCompiler;
         }
     } else blk: {
-        try env_map.put(inf_loop_env_key, "1");
+        try environ_map.put(inf_loop_env_key, "1");
         break :blk false;
     };
 
-    var argv = std.array_list.Managed([]const u8).init(allocator);
+    var argv = std.array_list.Managed([]const u8).init(gpa);
     defer argv.deinit();
 
-    const arg1 = try std.fmt.allocPrint(allocator, "-print-file-name={s}", .{args.search_basename});
-    defer allocator.free(arg1);
+    const arg1 = try std.fmt.allocPrint(gpa, "-print-file-name={s}", .{args.search_basename});
+    defer gpa.free(arg1);
 
-    try appendCcExe(&argv, skip_cc_env_var);
+    try appendCcExe(&argv, skip_cc_env_var, &environ_map);
     try argv.append(arg1);
 
-    const run_res = std.process.Child.run(.{
-        .allocator = allocator,
+    const run_res = std.process.run(gpa, io, .{
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
         .argv = argv.items,
-        .max_output_bytes = 1024 * 1024,
-        .env_map = &env_map,
+        .environ_map = &environ_map,
         // Some C compilers, such as Clang, are known to rely on argv[0] to find the path
         // to their own executable, without even bothering to resolve PATH. This results in the message:
         // error: unable to execute command: Executable "" doesn't exist!
         // So we use the expandArg0 variant of ChildProcess to give them a helping hand.
         .expand_arg0 = .expand,
     }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
+        error.OutOfMemory => |e| return e,
         else => return error.UnableToSpawnCCompiler,
     };
     defer {
-        allocator.free(run_res.stdout);
-        allocator.free(run_res.stderr);
+        gpa.free(run_res.stdout);
+        gpa.free(run_res.stderr);
     }
     switch (run_res.term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             printVerboseInvocation(argv.items, args.search_basename, args.verbose, run_res.stderr);
             return error.CCompilerExitCode;
         },
@@ -622,10 +631,10 @@ fn ccPrintFileName(args: CCPrintFileNameOptions) ![:0]u8 {
     // So we detect failure by checking if the output matches exactly the input.
     if (std.mem.eql(u8, line, args.search_basename)) return error.LibCRuntimeNotFound;
     switch (args.want_dirname) {
-        .full_path => return allocator.dupeZ(u8, line),
+        .full_path => return gpa.dupe(u8, line),
         .only_dir => {
             const dirname = fs.path.dirname(line) orelse return error.LibCRuntimeNotFound;
-            return allocator.dupeZ(u8, dirname);
+            return gpa.dupe(u8, dirname);
         },
     }
 }
@@ -671,14 +680,18 @@ fn fillInstallations(
 
 const inf_loop_env_key = "ZIG_IS_DETECTING_LIBC_PATHS";
 
-fn appendCcExe(args: *std.array_list.Managed([]const u8), skip_cc_env_var: bool) !void {
+fn appendCcExe(
+    args: *std.array_list.Managed([]const u8),
+    skip_cc_env_var: bool,
+    environ_map: *const Environ.Map,
+) !void {
     const default_cc_exe = if (is_windows) "cc.exe" else "cc";
     try args.ensureUnusedCapacity(1);
     if (skip_cc_env_var) {
         args.appendAssumeCapacity(default_cc_exe);
         return;
     }
-    const cc_env_var = std.zig.EnvVar.CC.getPosix() orelse {
+    const cc_env_var = std.zig.EnvVar.CC.get(environ_map) orelse {
         args.appendAssumeCapacity(default_cc_exe);
         return;
     };
@@ -701,8 +714,8 @@ pub const CrtBasenames = struct {
     pub const GetArgs = struct {
         target: *const std.Target,
         link_libc: bool,
-        output_mode: std.builtin.OutputMode,
-        link_mode: std.builtin.LinkMode,
+        output_mode: std.lang.OutputMode,
+        link_mode: std.lang.LinkMode,
         pie: bool,
     };
 
@@ -752,26 +765,36 @@ pub const CrtBasenames = struct {
             .linux => switch (mode) {
                 .dynamic_lib => .{
                     .crti = "crti.o",
+                    .crtbegin = "crtbeginS.o",
+                    .crtend = "crtendS.o",
                     .crtn = "crtn.o",
                 },
                 .dynamic_exe => .{
                     .crt0 = "crt1.o",
                     .crti = "crti.o",
+                    .crtbegin = "crtbegin.o",
+                    .crtend = "crtend.o",
                     .crtn = "crtn.o",
                 },
                 .dynamic_pie => .{
                     .crt0 = "Scrt1.o",
                     .crti = "crti.o",
+                    .crtbegin = "crtbeginS.o",
+                    .crtend = "crtendS.o",
                     .crtn = "crtn.o",
                 },
                 .static_exe => .{
                     .crt0 = "crt1.o",
                     .crti = "crti.o",
+                    .crtbegin = "crtbegin.o",
+                    .crtend = "crtend.o",
                     .crtn = "crtn.o",
                 },
                 .static_pie => .{
                     .crt0 = "rcrt1.o",
                     .crti = "crti.o",
+                    .crtbegin = "crtbeginS.o",
+                    .crtend = "crtendS.o",
                     .crtn = "crtn.o",
                 },
             },
@@ -935,7 +958,7 @@ pub const CrtBasenames = struct {
                     .crtn = "crtn.o",
                 },
             },
-            .solaris, .illumos => switch (mode) {
+            .illumos => switch (mode) {
                 .dynamic_lib => .{
                     .crti = "crti.o",
                     .crtn = "crtn.o",
@@ -946,6 +969,22 @@ pub const CrtBasenames = struct {
                     .crtn = "crtn.o",
                 },
                 .static_exe, .static_pie => .{},
+            },
+            .serenity => switch (mode) {
+                .dynamic_lib => .{
+                    .crtbegin = "crtbeginS.o",
+                    .crtend = "crtendS.o",
+                },
+                .dynamic_exe, .static_exe => .{
+                    .crt0 = "crt0.o",
+                    .crtbegin = "crtbegin.o",
+                    .crtend = "crtend.o",
+                },
+                .dynamic_pie, .static_pie => .{
+                    .crt0 = "crt0.o",
+                    .crtbegin = "crtbeginS.o",
+                    .crtend = "crtendS.o",
+                },
             },
             else => .{},
         };
@@ -965,11 +1004,12 @@ pub fn resolveCrtPaths(
     arena: Allocator,
     crt_basenames: CrtBasenames,
     target: *const std.Target,
-) error{ OutOfMemory, LibCInstallationMissingCrtDir }!CrtPaths {
+) error{ OutOfMemory, LibCInstallationMissingCcDir, LibCInstallationMissingCrtDir }!CrtPaths {
     const crt_dir_path: Path = .{
-        .root_dir = std.Build.Cache.Directory.cwd(),
+        .root_dir = Cache.Directory.cwd(),
         .sub_path = lci.crt_dir orelse return error.LibCInstallationMissingCrtDir,
     };
+
     switch (target.os.tag) {
         .dragonfly => {
             const gccv: []const u8 = if (target.os.version_range.semver.isAtLeast(.{
@@ -991,16 +1031,16 @@ pub fn resolveCrtPaths(
                 .crtn = if (crt_basenames.crtn) |basename| try crt_dir_path.join(arena, basename) else null,
             };
         },
-        .haiku => {
-            const gcc_dir_path: Path = .{
-                .root_dir = std.Build.Cache.Directory.cwd(),
-                .sub_path = lci.gcc_dir orelse return error.LibCInstallationMissingCrtDir,
+        .haiku, .serenity, .linux => {
+            const cc_dir_path: Path = .{
+                .root_dir = Cache.Directory.cwd(),
+                .sub_path = lci.cc_dir orelse return error.LibCInstallationMissingCcDir,
             };
             return .{
                 .crt0 = if (crt_basenames.crt0) |basename| try crt_dir_path.join(arena, basename) else null,
                 .crti = if (crt_basenames.crti) |basename| try crt_dir_path.join(arena, basename) else null,
-                .crtbegin = if (crt_basenames.crtbegin) |basename| try gcc_dir_path.join(arena, basename) else null,
-                .crtend = if (crt_basenames.crtend) |basename| try gcc_dir_path.join(arena, basename) else null,
+                .crtbegin = if (crt_basenames.crtbegin) |basename| try cc_dir_path.join(arena, basename) else null,
+                .crtend = if (crt_basenames.crtend) |basename| try cc_dir_path.join(arena, basename) else null,
                 .crtn = if (crt_basenames.crtn) |basename| try crt_dir_path.join(arena, basename) else null,
             };
         },
@@ -1016,16 +1056,15 @@ pub fn resolveCrtPaths(
     }
 }
 
-const LibCInstallation = @This();
-const std = @import("std");
-const builtin = @import("builtin");
-const Target = std.Target;
-const fs = std.fs;
-const Allocator = std.mem.Allocator;
-const Path = std.Build.Cache.Path;
-
-const is_darwin = builtin.target.os.tag.isDarwin();
-const is_windows = builtin.target.os.tag == .windows;
-const is_haiku = builtin.target.os.tag == .haiku;
-
-const log = std.log.scoped(.libc_installation);
+pub fn addToHash(opt_lci: ?*const LibCInstallation, hh: *Cache.HashHelper, abi: std.Target.Abi) void {
+    const lci = opt_lci orelse return hh.add(false);
+    hh.add(true);
+    hh.addOptionalBytes(lci.crt_dir);
+    switch (abi) {
+        .msvc, .itanium => {
+            hh.addOptionalBytes(lci.msvc_lib_dir);
+            hh.addOptionalBytes(lci.kernel32_lib_dir);
+        },
+        else => {},
+    }
+}

@@ -1,24 +1,16 @@
 const std = @import("std");
 const assert = std.debug.assert;
-const common = @import("./common.zig");
+const compiler_rt = @import("../compiler_rt.zig");
+const symbol = compiler_rt.symbol;
 const builtin = @import("builtin");
 
 comptime {
     if (builtin.object_format != .c) {
-        const export_options: std.builtin.ExportOptions = .{
-            .name = "memcpy",
-            .linkage = common.linkage,
-            .visibility = common.visibility,
-        };
-
-        if (builtin.mode == .ReleaseSmall or builtin.zig_backend == .stage2_aarch64)
-            @export(&memcpySmall, export_options)
-        else
-            @export(&memcpyFast, export_options);
+        symbol(if (builtin.mode == .small or builtin.zig_backend == .stage2_aarch64) &memcpySmall else &memcpyFast, "memcpy");
     }
 }
 
-const Element = common.PreferredLoadStoreElement;
+const Element = compiler_rt.PreferredLoadStoreElement;
 
 comptime {
     assert(std.math.isPowerOfTwo(@sizeOf(Element)));
@@ -159,7 +151,7 @@ inline fn copyFixedLength(
     else if (len > @sizeOf(usize))
         @Vector(len, u8)
     else
-        @Type(.{ .int = .{ .signedness = .unsigned, .bits = len * 8 } });
+        @Int(.unsigned, len * 8);
 
     const loop_count = @divExact(len, @sizeOf(T));
 
@@ -194,37 +186,36 @@ inline fn copyRange4(
     copyFixedLength(dest + last, src + last, copy_len);
 }
 
-test "memcpy" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
+fn testMemcpyImpl(comptime memcpyImpl: anytype) !void {
+    const max_len = 1024;
+    var buffer: [max_len + @alignOf(Element) - 1]u8 align(@alignOf(Element)) = undefined;
+    for (&buffer, 0..) |*b, i| {
+        b.* = @intCast(i % 97);
+    }
+    var dest: [max_len + @alignOf(Element) - 1]u8 align(@alignOf(Element)) = undefined;
 
-    const S = struct {
-        fn testFunc(comptime copy_func: anytype) !void {
-            const max_len = 1024;
-            var buffer: [max_len + @alignOf(Element) - 1]u8 align(@alignOf(Element)) = undefined;
-            for (&buffer, 0..) |*b, i| {
-                b.* = @intCast(i % 97);
-            }
-            var dest: [max_len + @alignOf(Element) - 1]u8 align(@alignOf(Element)) = undefined;
-
-            for (0..max_len) |copy_len| {
-                for (0..@alignOf(Element)) |s_offset| {
-                    for (0..@alignOf(Element)) |d_offset| {
-                        @memset(&dest, 0xff);
-                        const s = buffer[s_offset..][0..copy_len];
-                        const d = dest[d_offset..][0..copy_len];
-                        _ = copy_func(@ptrCast(d.ptr), @ptrCast(s.ptr), s.len);
-                        std.testing.expectEqualSlices(u8, s, d) catch |e| {
-                            std.debug.print("error encountered for length={d}, s_offset={d}, d_offset={d}\n", .{
-                                copy_len, s_offset, d_offset,
-                            });
-                            return e;
-                        };
-                    }
-                }
+    for (0..max_len) |copy_len| {
+        for (0..@alignOf(Element)) |s_offset| {
+            for (0..@alignOf(Element)) |d_offset| {
+                @memset(&dest, 0xff);
+                const s = buffer[s_offset..][0..copy_len];
+                const d = dest[d_offset..][0..copy_len];
+                _ = memcpyImpl(@ptrCast(d.ptr), @ptrCast(s.ptr), s.len);
+                std.testing.expectEqualSlices(u8, s, d) catch |e| {
+                    std.debug.print("error encountered for length={d}, s_offset={d}, d_offset={d}\n", .{
+                        copy_len, s_offset, d_offset,
+                    });
+                    return e;
+                };
             }
         }
-    };
-
-    try S.testFunc(memcpySmall);
-    try S.testFunc(memcpyFast);
+    }
+}
+test memcpySmall {
+    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
+    try testMemcpyImpl(memcpySmall);
+}
+test memcpyFast {
+    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
+    try testMemcpyImpl(memcpyFast);
 }

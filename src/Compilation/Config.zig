@@ -4,8 +4,8 @@
 //! order to resolve per-Module defaults.
 
 have_zcu: bool,
-output_mode: std.builtin.OutputMode,
-link_mode: std.builtin.LinkMode,
+output_mode: std.lang.OutputMode,
+link_mode: std.lang.LinkMode,
 link_libc: bool,
 link_libcpp: bool,
 link_libunwind: bool,
@@ -34,7 +34,6 @@ any_error_tracing: bool,
 any_sanitize_thread: bool,
 any_sanitize_c: std.zig.SanitizeC,
 any_fuzz: bool,
-pie: bool,
 /// If this is true then linker code is responsible for making an LLVM IR
 /// Module, outputting it to an object file, and then linking that together
 /// with link options and other objects. Otherwise (depending on `use_lld`)
@@ -48,16 +47,19 @@ use_lib_llvm: bool,
 /// and updates the final binary.
 use_lld: bool,
 c_frontend: CFrontend,
+use_new_linker: bool,
+pie: bool,
 lto: std.zig.LtoMode,
+incremental: bool,
 /// WASI-only. Type of WASI execution model ("command" or "reactor").
 /// Always set to `command` for non-WASI targets.
-wasi_exec_model: std.builtin.WasiExecModel,
+wasi_exec_model: std.lang.WasiExecModel,
 import_memory: bool,
 export_memory: bool,
 shared_memory: bool,
 is_test: bool,
 debug_format: DebugFormat,
-root_optimize_mode: std.builtin.OptimizeMode,
+root_optimize_mode: std.lang.Optimize,
 root_strip: bool,
 root_error_tracing: bool,
 dll_export_fns: bool,
@@ -73,15 +75,15 @@ pub const DebugFormat = union(enum) {
 };
 
 pub const Options = struct {
-    output_mode: std.builtin.OutputMode,
+    output_mode: std.lang.OutputMode,
     resolved_target: Module.ResolvedTarget,
     is_test: bool,
     have_zcu: bool,
     emit_bin: bool,
-    root_optimize_mode: ?std.builtin.OptimizeMode = null,
+    root_optimize_mode: ?std.lang.Optimize = null,
     root_strip: ?bool = null,
     root_error_tracing: ?bool = null,
-    link_mode: ?std.builtin.LinkMode = null,
+    link_mode: ?std.lang.LinkMode = null,
     ensure_libc_on_non_freestanding: bool = false,
     ensure_libcpp_on_non_freestanding: bool = false,
     any_non_single_threaded: bool = false,
@@ -98,14 +100,16 @@ pub const Options = struct {
     link_libc: ?bool = null,
     link_libcpp: ?bool = null,
     link_libunwind: ?bool = null,
-    pie: ?bool = null,
     use_llvm: ?bool = null,
     use_lib_llvm: ?bool = null,
     use_lld: ?bool = null,
     use_clang: ?bool = null,
+    use_new_linker: ?bool = null,
+    pie: ?bool = null,
     lto: ?std.zig.LtoMode = null,
+    incremental: bool = false,
     /// WASI-only. Type of WASI execution model ("command" or "reactor").
-    wasi_exec_model: ?std.builtin.WasiExecModel = null,
+    wasi_exec_model: ?std.lang.WasiExecModel = null,
     import_memory: ?bool = null,
     export_memory: ?bool = null,
     shared_memory: ?bool = null,
@@ -126,27 +130,30 @@ pub const ResolveError = error{
     ZigLacksTargetSupport,
     EmittingBinaryRequiresLlvmLibrary,
     LldIncompatibleObjectFormat,
-    LldCannotIncrementallyLink,
+    LldIncompatibleWithSelfHostedBackend,
     LtoRequiresLld,
     SanitizeThreadRequiresLibCpp,
     LibCRequiresLibUnwind,
     LibCppRequiresLibUnwind,
-    OsRequiresLibC,
     LibCppRequiresLibC,
     LibUnwindRequiresLibC,
     TargetCannotDynamicLink,
     TargetCannotStaticLinkExecutables,
     LibCRequiresDynamicLinking,
     SharedLibrariesRequireDynamicLinking,
+    DynamicLinkingWithLldRequiresSharedLibraries,
     ExportMemoryAndDynamicIncompatible,
     DynamicLibraryPrecludesPie,
     TargetRequiresPie,
     SanitizeThreadRequiresPie,
+    SanitizeThreadRequiresLlvmBackend,
     BackendLacksErrorTracing,
     LlvmLibraryUnavailable,
     LldUnavailable,
     ClangUnavailable,
     DllExportFnsRequiresWindows,
+    NewLinkerIncompatibleWithLld,
+    NewLinkerIncompatibleObjectFormat,
 };
 
 pub fn resolve(options: Options) ResolveError!Config {
@@ -189,7 +196,7 @@ pub fn resolve(options: Options) ResolveError!Config {
         break :b options.use_lib_llvm orelse true;
     };
 
-    const root_optimize_mode = options.root_optimize_mode orelse .Debug;
+    const root_optimize_mode = options.root_optimize_mode orelse .debug;
 
     // Make a decision on whether to use Clang or Aro for translate-c and compiling C files.
     const c_frontend: CFrontend = b: {
@@ -217,10 +224,6 @@ pub fn resolve(options: Options) ResolveError!Config {
     };
 
     const link_libc = b: {
-        if (target_util.osRequiresLibC(target)) {
-            if (options.link_libc == false) return error.OsRequiresLibC;
-            break :b true;
-        }
         if (link_libcpp) {
             if (options.link_libc == false) return error.LibCppRequiresLibC;
             break :b true;
@@ -230,18 +233,10 @@ pub fn resolve(options: Options) ResolveError!Config {
             break :b true;
         }
         if (options.link_libc) |x| break :b x;
-        switch (target.os.tag) {
-            // These targets don't require libc, but we don't yet have a syscall layer for them,
-            // so we default to linking libc for now.
-            .freebsd,
-            .netbsd,
-            => break :b true,
-            else => {},
-        }
         if (options.ensure_libc_on_non_freestanding and target.os.tag != .freestanding)
             break :b true;
 
-        break :b false;
+        break :b std.os.targetRequiresLibC(target);
     };
 
     const link_mode = b: {
@@ -251,32 +246,27 @@ pub fn resolve(options: Options) ResolveError!Config {
             .Exe => true,
         };
 
-        if (target_util.cannotDynamicLink(target)) {
+        if (!target_util.canDynamicLink(target)) {
             if (options.link_mode == .dynamic) return error.TargetCannotDynamicLink;
             break :b .static;
         }
-        if (target.os.tag == .fuchsia and options.output_mode == .Exe) {
+        if (!target_util.canStaticLinkExe(target) and options.output_mode == .Exe) {
             if (options.link_mode == .static) return error.TargetCannotStaticLinkExecutables;
             break :b .dynamic;
         }
         if (explicitly_exe_or_dyn_lib and link_libc and
-            (target_util.osRequiresLibC(target) or
+            (target.requiresLibC() or
                 // For these libcs, Zig can only provide dynamic libc when cross-compiling.
-                ((target.isGnuLibC() or target.isFreeBSDLibC() or target.isNetBSDLibC()) and
+                ((target.isGnuLibC() or target.isFreeBSDLibC() or target.isNetBSDLibC() or target.isOpenBSDLibC()) and
                     !options.resolved_target.is_native_abi)))
         {
             if (options.link_mode == .static) return error.LibCRequiresDynamicLinking;
             break :b .dynamic;
         }
-        // When creating a executable that links to system libraries, we
-        // require dynamic linking, but we must not link static libraries
-        // or object files dynamically!
-        if (options.any_dyn_libs and options.output_mode == .Exe) {
-            if (options.link_mode == .static) return error.SharedLibrariesRequireDynamicLinking;
-            break :b .dynamic;
-        }
 
         if (options.link_mode) |link_mode| break :b link_mode;
+
+        if (options.any_dyn_libs) break :b .dynamic;
 
         if (explicitly_exe_or_dyn_lib and link_libc) {
             // When using the native glibc/musl ABI, dynamic linking is usually what people want.
@@ -287,7 +277,7 @@ pub fn resolve(options: Options) ResolveError!Config {
             // When targeting systems where the kernel and libc are developed alongside each other,
             // dynamic linking is the better default; static libc may contain code that requires
             // the very latest kernel version.
-            if (target.isFreeBSDLibC() or target.isNetBSDLibC()) {
+            if (target.isFreeBSDLibC() or target.isNetBSDLibC() or target.isOpenBSDLibC()) {
                 break :b .dynamic;
             }
         }
@@ -316,33 +306,6 @@ pub fn resolve(options: Options) ResolveError!Config {
         }
         if (options.export_memory) |x| break :b x;
         break :b !import_memory;
-    };
-
-    const pie: bool = b: {
-        switch (options.output_mode) {
-            .Exe => if (target.os.tag == .fuchsia or
-                (target.abi.isAndroid() and link_mode == .dynamic))
-            {
-                if (options.pie == false) return error.TargetRequiresPie;
-                break :b true;
-            },
-            .Lib => if (link_mode == .dynamic) {
-                if (options.pie == true) return error.DynamicLibraryPrecludesPie;
-                break :b false;
-            },
-            .Obj => {},
-        }
-        if (options.any_sanitize_thread) {
-            if (options.pie == false) return error.SanitizeThreadRequiresPie;
-            break :b true;
-        }
-        if (options.pie) |pie| break :b pie;
-        break :b if (options.output_mode == .Exe) switch (target.os.tag) {
-            .fuchsia,
-            .openbsd,
-            => true,
-            else => target.os.tag.isDarwin(),
-        } else false;
     };
 
     const is_dyn_lib = switch (options.output_mode) {
@@ -380,6 +343,12 @@ pub fn resolve(options: Options) ResolveError!Config {
             break :b true;
         }
 
+        if (options.any_sanitize_thread) {
+            // Thread sanitization instrumentation requires the LLVM backend.
+            if (options.use_llvm == false) return error.SanitizeThreadRequiresLlvmBackend;
+            break :b true;
+        }
+
         if (options.use_llvm) |x| break :b x;
 
         // If we cannot use LLVM libraries, then our own backends will be a
@@ -388,17 +357,18 @@ pub fn resolve(options: Options) ResolveError!Config {
         if (!use_lib_llvm and options.emit_bin) break :b false;
 
         // Prefer LLVM for release builds.
-        if (root_optimize_mode != .Debug) break :b true;
+        if (root_optimize_mode != .debug) break :b true;
 
         // load_dynamic_library standalone test not passing on this combination
         // https://github.com/ziglang/zig/issues/24080
-        if (target.os.tag == .macos and is_dyn_lib) break :b true;
+        if (target.os.tag.isDarwin() and is_dyn_lib) break :b true;
 
         // At this point we would prefer to use our own self-hosted backend,
         // because the compilation speed is better than LLVM. But only do it if
         // we are confident in the robustness of the backend.
         break :b !target_util.selfHostedBackendIsAsRobustAsLlvm(target);
     };
+    const backend = target_util.zigBackend(target, use_llvm);
 
     if (options.emit_bin and options.have_zcu) {
         if (!use_lib_llvm and use_llvm) {
@@ -407,7 +377,7 @@ pub fn resolve(options: Options) ResolveError!Config {
             return error.EmittingBinaryRequiresLlvmLibrary;
         }
 
-        if (target_util.zigBackend(target, use_llvm) == .other) {
+        if (backend == .other) {
             // There is no compiler backend available for this target.
             return error.ZigLacksTargetSupport;
         }
@@ -430,12 +400,24 @@ pub fn resolve(options: Options) ResolveError!Config {
             break :b true;
         }
 
-        if (options.use_llvm == false) {
-            if (options.use_lld == true) return error.LldCannotIncrementallyLink;
+        // If we have Zig code (i.e. a ZCU) and are compiling with a self-hosted backend, then we
+        // also need to use a self-hosted linker.
+        if (options.have_zcu and !use_llvm) {
+            if (options.use_lld == true) return error.LldIncompatibleWithSelfHostedBackend;
             break :b false;
         }
 
         if (options.use_lld) |x| break :b x;
+
+        // If the user didn't specify whether to use LLD but did specify to use the new linker,
+        // assume no LLD.
+        if (options.use_new_linker == true) break :b false;
+
+        if (options.use_new_linker == null and
+            target_util.preferNewLinkerOverLld(target))
+        {
+            break :b false;
+        }
 
         // If we have no zig code to compile, no need for the self-hosted linker.
         if (!options.have_zcu) break :b true;
@@ -443,6 +425,58 @@ pub fn resolve(options: Options) ResolveError!Config {
         // If we do have zig code, match the decision for whether to use the llvm backend,
         // so that the llvm backend defaults to lld and the self-hosted backends do not.
         break :b use_llvm;
+    };
+
+    switch (options.output_mode) {
+        .Exe => if (options.any_dyn_libs) {
+            // When creating a executable that links to system libraries, we
+            // require dynamic linking, but we must not link static libraries
+            // or object files dynamically!
+            if (link_mode == .static) return error.SharedLibrariesRequireDynamicLinking;
+        } else if (use_lld and !link_libc and !link_libcpp and !link_libunwind) {
+            // Lld does not support creating dynamic executables when not
+            // linking to any shared libraries.
+            if (link_mode == .dynamic) return error.DynamicLinkingWithLldRequiresSharedLibraries;
+        },
+        .Lib, .Obj => {},
+    }
+
+    const use_new_linker = b: {
+        if (use_lld) {
+            if (options.use_new_linker == true) return error.NewLinkerIncompatibleWithLld;
+            break :b false;
+        }
+
+        if (!target_util.hasNewLinker(target.ofmt)) {
+            if (options.use_new_linker == true) return error.NewLinkerIncompatibleObjectFormat;
+            break :b false;
+        }
+
+        if (options.use_new_linker) |x| break :b x;
+
+        if (target_util.preferNewLinkerOverLld(target)) break :b true;
+
+        break :b options.incremental;
+    };
+
+    const pie = b: {
+        switch (options.output_mode) {
+            .Exe => if (target_util.requiresPie(target, link_mode)) {
+                if (options.pie == false) return error.TargetRequiresPie;
+                break :b true;
+            },
+            .Lib => if (link_mode == .dynamic) {
+                if (options.pie == true) return error.DynamicLibraryPrecludesPie;
+                break :b false;
+            },
+            .Obj => {},
+        }
+        if (options.any_sanitize_thread) {
+            if (options.pie == false) return error.SanitizeThreadRequiresPie;
+            break :b true;
+        }
+        if (options.pie) |pie| break :b pie;
+        break :b if (options.output_mode == .Exe) target_util.defaultPie(target) else false;
     };
 
     const lto: std.zig.LtoMode = b: {
@@ -460,7 +494,7 @@ pub fn resolve(options: Options) ResolveError!Config {
 
     const root_strip = b: {
         if (options.root_strip) |x| break :b x;
-        if (root_optimize_mode == .ReleaseSmall) break :b true;
+        if (root_optimize_mode == .small) break :b true;
         if (!target_util.hasDebugInfo(target)) break :b true;
         break :b false;
     };
@@ -469,7 +503,7 @@ pub fn resolve(options: Options) ResolveError!Config {
         if (root_strip and !options.any_non_stripped) break :b .strip;
         if (options.debug_format) |x| break :b x;
         break :b switch (target.ofmt) {
-            .elf, .goff, .macho, .wasm, .xcoff => .{ .dwarf = .@"32" },
+            .elf, .macho, .wasm => .{ .dwarf = .@"32" },
             .coff => .code_view,
             .c => switch (target.os.tag) {
                 .windows, .uefi => .code_view,
@@ -479,7 +513,6 @@ pub fn resolve(options: Options) ResolveError!Config {
         };
     };
 
-    const backend = target_util.zigBackend(target, use_llvm);
     const backend_supports_error_tracing = target_util.backendSupportsFeature(backend, .error_return_trace);
 
     const root_error_tracing = b: {
@@ -487,8 +520,8 @@ pub fn resolve(options: Options) ResolveError!Config {
         if (root_strip) break :b false;
         if (!backend_supports_error_tracing) break :b false;
         break :b switch (root_optimize_mode) {
-            .Debug => true,
-            .ReleaseSafe, .ReleaseFast, .ReleaseSmall => false,
+            .debug => true,
+            .safe, .fast, .small => false,
         };
     };
 
@@ -529,8 +562,10 @@ pub fn resolve(options: Options) ResolveError!Config {
         .any_fuzz = options.any_fuzz,
         .san_cov_trace_pc_guard = options.san_cov_trace_pc_guard,
         .root_error_tracing = root_error_tracing,
+        .use_new_linker = use_new_linker,
         .pie = pie,
         .lto = lto,
+        .incremental = options.incremental,
         .import_memory = import_memory,
         .export_memory = export_memory,
         .shared_memory = shared_memory,
@@ -548,7 +583,7 @@ pub fn resolve(options: Options) ResolveError!Config {
 }
 
 const std = @import("std");
-const Module = @import("../Package.zig").Module;
+const Module = @import("../Module.zig");
 const Config = @This();
 const target_util = @import("../target.zig");
 const build_options = @import("build_options");

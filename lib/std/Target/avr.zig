@@ -40,7 +40,9 @@ pub const Feature = enum {
     tinyencoding,
     wrappingrjmp,
     xmega,
+    xmega2,
     xmega3,
+    xmega4,
     xmegau,
 };
 
@@ -50,20 +52,20 @@ pub const featureSetHasAny = CpuFeature.FeatureSetFns(Feature).featureSetHasAny;
 pub const featureSetHasAll = CpuFeature.FeatureSetFns(Feature).featureSetHasAll;
 
 pub const all_features = blk: {
-    const len = @typeInfo(Feature).@"enum".fields.len;
+    const len = @typeInfo(Feature).@"enum".field_names.len;
     std.debug.assert(len <= CpuFeature.Set.needed_bit_count);
     var result: [len]CpuFeature = undefined;
-    result[@intFromEnum(Feature.addsubiw)] = .{
+    result[@backingInt(Feature.addsubiw)] = .{
         .llvm_name = "addsubiw",
         .description = "Enable 16-bit register-immediate addition and subtraction instructions",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.avr0)] = .{
+    result[@backingInt(Feature.avr0)] = .{
         .llvm_name = "avr0",
         .description = "The device is a part of the avr0 family",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.avr1)] = .{
+    result[@backingInt(Feature.avr1)] = .{
         .llvm_name = "avr1",
         .description = "The device is a part of the avr1 family",
         .dependencies = featureSet(&[_]Feature{
@@ -72,7 +74,7 @@ pub const all_features = blk: {
             .memmappedregs,
         }),
     };
-    result[@intFromEnum(Feature.avr2)] = .{
+    result[@backingInt(Feature.avr2)] = .{
         .llvm_name = "avr2",
         .description = "The device is a part of the avr2 family",
         .dependencies = featureSet(&[_]Feature{
@@ -82,7 +84,7 @@ pub const all_features = blk: {
             .sram,
         }),
     };
-    result[@intFromEnum(Feature.avr25)] = .{
+    result[@backingInt(Feature.avr25)] = .{
         .llvm_name = "avr25",
         .description = "The device is a part of the avr25 family",
         .dependencies = featureSet(&[_]Feature{
@@ -93,7 +95,7 @@ pub const all_features = blk: {
             .spm,
         }),
     };
-    result[@intFromEnum(Feature.avr3)] = .{
+    result[@backingInt(Feature.avr3)] = .{
         .llvm_name = "avr3",
         .description = "The device is a part of the avr3 family",
         .dependencies = featureSet(&[_]Feature{
@@ -101,7 +103,7 @@ pub const all_features = blk: {
             .jmpcall,
         }),
     };
-    result[@intFromEnum(Feature.avr31)] = .{
+    result[@backingInt(Feature.avr31)] = .{
         .llvm_name = "avr31",
         .description = "The device is a part of the avr31 family",
         .dependencies = featureSet(&[_]Feature{
@@ -109,7 +111,7 @@ pub const all_features = blk: {
             .elpm,
         }),
     };
-    result[@intFromEnum(Feature.avr35)] = .{
+    result[@backingInt(Feature.avr35)] = .{
         .llvm_name = "avr35",
         .description = "The device is a part of the avr35 family",
         .dependencies = featureSet(&[_]Feature{
@@ -120,7 +122,7 @@ pub const all_features = blk: {
             .spm,
         }),
     };
-    result[@intFromEnum(Feature.avr4)] = .{
+    result[@backingInt(Feature.avr4)] = .{
         .llvm_name = "avr4",
         .description = "The device is a part of the avr4 family",
         .dependencies = featureSet(&[_]Feature{
@@ -132,7 +134,7 @@ pub const all_features = blk: {
             .spm,
         }),
     };
-    result[@intFromEnum(Feature.avr5)] = .{
+    result[@backingInt(Feature.avr5)] = .{
         .llvm_name = "avr5",
         .description = "The device is a part of the avr5 family",
         .dependencies = featureSet(&[_]Feature{
@@ -144,7 +146,7 @@ pub const all_features = blk: {
             .spm,
         }),
     };
-    result[@intFromEnum(Feature.avr51)] = .{
+    result[@backingInt(Feature.avr51)] = .{
         .llvm_name = "avr51",
         .description = "The device is a part of the avr51 family",
         .dependencies = featureSet(&[_]Feature{
@@ -153,7 +155,7 @@ pub const all_features = blk: {
             .elpmx,
         }),
     };
-    result[@intFromEnum(Feature.avr6)] = .{
+    result[@backingInt(Feature.avr6)] = .{
         .llvm_name = "avr6",
         .description = "The device is a part of the avr6 family",
         .dependencies = featureSet(&[_]Feature{
@@ -161,7 +163,7 @@ pub const all_features = blk: {
             .eijmpcall,
         }),
     };
-    result[@intFromEnum(Feature.avrtiny)] = .{
+    result[@backingInt(Feature.avrtiny)] = .{
         .llvm_name = "avrtiny",
         .description = "The device is a part of the avrtiny family",
         .dependencies = featureSet(&[_]Feature{
@@ -172,82 +174,82 @@ pub const all_features = blk: {
             .tinyencoding,
         }),
     };
-    result[@intFromEnum(Feature.@"break")] = .{
+    result[@backingInt(Feature.@"break")] = .{
         .llvm_name = "break",
         .description = "The device supports the `BREAK` debugging instruction",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.des)] = .{
+    result[@backingInt(Feature.des)] = .{
         .llvm_name = "des",
         .description = "The device supports the `DES k` encryption instruction",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.eijmpcall)] = .{
+    result[@backingInt(Feature.eijmpcall)] = .{
         .llvm_name = "eijmpcall",
         .description = "The device supports the `EIJMP`/`EICALL` instructions",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.elpm)] = .{
+    result[@backingInt(Feature.elpm)] = .{
         .llvm_name = "elpm",
         .description = "The device supports the ELPM instruction",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.elpmx)] = .{
+    result[@backingInt(Feature.elpmx)] = .{
         .llvm_name = "elpmx",
         .description = "The device supports the `ELPM Rd, Z[+]` instructions",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.ijmpcall)] = .{
+    result[@backingInt(Feature.ijmpcall)] = .{
         .llvm_name = "ijmpcall",
         .description = "The device supports `IJMP`/`ICALL`instructions",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.jmpcall)] = .{
+    result[@backingInt(Feature.jmpcall)] = .{
         .llvm_name = "jmpcall",
         .description = "The device supports the `JMP` and `CALL` instructions",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.lowbytefirst)] = .{
+    result[@backingInt(Feature.lowbytefirst)] = .{
         .llvm_name = "lowbytefirst",
         .description = "Do the low byte first when writing a 16-bit port or storing a 16-bit word",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.lpm)] = .{
+    result[@backingInt(Feature.lpm)] = .{
         .llvm_name = "lpm",
         .description = "The device supports the `LPM` instruction",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.lpmx)] = .{
+    result[@backingInt(Feature.lpmx)] = .{
         .llvm_name = "lpmx",
         .description = "The device supports the `LPM Rd, Z[+]` instruction",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.memmappedregs)] = .{
+    result[@backingInt(Feature.memmappedregs)] = .{
         .llvm_name = "memmappedregs",
         .description = "The device has CPU registers mapped in data address space",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.movw)] = .{
+    result[@backingInt(Feature.movw)] = .{
         .llvm_name = "movw",
         .description = "The device supports the 16-bit MOVW instruction",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.mul)] = .{
+    result[@backingInt(Feature.mul)] = .{
         .llvm_name = "mul",
         .description = "The device supports the multiplication instructions",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.rmw)] = .{
+    result[@backingInt(Feature.rmw)] = .{
         .llvm_name = "rmw",
         .description = "The device supports the read-write-modify instructions: XCH, LAS, LAC, LAT",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.smallstack)] = .{
+    result[@backingInt(Feature.smallstack)] = .{
         .llvm_name = "smallstack",
         .description = "The device has an 8-bit stack pointer",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.special)] = .{
+    result[@backingInt(Feature.special)] = .{
         .llvm_name = "special",
         .description = "Enable use of the entire instruction set - used for debugging",
         .dependencies = featureSet(&[_]Feature{
@@ -270,32 +272,32 @@ pub const all_features = blk: {
             .sram,
         }),
     };
-    result[@intFromEnum(Feature.spm)] = .{
+    result[@backingInt(Feature.spm)] = .{
         .llvm_name = "spm",
         .description = "The device supports the `SPM` instruction",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.spmx)] = .{
+    result[@backingInt(Feature.spmx)] = .{
         .llvm_name = "spmx",
         .description = "The device supports the `SPM Z+` instruction",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.sram)] = .{
+    result[@backingInt(Feature.sram)] = .{
         .llvm_name = "sram",
         .description = "The device has random access memory",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.tinyencoding)] = .{
+    result[@backingInt(Feature.tinyencoding)] = .{
         .llvm_name = "tinyencoding",
         .description = "The device has Tiny core specific instruction encodings",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.wrappingrjmp)] = .{
+    result[@backingInt(Feature.wrappingrjmp)] = .{
         .llvm_name = "wrappingrjmp",
         .description = "The device potentially requires emitting rjmp that wraps across the flash boundary",
         .dependencies = featureSet(&[_]Feature{}),
     };
-    result[@intFromEnum(Feature.xmega)] = .{
+    result[@backingInt(Feature.xmega)] = .{
         .llvm_name = "xmega",
         .description = "The device is a part of the xmega family",
         .dependencies = featureSet(&[_]Feature{
@@ -318,7 +320,26 @@ pub const all_features = blk: {
             .sram,
         }),
     };
-    result[@intFromEnum(Feature.xmega3)] = .{
+    result[@backingInt(Feature.xmega2)] = .{
+        .llvm_name = "xmega2",
+        .description = "The device is a part of the xmega2 family",
+        .dependencies = featureSet(&[_]Feature{
+            .addsubiw,
+            .avr0,
+            .@"break",
+            .ijmpcall,
+            .jmpcall,
+            .lowbytefirst,
+            .lpm,
+            .lpmx,
+            .movw,
+            .mul,
+            .spm,
+            .spmx,
+            .sram,
+        }),
+    };
+    result[@backingInt(Feature.xmega3)] = .{
         .llvm_name = "xmega3",
         .description = "The device is a part of the xmega3 family",
         .dependencies = featureSet(&[_]Feature{
@@ -335,7 +356,28 @@ pub const all_features = blk: {
             .sram,
         }),
     };
-    result[@intFromEnum(Feature.xmegau)] = .{
+    result[@backingInt(Feature.xmega4)] = .{
+        .llvm_name = "xmega4",
+        .description = "The device is a part of the xmega4 family",
+        .dependencies = featureSet(&[_]Feature{
+            .addsubiw,
+            .avr0,
+            .@"break",
+            .elpm,
+            .elpmx,
+            .ijmpcall,
+            .jmpcall,
+            .lowbytefirst,
+            .lpm,
+            .lpmx,
+            .movw,
+            .mul,
+            .spm,
+            .spmx,
+            .sram,
+        }),
+    };
+    result[@backingInt(Feature.xmegau)] = .{
         .llvm_name = "xmegau",
         .description = "The device is a part of the xmegau family",
         .dependencies = featureSet(&[_]Feature{
@@ -346,7 +388,7 @@ pub const all_features = blk: {
     const ti = @typeInfo(Feature);
     for (&result, 0..) |*elem, i| {
         elem.index = i;
-        elem.name = ti.@"enum".fields[i].name;
+        elem.name = ti.@"enum".field_names[i];
     }
     break :blk result;
 };
@@ -1927,6 +1969,27 @@ pub const cpu = struct {
             .xmega3,
         }),
     };
+    pub const attiny3224: CpuModel = .{
+        .name = "attiny3224",
+        .llvm_name = "attiny3224",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const attiny3226: CpuModel = .{
+        .name = "attiny3226",
+        .llvm_name = "attiny3226",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const attiny3227: CpuModel = .{
+        .name = "attiny3227",
+        .llvm_name = "attiny3227",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
     pub const attiny4: CpuModel = .{
         .name = "attiny4",
         .llvm_name = "attiny4",
@@ -2503,6 +2566,160 @@ pub const cpu = struct {
             .avr1,
         }),
     };
+    pub const avr128da28: CpuModel = .{
+        .name = "avr128da28",
+        .llvm_name = "avr128da28",
+        .features = featureSet(&[_]Feature{
+            .xmega4,
+        }),
+    };
+    pub const avr128da32: CpuModel = .{
+        .name = "avr128da32",
+        .llvm_name = "avr128da32",
+        .features = featureSet(&[_]Feature{
+            .xmega4,
+        }),
+    };
+    pub const avr128da48: CpuModel = .{
+        .name = "avr128da48",
+        .llvm_name = "avr128da48",
+        .features = featureSet(&[_]Feature{
+            .xmega4,
+        }),
+    };
+    pub const avr128da64: CpuModel = .{
+        .name = "avr128da64",
+        .llvm_name = "avr128da64",
+        .features = featureSet(&[_]Feature{
+            .xmega4,
+        }),
+    };
+    pub const avr128db28: CpuModel = .{
+        .name = "avr128db28",
+        .llvm_name = "avr128db28",
+        .features = featureSet(&[_]Feature{
+            .xmega4,
+        }),
+    };
+    pub const avr128db32: CpuModel = .{
+        .name = "avr128db32",
+        .llvm_name = "avr128db32",
+        .features = featureSet(&[_]Feature{
+            .xmega4,
+        }),
+    };
+    pub const avr128db48: CpuModel = .{
+        .name = "avr128db48",
+        .llvm_name = "avr128db48",
+        .features = featureSet(&[_]Feature{
+            .xmega4,
+        }),
+    };
+    pub const avr128db64: CpuModel = .{
+        .name = "avr128db64",
+        .llvm_name = "avr128db64",
+        .features = featureSet(&[_]Feature{
+            .xmega4,
+        }),
+    };
+    pub const avr16dd20: CpuModel = .{
+        .name = "avr16dd20",
+        .llvm_name = "avr16dd20",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr16dd28: CpuModel = .{
+        .name = "avr16dd28",
+        .llvm_name = "avr16dd28",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr16dd32: CpuModel = .{
+        .name = "avr16dd32",
+        .llvm_name = "avr16dd32",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr16du14: CpuModel = .{
+        .name = "avr16du14",
+        .llvm_name = "avr16du14",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr16du20: CpuModel = .{
+        .name = "avr16du20",
+        .llvm_name = "avr16du20",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr16du28: CpuModel = .{
+        .name = "avr16du28",
+        .llvm_name = "avr16du28",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr16du32: CpuModel = .{
+        .name = "avr16du32",
+        .llvm_name = "avr16du32",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr16ea28: CpuModel = .{
+        .name = "avr16ea28",
+        .llvm_name = "avr16ea28",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr16ea32: CpuModel = .{
+        .name = "avr16ea32",
+        .llvm_name = "avr16ea32",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr16ea48: CpuModel = .{
+        .name = "avr16ea48",
+        .llvm_name = "avr16ea48",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr16eb14: CpuModel = .{
+        .name = "avr16eb14",
+        .llvm_name = "avr16eb14",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr16eb20: CpuModel = .{
+        .name = "avr16eb20",
+        .llvm_name = "avr16eb20",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr16eb28: CpuModel = .{
+        .name = "avr16eb28",
+        .llvm_name = "avr16eb28",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr16eb32: CpuModel = .{
+        .name = "avr16eb32",
+        .llvm_name = "avr16eb32",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
     pub const avr2: CpuModel = .{
         .name = "avr2",
         .llvm_name = "avr2",
@@ -2529,6 +2746,146 @@ pub const cpu = struct {
         .llvm_name = "avr31",
         .features = featureSet(&[_]Feature{
             .avr31,
+        }),
+    };
+    pub const avr32da28: CpuModel = .{
+        .name = "avr32da28",
+        .llvm_name = "avr32da28",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr32da32: CpuModel = .{
+        .name = "avr32da32",
+        .llvm_name = "avr32da32",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr32da48: CpuModel = .{
+        .name = "avr32da48",
+        .llvm_name = "avr32da48",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr32db28: CpuModel = .{
+        .name = "avr32db28",
+        .llvm_name = "avr32db28",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr32db32: CpuModel = .{
+        .name = "avr32db32",
+        .llvm_name = "avr32db32",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr32db48: CpuModel = .{
+        .name = "avr32db48",
+        .llvm_name = "avr32db48",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr32dd14: CpuModel = .{
+        .name = "avr32dd14",
+        .llvm_name = "avr32dd14",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr32dd20: CpuModel = .{
+        .name = "avr32dd20",
+        .llvm_name = "avr32dd20",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr32dd28: CpuModel = .{
+        .name = "avr32dd28",
+        .llvm_name = "avr32dd28",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr32dd32: CpuModel = .{
+        .name = "avr32dd32",
+        .llvm_name = "avr32dd32",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr32du14: CpuModel = .{
+        .name = "avr32du14",
+        .llvm_name = "avr32du14",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr32du20: CpuModel = .{
+        .name = "avr32du20",
+        .llvm_name = "avr32du20",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr32du28: CpuModel = .{
+        .name = "avr32du28",
+        .llvm_name = "avr32du28",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr32du32: CpuModel = .{
+        .name = "avr32du32",
+        .llvm_name = "avr32du32",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr32ea28: CpuModel = .{
+        .name = "avr32ea28",
+        .llvm_name = "avr32ea28",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr32ea32: CpuModel = .{
+        .name = "avr32ea32",
+        .llvm_name = "avr32ea32",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr32ea48: CpuModel = .{
+        .name = "avr32ea48",
+        .llvm_name = "avr32ea48",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr32sd20: CpuModel = .{
+        .name = "avr32sd20",
+        .llvm_name = "avr32sd20",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr32sd28: CpuModel = .{
+        .name = "avr32sd28",
+        .llvm_name = "avr32sd28",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
+        }),
+    };
+    pub const avr32sd32: CpuModel = .{
+        .name = "avr32sd32",
+        .llvm_name = "avr32sd32",
+        .features = featureSet(&[_]Feature{
+            .xmega3,
         }),
     };
     pub const avr35: CpuModel = .{
@@ -2564,6 +2921,146 @@ pub const cpu = struct {
         .llvm_name = "avr6",
         .features = featureSet(&[_]Feature{
             .avr6,
+        }),
+    };
+    pub const avr64da28: CpuModel = .{
+        .name = "avr64da28",
+        .llvm_name = "avr64da28",
+        .features = featureSet(&[_]Feature{
+            .xmega2,
+        }),
+    };
+    pub const avr64da32: CpuModel = .{
+        .name = "avr64da32",
+        .llvm_name = "avr64da32",
+        .features = featureSet(&[_]Feature{
+            .xmega2,
+        }),
+    };
+    pub const avr64da48: CpuModel = .{
+        .name = "avr64da48",
+        .llvm_name = "avr64da48",
+        .features = featureSet(&[_]Feature{
+            .xmega2,
+        }),
+    };
+    pub const avr64da64: CpuModel = .{
+        .name = "avr64da64",
+        .llvm_name = "avr64da64",
+        .features = featureSet(&[_]Feature{
+            .xmega2,
+        }),
+    };
+    pub const avr64db28: CpuModel = .{
+        .name = "avr64db28",
+        .llvm_name = "avr64db28",
+        .features = featureSet(&[_]Feature{
+            .xmega2,
+        }),
+    };
+    pub const avr64db32: CpuModel = .{
+        .name = "avr64db32",
+        .llvm_name = "avr64db32",
+        .features = featureSet(&[_]Feature{
+            .xmega2,
+        }),
+    };
+    pub const avr64db48: CpuModel = .{
+        .name = "avr64db48",
+        .llvm_name = "avr64db48",
+        .features = featureSet(&[_]Feature{
+            .xmega2,
+        }),
+    };
+    pub const avr64db64: CpuModel = .{
+        .name = "avr64db64",
+        .llvm_name = "avr64db64",
+        .features = featureSet(&[_]Feature{
+            .xmega2,
+        }),
+    };
+    pub const avr64dd14: CpuModel = .{
+        .name = "avr64dd14",
+        .llvm_name = "avr64dd14",
+        .features = featureSet(&[_]Feature{
+            .xmega2,
+        }),
+    };
+    pub const avr64dd20: CpuModel = .{
+        .name = "avr64dd20",
+        .llvm_name = "avr64dd20",
+        .features = featureSet(&[_]Feature{
+            .xmega2,
+        }),
+    };
+    pub const avr64dd28: CpuModel = .{
+        .name = "avr64dd28",
+        .llvm_name = "avr64dd28",
+        .features = featureSet(&[_]Feature{
+            .xmega2,
+        }),
+    };
+    pub const avr64dd32: CpuModel = .{
+        .name = "avr64dd32",
+        .llvm_name = "avr64dd32",
+        .features = featureSet(&[_]Feature{
+            .xmega2,
+        }),
+    };
+    pub const avr64du28: CpuModel = .{
+        .name = "avr64du28",
+        .llvm_name = "avr64du28",
+        .features = featureSet(&[_]Feature{
+            .xmega2,
+        }),
+    };
+    pub const avr64du32: CpuModel = .{
+        .name = "avr64du32",
+        .llvm_name = "avr64du32",
+        .features = featureSet(&[_]Feature{
+            .xmega2,
+        }),
+    };
+    pub const avr64ea28: CpuModel = .{
+        .name = "avr64ea28",
+        .llvm_name = "avr64ea28",
+        .features = featureSet(&[_]Feature{
+            .xmega2,
+        }),
+    };
+    pub const avr64ea32: CpuModel = .{
+        .name = "avr64ea32",
+        .llvm_name = "avr64ea32",
+        .features = featureSet(&[_]Feature{
+            .xmega2,
+        }),
+    };
+    pub const avr64ea48: CpuModel = .{
+        .name = "avr64ea48",
+        .llvm_name = "avr64ea48",
+        .features = featureSet(&[_]Feature{
+            .xmega2,
+        }),
+    };
+    pub const avr64sd28: CpuModel = .{
+        .name = "avr64sd28",
+        .llvm_name = "avr64sd28",
+        .features = featureSet(&[_]Feature{
+            .xmega2,
+        }),
+    };
+    pub const avr64sd32: CpuModel = .{
+        .name = "avr64sd32",
+        .llvm_name = "avr64sd32",
+        .features = featureSet(&[_]Feature{
+            .xmega2,
+        }),
+    };
+    pub const avr64sd48: CpuModel = .{
+        .name = "avr64sd48",
+        .llvm_name = "avr64sd48",
+        .features = featureSet(&[_]Feature{
+            .xmega2,
         }),
     };
     pub const avrtiny: CpuModel = .{

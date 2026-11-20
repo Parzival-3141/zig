@@ -2,6 +2,10 @@ buffer: []const u8,
 index: u32,
 
 pub const Bundle = @import("Certificate/Bundle.zig");
+pub const Chain = switch (builtin.os.tag) {
+    else => void, // not a shim to also avoid expensive caller logic
+    .windows => @import("Certificate/Chain.zig"),
+};
 
 pub const Version = enum { v1, v2, v3 };
 
@@ -171,6 +175,8 @@ pub const GeneralNameTag = enum(u5) {
     _,
 };
 
+const net = @import("../Io/net.zig");
+
 pub const Parsed = struct {
     certificate: Certificate,
     issuer_slice: Slice,
@@ -311,6 +317,7 @@ pub const Parsed = struct {
         // what to check. Otherwise, only the common name is checked.
         const subject_alt_name = parsed_subject.subjectAltName();
         if (subject_alt_name.len == 0) {
+            // note: checkIpAddress is intentionally omitted, as it is not permitted in the common name field anyway.
             if (checkHostName(host_name, parsed_subject.commonName())) {
                 return;
             } else {
@@ -323,10 +330,14 @@ pub const Parsed = struct {
         while (name_i < general_names.slice.end) {
             const general_name = try der.Element.parse(subject_alt_name, name_i);
             name_i = general_name.slice.end;
-            switch (@as(GeneralNameTag, @enumFromInt(@intFromEnum(general_name.identifier.tag)))) {
+            switch (@as(GeneralNameTag, @fromBackingInt(@intCast(@backingInt(general_name.identifier.tag))))) {
                 .dNSName => {
                     const dns_name = subject_alt_name[general_name.slice.start..general_name.slice.end];
                     if (checkHostName(host_name, dns_name)) return;
+                },
+                .iPAddress => {
+                    const ip_address = subject_alt_name[general_name.slice.start..general_name.slice.end];
+                    if (checkIpAddress(host_name, ip_address)) return;
                 },
                 else => {},
             }
@@ -341,8 +352,8 @@ pub const Parsed = struct {
     // the certificate (e.g., more than one DNSName name, a match in any one
     // of the set is considered acceptable.) Names may contain the wildcard
     // character * which is considered to match any single domain name
-    // component or component fragment. E.g., *.a.com matches foo.a.com but
-    // not bar.foo.a.com. f*.com matches foo.com but not bar.com.
+    // component. E.g., *.a.com matches foo.a.com but not bar.foo.a.com.
+    // Partial wildcards like f*.com are not supported.
     fn checkHostName(host_name: []const u8, dns_name: []const u8) bool {
         // Empty strings should not match
         if (host_name.len == 0 or dns_name.len == 0) return false;
@@ -358,10 +369,10 @@ pub const Parsed = struct {
             const wildcard_suffix = dns_name[2..];
 
             // No additional wildcards allowed in the suffix
-            if (mem.indexOf(u8, wildcard_suffix, "*") != null) return false;
+            if (mem.find(u8, wildcard_suffix, "*") != null) return false;
 
             // Find the first dot in hostname to split first label from rest
-            const dot_pos = mem.indexOf(u8, host_name, ".") orelse return false;
+            const dot_pos = mem.find(u8, host_name, ".") orelse return false;
 
             // Wildcard matches exactly one label, so compare the rest
             const host_suffix = host_name[dot_pos + 1 ..];
@@ -371,6 +382,22 @@ pub const Parsed = struct {
         }
 
         return false;
+    }
+
+    // Check IP address according to RFC 5280 §4.2.1.6.
+    fn checkIpAddress(host_name: []const u8, ip_address: []const u8) bool {
+        switch (ip_address.len) {
+            4 => {
+                // port is irrelevant to SAN matching, so 0 is a harmless placeholder.
+                const address = net.Ip4Address.parse(host_name, 0) catch return false;
+                return mem.eql(u8, &address.bytes, ip_address);
+            },
+            16 => {
+                const address = net.Ip6Address.parse(host_name, 0) catch return false;
+                return mem.eql(u8, &address.bytes, ip_address);
+            },
+            else => return false, // a malformed certificate, neither 4 nor 16 octets
+        }
     }
 };
 
@@ -411,6 +438,39 @@ test "Parsed.checkHostName RFC 6125 compliance" {
     try expectEqual(false, Parsed.checkHostName("", "*.example.com"));
     try expectEqual(false, Parsed.checkHostName("example.com", "*"));
     try expectEqual(false, Parsed.checkHostName("example.com", "*."));
+}
+
+test "Parsed.checkIpAddress RFC 5280 4.2.1.6 compliance" {
+    const expectEqual = std.testing.expectEqual;
+
+    // Exact match positive tests
+    try expectEqual(true, Parsed.checkIpAddress("127.0.0.1", &[4]u8{ 127, 0, 0, 1 }));
+    try expectEqual(true, Parsed.checkIpAddress("0:0:0:0:0:0:0:1", &[16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }));
+
+    // Mismatches should not pass
+    try expectEqual(false, Parsed.checkIpAddress("1.2.3.4", &[4]u8{ 5, 6, 7, 8 }));
+    try expectEqual(false, Parsed.checkIpAddress("0:0:0:0:0:0:0:1", &[16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 }));
+
+    // IPv6: the hostname may be in short-form and should match the exact 16 octets specified in the SAN
+    try expectEqual(true, Parsed.checkIpAddress("::1", &[16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }));
+
+    // IPv6: do not match when using DNS64 / NAT64 (i.e. 64:ff9b::/96)
+    // the RFC requires exact octet matches, so this is likely surprising and wrong. The decision here is to fail-safe out of an abundance of caution.
+    // The test assertions are included not to harden on this behavior, but to show that this use-case was considered.
+    // This check may become more lenient in the future if a valid use-case is found.
+    try expectEqual(false, Parsed.checkIpAddress("64:ff9b::192.0.2.10", &[4]u8{ 192, 0, 2, 10 }));
+    try expectEqual(false, Parsed.checkIpAddress("::ffff:127.0.0.1", &[4]u8{ 127, 0, 0, 1 }));
+
+    // Malformed SAN lengths (not 4 or 16 octets) never match.
+    try expectEqual(false, Parsed.checkIpAddress("127.0.0", &[_]u8{ 127, 0, 0 }));
+    try expectEqual(false, Parsed.checkIpAddress("127.0.0.1.0", &[_]u8{ 127, 0, 0, 1, 0 }));
+
+    // A non-parseable host_name never matches.
+    try expectEqual(false, Parsed.checkIpAddress("not-an-ip", &[4]u8{ 127, 0, 0, 1 }));
+
+    // Edge cases - empty strings
+    try expectEqual(false, Parsed.checkIpAddress("", ""));
+    try expectEqual(false, Parsed.checkIpAddress("127.0.0.1", ""));
 }
 
 pub const ParseError = der.Element.ParseError || ParseVersionError || ParseTimeError || ParseEnumError || ParseBitStringError;
@@ -576,7 +636,10 @@ pub fn parseTime(cert: Certificate, elem: der.Element) ParseTimeError!u64 {
                 return error.CertificateTimeInvalid;
 
             return Date.toSeconds(.{
-                .year = @as(u16, 2000) + try parseTimeDigits(bytes[0..2], 0, 99),
+                .year = blk: {
+                    const year = try parseTimeDigits(bytes[0..2], 0, 99);
+                    break :blk if (year < 50) @as(u16, 2000) + year else @as(u16, 1900) + year;
+                },
                 .month = try parseTimeDigits(bytes[2..4], 1, 12),
                 .day = try parseTimeDigits(bytes[4..6], 1, 31),
                 .hour = try parseTimeDigits(bytes[6..8], 0, 23),
@@ -635,7 +698,7 @@ const Date = struct {
             while (month < date.month) : (month += 1) {
                 const days: u64 = std.time.epoch.getDaysInMonth(
                     date.year,
-                    @enumFromInt(month),
+                    @fromBackingInt(@intCast(month)),
                 );
                 sec += days * std.time.epoch.secs_per_day;
             }
@@ -651,13 +714,28 @@ const Date = struct {
 };
 
 pub fn parseTimeDigits(text: *const [2]u8, min: u8, max: u8) !u8 {
-    const nn: @Vector(2, u16) = .{ text[0], text[1] };
-    const zero: @Vector(2, u16) = .{ '0', '0' };
-    const mm: @Vector(2, u16) = .{ 10, 1 };
-    const result = @reduce(.Add, (nn -% zero) *% mm);
+    const V = @Vector(2, u16);
+    const bytes: V = text.*;
+    const zero: V = @splat('0');
+    const mm: V = .{ 10, 1 };
+    const d = bytes -% zero;
+    if (@reduce(.Or, d > @as(V, @splat(9)))) {
+        @branchHint(.unlikely);
+        return error.CertificateTimeInvalid;
+    }
+    const result = @reduce(.Add, d *% mm);
     if (result < min) return error.CertificateTimeInvalid;
     if (result > max) return error.CertificateTimeInvalid;
     return @intCast(result);
+}
+
+test "parseTime UTCTime year mapping per RFC 5280" {
+    const utc_time_id: der.Identifier = .{ .tag = .utc_time, .pc = .primitive, .class = .universal };
+    const elem = der.Element{ .identifier = utc_time_id, .slice = .{ .start = 0, .end = 13 } };
+    const cert49 = Certificate{ .buffer = "490101000000Z", .index = 0 };
+    try std.testing.expectEqual(@as(u64, 2493072000), try cert49.parseTime(elem));
+    const cert99 = Certificate{ .buffer = "990101000000Z", .index = 0 };
+    try std.testing.expectEqual(@as(u64, 915148800), try cert99.parseTime(elem));
 }
 
 test parseTimeDigits {
@@ -670,14 +748,20 @@ test parseTimeDigits {
     try expectError(error.CertificateTimeInvalid, parseTimeDigits("13", 1, 12));
     try expectError(error.CertificateTimeInvalid, parseTimeDigits("00", 1, 12));
     try expectError(error.CertificateTimeInvalid, parseTimeDigits("Di", 0, 99));
+    try expectError(error.CertificateTimeInvalid, parseTimeDigits("0:", 1, 31));
 }
 
 pub fn parseYear4(text: *const [4]u8) !u16 {
-    const nnnn: @Vector(4, u32) = .{ text[0], text[1], text[2], text[3] };
-    const zero: @Vector(4, u32) = .{ '0', '0', '0', '0' };
-    const mmmm: @Vector(4, u32) = .{ 1000, 100, 10, 1 };
-    const result = @reduce(.Add, (nnnn -% zero) *% mmmm);
-    if (result > 9999) return error.CertificateTimeInvalid;
+    const V = @Vector(4, u32);
+    const bytes: V = text.*;
+    const zero: V = @splat('0');
+    const mmmm: V = .{ 1000, 100, 10, 1 };
+    const d = bytes -% zero;
+    if (@reduce(.Or, d > @as(V, @splat(9)))) {
+        @branchHint(.unlikely);
+        return error.CertificateTimeInvalid;
+    }
+    const result = @reduce(.Add, d *% mmmm);
     return @intCast(result);
 }
 
@@ -691,6 +775,9 @@ test parseYear4 {
     try expectError(error.CertificateTimeInvalid, parseYear4("999b"));
     try expectError(error.CertificateTimeInvalid, parseYear4("crap"));
     try expectError(error.CertificateTimeInvalid, parseYear4("r:bQ"));
+    try expectError(error.CertificateTimeInvalid, parseYear4("000:"));
+    try expectError(error.CertificateTimeInvalid, parseYear4("0???"));
+    try expectError(error.CertificateTimeInvalid, parseYear4("*zig"));
 }
 
 pub fn parseAlgorithm(bytes: []const u8, element: der.Element) ParseEnumError!Algorithm {
@@ -762,7 +849,7 @@ fn verifyRsa(
         inline 128, 256, 384, 512 => |modulus_len| {
             const public_key = rsa.PublicKey.fromBytes(exponent, modulus) catch
                 return error.CertificateSignatureInvalid;
-            rsa.PKCS1v1_5Signature.verify(modulus_len, sig[0..modulus_len].*, msg, public_key, Hash) catch
+            rsa.PKCS1v1_5Signature.verify(modulus_len, sig[0..modulus_len], msg, public_key, Hash) catch
                 return error.CertificateSignatureInvalid;
         },
         else => return error.CertificateSignatureUnsupportedBitCount,
@@ -829,6 +916,7 @@ fn verifyEd25519(
     };
 }
 
+const builtin = @import("builtin");
 const std = @import("../std.zig");
 const crypto = std.crypto;
 const mem = std.mem;
@@ -861,7 +949,7 @@ pub const der = struct {
         null = 5,
         object_identifier = 6,
         sequence = 16,
-        sequence_of = 17,
+        set = 17,
         utc_time = 23,
         generalized_time = 24,
         _,
@@ -941,7 +1029,7 @@ pub const rsa = struct {
 
         pub fn verify(
             comptime modulus_len: usize,
-            sig: [modulus_len]u8,
+            sig: *const [modulus_len]u8,
             msg: []const u8,
             public_key: PublicKey,
             comptime Hash: type,
@@ -951,7 +1039,7 @@ pub const rsa = struct {
 
         pub fn concatVerify(
             comptime modulus_len: usize,
-            sig: [modulus_len]u8,
+            sig: *const [modulus_len]u8,
             msg: []const []const u8,
             public_key: PublicKey,
             comptime Hash: type,
@@ -1060,9 +1148,9 @@ pub const rsa = struct {
             }
             var m_p_buf: [8 + Hash.digest_length + Hash.digest_length]u8 = undefined;
             var m_p = m_p_buf[0 .. 8 + Hash.digest_length + sLen];
-            std.mem.copyForwards(u8, m_p, &([_]u8{0} ** 8));
-            std.mem.copyForwards(u8, m_p[8..], &mHash);
-            std.mem.copyForwards(u8, m_p[(8 + Hash.digest_length)..], salt);
+            @memmove(m_p[0..8], @as(*const [8]u8, &@splat(0)));
+            @memmove(m_p[8..][0..Hash.digest_length], &mHash);
+            @memmove(m_p[(8 + Hash.digest_length)..], salt);
 
             // 13.  Let H' = Hash(M'), an octet string of length hLen.
             var h_p: [Hash.digest_length]u8 = undefined;
@@ -1104,7 +1192,7 @@ pub const rsa = struct {
 
         pub fn verify(
             comptime modulus_len: usize,
-            sig: [modulus_len]u8,
+            sig: *const [modulus_len]u8,
             msg: []const u8,
             public_key: PublicKey,
             comptime Hash: type,
@@ -1114,7 +1202,7 @@ pub const rsa = struct {
 
         pub fn concatVerify(
             comptime modulus_len: usize,
-            sig: [modulus_len]u8,
+            sig: *const [modulus_len]u8,
             msg: []const []const u8,
             public_key: PublicKey,
             comptime Hash: type,
@@ -1155,6 +1243,11 @@ pub const rsa = struct {
             //    DigestInfo value (see the notes below) and let tLen be the length
             //    in octets of T.
             const hash_der: []const u8 = &switch (Hash) {
+                crypto.hash.Md5 => .{
+                    0x30, 0x20, 0x30, 0x0C, 0x06, 0x08, 0x2A, 0x86,
+                    0x48, 0x86, 0xF7, 0x0D, 0x02, 0x05, 0x05, 0x00,
+                    0x04, 0x10,
+                },
                 crypto.hash.Sha1 => .{
                     0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e,
                     0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14,
@@ -1179,7 +1272,17 @@ pub const rsa = struct {
                     0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05,
                     0x00, 0x04, 0x40,
                 },
-                else => @compileError("unreachable"),
+                crypto.hash.sha3.Sha3_256 => .{
+                    0x30, 0x31, 0x30, 0x0D, 0x06, 0x09, 0x60, 0x86,
+                    0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x08, 0x05,
+                    0x00, 0x04, 0x20,
+                },
+                crypto.hash.sha3.Sha3_512 => .{
+                    0x30, 0x51, 0x30, 0x0D, 0x06, 0x09, 0x60, 0x86,
+                    0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x0a, 0x05,
+                    0x00, 0x04, 0x40,
+                },
+                else => comptime unreachable,
             };
             em_index -= hash_der.len;
             @memcpy(em[em_index..][0..hash_der.len], hash_der);
@@ -1260,11 +1363,27 @@ pub const rsa = struct {
 
     const EncryptError = error{MessageTooLong};
 
-    fn encrypt(comptime modulus_len: usize, msg: [modulus_len]u8, public_key: PublicKey) EncryptError![modulus_len]u8 {
-        const m = Fe.fromBytes(public_key.n, &msg, .big) catch return error.MessageTooLong;
+    fn encrypt(comptime modulus_len: usize, msg: *const [modulus_len]u8, public_key: PublicKey) EncryptError![modulus_len]u8 {
+        const m = Fe.fromBytes(public_key.n, msg, .big) catch return error.MessageTooLong;
         const e = public_key.n.powPublic(m, public_key.e) catch unreachable;
         var res: [modulus_len]u8 = undefined;
         e.toBytes(&res, .big) catch unreachable;
         return res;
     }
 };
+
+test "RSA-PSS verify wrapper" {
+    const modulus_hex = "a1757161bd6ddb93e4a96329dfed3cf5bd729156686893b74e36cabfc929781316ab7a2ecab1d5a0e3fe1d2ab4b14f34dbb02d3a7c879fded3b2ba26d41f554a183f906b3b32a7c11be8194d25f7a26fef17020373fea72906ba2db5259a4ab4ba91937f078bcb57f9f82b06ca6dac17a2e0b673c721b1f7d0600b208fef0d43";
+    const signature_hex = "32079b2b70f8828e4c70331abc9f08d2ccb805b29b7330c80f4ed17ddaa8c72b544faed138e9e7d41ca55e5770f408cb13d1149da7f1c13034dc5ce0da35dfc8417a2a8bfee1056b81e73954aae23acf6113c8db5b57b4a9242fd943c59c6b693d3d5d2dc40146dd75fc631507d1e43c6ce4f5a44b243804018107ae8bcacc86";
+    var modulus: [modulus_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&modulus, modulus_hex);
+    var signature: [signature_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&signature, signature_hex);
+    const key = try rsa.PublicKey.fromBytes(&.{ 1, 0, 1 }, &modulus);
+    const message = "Zig RSA-PSS wrapper regression";
+
+    try rsa.PSSSignature.verify(signature.len, &signature, message, key, std.crypto.hash.sha2.Sha256);
+    try std.testing.expectError(error.InvalidSignature, rsa.PSSSignature.verify(signature.len, &signature, "wrong message", key, std.crypto.hash.sha2.Sha256));
+    signature[signature.len - 1] ^= 1;
+    try std.testing.expectError(error.InvalidSignature, rsa.PSSSignature.verify(signature.len, &signature, message, key, std.crypto.hash.sha2.Sha256));
+}

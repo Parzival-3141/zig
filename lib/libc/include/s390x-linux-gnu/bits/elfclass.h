@@ -1,4 +1,4 @@
-/* Copyright (C) 2001-2025 Free Software Foundation, Inc.
+/* Copyright (C) 2001-2026 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -27,11 +27,6 @@
 
 #define __ELF_NATIVE_CLASS __WORDSIZE
 
-#if __WORDSIZE == 64
 /* 64 bit Linux for S/390 is exceptional as it has .hash section with
    64 bit entries.  */
 typedef uint64_t Elf_Symndx;
-#else
-/* 32 bit Linux for S/390 has normal .hash section entries with 32 bits.  */
-typedef uint32_t Elf_Symndx;
-#endif

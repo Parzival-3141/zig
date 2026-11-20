@@ -2,17 +2,15 @@
 // https://github.com/golang/crypto/tree/master/argon2
 // https://github.com/P-H-C/phc-winner-argon2
 
-const std = @import("std");
 const builtin = @import("builtin");
 
+const std = @import("std");
 const blake2 = crypto.hash.blake2;
 const crypto = std.crypto;
-const math = std.math;
+const Io = std.Io;
 const mem = std.mem;
 const phc_format = pwhash.phc_format;
 const pwhash = crypto.pwhash;
-
-const Thread = std.Thread;
 const Blake2b512 = blake2.Blake2b512;
 const Blocks = std.array_list.AlignedManaged([block_length]u64, .@"16");
 const H0 = [Blake2b512.digest_length + 8]u8;
@@ -54,23 +52,24 @@ pub const Mode = enum {
 pub const Params = struct {
     const Self = @This();
 
-    /// A [t]ime cost, which defines the amount of computation realized and therefore the execution
+    /// Time cost, which defines the amount of computation realized and therefore the execution
     /// time, given in number of iterations.
     t: u32,
 
-    /// A [m]emory cost, which defines the memory usage, given in kibibytes.
+    /// Memory cost, which defines the memory usage, given in kibibytes.
     m: u32,
 
-    /// A [p]arallelism degree, which defines the number of parallel threads.
+    /// Parallelism degree, which defines the number of independent tasks,
+    /// to be multiplexed onto threads when possible.
     p: u24,
 
-    /// The [secret] parameter, which is used for keyed hashing. This allows a secret key to be input
+    /// The secret parameter, which is used for keyed hashing. This allows a secret key to be input
     /// at hashing time (from some external location) and be folded into the value of the hash. This
     /// means that even if your salts and hashes are compromised, an attacker cannot brute-force to
     /// find the password without the key.
     secret: ?[]const u8 = null,
 
-    /// The [ad] parameter, which is used to fold any additional data into the hash value. Functionally,
+    /// The ad parameter, which is used to fold any additional data into the hash value. Functionally,
     /// this behaves almost exactly like the secret or salt parameters; the ad parameter is folding
     /// into the value of the hash. However, this parameter is used for different data. The salt
     /// should be a random string stored alongside your password. The secret should be a random key
@@ -119,7 +118,7 @@ fn initHash(
     mem.writeInt(u32, parameters[8..12], params.m, .little);
     mem.writeInt(u32, parameters[12..16], params.t, .little);
     mem.writeInt(u32, parameters[16..20], version, .little);
-    mem.writeInt(u32, parameters[20..24], @intFromEnum(mode), .little);
+    mem.writeInt(u32, parameters[20..24], @backingInt(mode), .little);
     b2.update(&parameters);
     mem.writeInt(u32, &tmp, @as(u32, @intCast(password.len)), .little);
     b2.update(&tmp);
@@ -177,51 +176,25 @@ fn blake2bLong(out: []u8, in: []const u8) void {
     @memcpy(out_slice, out_buf[0..out_slice.len]);
 }
 
-fn initBlocks(
-    blocks: *Blocks,
-    h0: *H0,
-    memory: u32,
-    threads: u24,
-) void {
-    var block0: [1024]u8 = undefined;
-    var lane: u24 = 0;
-    while (lane < threads) : (lane += 1) {
-        const j = lane * (memory / threads);
-        mem.writeInt(u32, h0[Blake2b512.digest_length + 4 ..][0..4], lane, .little);
-
-        mem.writeInt(u32, h0[Blake2b512.digest_length..][0..4], 0, .little);
-        blake2bLong(&block0, h0);
-        for (&blocks.items[j + 0], 0..) |*v, i| {
-            v.* = mem.readInt(u64, block0[i * 8 ..][0..8], .little);
-        }
-
-        mem.writeInt(u32, h0[Blake2b512.digest_length..][0..4], 1, .little);
-        blake2bLong(&block0, h0);
-        for (&blocks.items[j + 1], 0..) |*v, i| {
-            v.* = mem.readInt(u64, block0[i * 8 ..][0..8], .little);
-        }
-    }
-}
-
 fn processBlocks(
-    allocator: mem.Allocator,
     blocks: *Blocks,
     time: u32,
     memory: u32,
     threads: u24,
     mode: Mode,
-) KdfError!void {
+    io: Io,
+) Io.Cancelable!void {
     const lanes = memory / threads;
     const segments = lanes / sync_points;
 
     if (builtin.single_threaded or threads == 1) {
-        processBlocksSt(blocks, time, memory, threads, mode, lanes, segments);
+        processBlocksSync(blocks, time, memory, threads, mode, lanes, segments);
     } else {
-        try processBlocksMt(allocator, blocks, time, memory, threads, mode, lanes, segments);
+        try processBlocksAsync(blocks, time, memory, threads, mode, lanes, segments, io);
     }
 }
 
-fn processBlocksSt(
+fn processBlocksSync(
     blocks: *Blocks,
     time: u32,
     memory: u32,
@@ -242,8 +215,7 @@ fn processBlocksSt(
     }
 }
 
-fn processBlocksMt(
-    allocator: mem.Allocator,
+fn processBlocksAsync(
     blocks: *Blocks,
     time: u32,
     memory: u32,
@@ -251,26 +223,21 @@ fn processBlocksMt(
     mode: Mode,
     lanes: u32,
     segments: u32,
-) KdfError!void {
-    var threads_list = try std.array_list.Managed(Thread).initCapacity(allocator, threads);
-    defer threads_list.deinit();
-
+    io: Io,
+) Io.Cancelable!void {
     var n: u32 = 0;
     while (n < time) : (n += 1) {
         var slice: u32 = 0;
         while (slice < sync_points) : (slice += 1) {
+            var group: Io.Group = .init;
+            defer group.cancel(io);
             var lane: u24 = 0;
             while (lane < threads) : (lane += 1) {
-                const thread = try Thread.spawn(.{}, processSegment, .{
+                group.async(io, processSegment, .{
                     blocks, time, memory, threads, mode, lanes, segments, n, slice, lane,
                 });
-                threads_list.appendAssumeCapacity(thread);
             }
-            lane = 0;
-            while (lane < threads) : (lane += 1) {
-                threads_list.items[lane].join();
-            }
-            threads_list.clearRetainingCapacity();
+            try group.await(io);
         }
     }
 }
@@ -287,16 +254,16 @@ fn processSegment(
     slice: u32,
     lane: u24,
 ) void {
-    var addresses align(16) = [_]u64{0} ** block_length;
-    var in align(16) = [_]u64{0} ** block_length;
-    const zero align(16) = [_]u64{0} ** block_length;
+    var addresses: [block_length]u64 align(16) = @splat(0);
+    var in: [block_length]u64 align(16) = @splat(0);
+    const zero: [block_length]u64 align(16) = @splat(0);
     if (mode == .argon2i or (mode == .argon2id and n == 0 and slice < sync_points / 2)) {
         in[0] = n;
         in[1] = lane;
         in[2] = slice;
         in[3] = memory;
         in[4] = passes;
-        in[5] = @intFromEnum(mode);
+        in[5] = @backingInt(mode);
     }
     var index: u32 = 0;
     if (n == 0 and slice == 0) {
@@ -328,7 +295,11 @@ fn processSegment(
             random = blocks.items[prev][0];
         }
         const new_offset = indexAlpha(random, lanes, segments, threads, n, slice, lane, index);
-        processBlockXor(&blocks.items[offset], &blocks.items[prev], &blocks.items[new_offset]);
+        if (n == 0) {
+            processBlock(&blocks.items[offset], &blocks.items[prev], &blocks.items[new_offset]);
+        } else {
+            processBlockXor(&blocks.items[offset], &blocks.items[prev], &blocks.items[new_offset]);
+        }
     }
 }
 
@@ -360,22 +331,25 @@ fn processBlockGeneric(
     }
     var i: usize = 0;
     while (i < block_length) : (i += 16) {
-        blamkaGeneric(t[i..][0..16]);
+        blamkaGeneric(.{
+            &t[i + 0],  &t[i + 1],  &t[i + 2],  &t[i + 3],
+            &t[i + 4],  &t[i + 5],  &t[i + 6],  &t[i + 7],
+            &t[i + 8],  &t[i + 9],  &t[i + 10], &t[i + 11],
+            &t[i + 12], &t[i + 13], &t[i + 14], &t[i + 15],
+        });
     }
     i = 0;
-    var buffer: [16]u64 = undefined;
     while (i < block_length / 8) : (i += 2) {
-        var j: usize = 0;
-        while (j < block_length / 8) : (j += 2) {
-            buffer[j] = t[j * 8 + i];
-            buffer[j + 1] = t[j * 8 + i + 1];
-        }
-        blamkaGeneric(&buffer);
-        j = 0;
-        while (j < block_length / 8) : (j += 2) {
-            t[j * 8 + i] = buffer[j];
-            t[j * 8 + i + 1] = buffer[j + 1];
-        }
+        blamkaGeneric(.{
+            &t[0 * 16 + i], &t[0 * 16 + i + 1],
+            &t[1 * 16 + i], &t[1 * 16 + i + 1],
+            &t[2 * 16 + i], &t[2 * 16 + i + 1],
+            &t[3 * 16 + i], &t[3 * 16 + i + 1],
+            &t[4 * 16 + i], &t[4 * 16 + i + 1],
+            &t[5 * 16 + i], &t[5 * 16 + i + 1],
+            &t[6 * 16 + i], &t[6 * 16 + i + 1],
+            &t[7 * 16 + i], &t[7 * 16 + i + 1],
+        });
     }
     if (xor) {
         for (t, 0..) |v, j| {
@@ -388,38 +362,53 @@ fn processBlockGeneric(
     }
 }
 
-const QuarterRound = struct { a: usize, b: usize, c: usize, d: usize };
+const BlamkaVector = @Vector(4, u64);
 
-fn Rp(a: usize, b: usize, c: usize, d: usize) QuarterRound {
-    return .{ .a = a, .b = b, .c = c, .d = d };
+fn fBlaMka(x: BlamkaVector, y: BlamkaVector) BlamkaVector {
+    const x_lo: @Vector(4, u32) = @truncate(x);
+    const y_lo: @Vector(4, u32) = @truncate(y);
+    const xy = @as(BlamkaVector, x_lo) * @as(BlamkaVector, y_lo);
+    return x +% y +% @as(BlamkaVector, @splat(2)) *% xy;
 }
 
-fn fBlaMka(x: u64, y: u64) u64 {
-    const xy = @as(u64, @as(u32, @truncate(x))) * @as(u64, @as(u32, @truncate(y)));
-    return x +% y +% 2 *% xy;
+fn rotrVector(x: BlamkaVector, comptime n: comptime_int) BlamkaVector {
+    return (x >> @splat(n)) | (x << @splat(64 - n));
 }
 
-fn blamkaGeneric(x: *[16]u64) void {
-    const rounds = comptime [_]QuarterRound{
-        Rp(0, 4, 8, 12),
-        Rp(1, 5, 9, 13),
-        Rp(2, 6, 10, 14),
-        Rp(3, 7, 11, 15),
-        Rp(0, 5, 10, 15),
-        Rp(1, 6, 11, 12),
-        Rp(2, 7, 8, 13),
-        Rp(3, 4, 9, 14),
-    };
-    inline for (rounds) |r| {
-        x[r.a] = fBlaMka(x[r.a], x[r.b]);
-        x[r.d] = math.rotr(u64, x[r.d] ^ x[r.a], 32);
-        x[r.c] = fBlaMka(x[r.c], x[r.d]);
-        x[r.b] = math.rotr(u64, x[r.b] ^ x[r.c], 24);
-        x[r.a] = fBlaMka(x[r.a], x[r.b]);
-        x[r.d] = math.rotr(u64, x[r.d] ^ x[r.a], 16);
-        x[r.c] = fBlaMka(x[r.c], x[r.d]);
-        x[r.b] = math.rotr(u64, x[r.b] ^ x[r.c], 63);
-    }
+// The `inline` is load-bearing: without it ReleaseSmall keeps this out of line
+// and shuffles the four vectors through memory across every call, costing
+// roughly 9% on  Apple Silicon.
+inline fn blamkaRound(a: *BlamkaVector, b: *BlamkaVector, c: *BlamkaVector, d: *BlamkaVector) void {
+    a.* = fBlaMka(a.*, b.*);
+    d.* = rotrVector(d.* ^ a.*, 32);
+    c.* = fBlaMka(c.*, d.*);
+    b.* = rotrVector(b.* ^ c.*, 24);
+    a.* = fBlaMka(a.*, b.*);
+    d.* = rotrVector(d.* ^ a.*, 16);
+    c.* = fBlaMka(c.*, d.*);
+    b.* = rotrVector(b.* ^ c.*, 63);
+}
+
+fn blamkaGeneric(xs: [16]*u64) void {
+    var a: BlamkaVector = .{ xs[0].*, xs[1].*, xs[2].*, xs[3].* };
+    var b: BlamkaVector = .{ xs[4].*, xs[5].*, xs[6].*, xs[7].* };
+    var c: BlamkaVector = .{ xs[8].*, xs[9].*, xs[10].*, xs[11].* };
+    var d: BlamkaVector = .{ xs[12].*, xs[13].*, xs[14].*, xs[15].* };
+
+    blamkaRound(&a, &b, &c, &d);
+
+    var b_diag = @shuffle(u64, b, undefined, [_]i32{ 1, 2, 3, 0 });
+    var c_diag = @shuffle(u64, c, undefined, [_]i32{ 2, 3, 0, 1 });
+    var d_diag = @shuffle(u64, d, undefined, [_]i32{ 3, 0, 1, 2 });
+    blamkaRound(&a, &b_diag, &c_diag, &d_diag);
+    b = @shuffle(u64, b_diag, undefined, [_]i32{ 3, 0, 1, 2 });
+    c = @shuffle(u64, c_diag, undefined, [_]i32{ 2, 3, 0, 1 });
+    d = @shuffle(u64, d_diag, undefined, [_]i32{ 1, 2, 3, 0 });
+
+    inline for (0..4) |k| xs[k].* = a[k];
+    inline for (0..4) |k| xs[4 + k].* = b[k];
+    inline for (0..4) |k| xs[8 + k].* = c[k];
+    inline for (0..4) |k| xs[12 + k].* = d[k];
 }
 
 fn finalize(
@@ -477,6 +466,18 @@ fn indexAlpha(
     return ref_lane * lanes + @as(u32, @intCast(((s + m - (p + 1)) % lanes)));
 }
 
+fn blockCount(params: Params) u32 {
+    return @max(
+        params.m / (sync_points * params.p) * (sync_points * params.p),
+        2 * sync_points * params.p,
+    );
+}
+
+/// Compute the number of bytes of scratch memory `kdf` needs for `params`.
+pub fn calcSize(params: Params) usize {
+    return blockCount(params) * @sizeOf([block_length]u64);
+}
+
 /// Derives a key from the password, salt, and argon2 parameters.
 ///
 /// Derived key has to be at least 4 bytes length.
@@ -489,6 +490,7 @@ pub fn kdf(
     salt: []const u8,
     params: Params,
     mode: Mode,
+    io: Io,
 ) KdfError!void {
     if (derived_key.len < 4) return KdfError.WeakParameters;
     if (derived_key.len > max_int) return KdfError.OutputTooLong;
@@ -499,18 +501,33 @@ pub fn kdf(
     if (params.m / 8 < params.p) return KdfError.WeakParameters;
 
     var h0 = initHash(password, salt, params, derived_key.len, mode);
-    const memory = @max(
-        params.m / (sync_points * params.p) * (sync_points * params.p),
-        2 * sync_points * params.p,
-    );
+    const memory = blockCount(params);
 
     var blocks = try Blocks.initCapacity(allocator, memory);
     defer blocks.deinit();
 
-    blocks.appendNTimesAssumeCapacity(@splat(0), memory);
+    const items = blocks.addManyAsSliceAssumeCapacity(memory);
 
-    initBlocks(&blocks, &h0, memory, params.p);
-    try processBlocks(allocator, &blocks, params.t, memory, params.p, mode);
+    var block0: [1024]u8 = undefined;
+    var lane: u24 = 0;
+    while (lane < params.p) : (lane += 1) {
+        const j = lane * (memory / params.p);
+        mem.writeInt(u32, h0[Blake2b512.digest_length + 4 ..][0..4], lane, .little);
+
+        mem.writeInt(u32, h0[Blake2b512.digest_length..][0..4], 0, .little);
+        blake2bLong(&block0, &h0);
+        for (&items[j + 0], 0..) |*v, i| {
+            v.* = mem.readInt(u64, block0[i * 8 ..][0..8], .little);
+        }
+
+        mem.writeInt(u32, h0[Blake2b512.digest_length..][0..4], 1, .little);
+        blake2bLong(&block0, &h0);
+        for (&items[j + 1], 0..) |*v, i| {
+            v.* = mem.readInt(u64, block0[i * 8 ..][0..8], .little);
+        }
+    }
+
+    try processBlocks(&blocks, params.t, memory, params.p, mode, io);
     finalize(&blocks, memory, params.p, derived_key);
 }
 
@@ -533,14 +550,15 @@ const PhcFormatHasher = struct {
         params: Params,
         mode: Mode,
         buf: []u8,
+        io: Io,
     ) HasherError![]const u8 {
         if (params.secret != null or params.ad != null) return HasherError.InvalidEncoding;
 
         var salt: [default_salt_len]u8 = undefined;
-        crypto.random.bytes(&salt);
+        io.random(&salt);
 
         var hash: [default_hash_len]u8 = undefined;
-        try kdf(allocator, &hash, password, &salt, params, mode);
+        try kdf(allocator, &hash, password, &salt, params, mode, io);
 
         return phc_format.serialize(HashResult{
             .alg_id = @tagName(mode),
@@ -557,6 +575,7 @@ const PhcFormatHasher = struct {
         allocator: mem.Allocator,
         str: []const u8,
         password: []const u8,
+        io: Io,
     ) HasherError!void {
         const hash_result = try phc_format.deserialize(HashResult, str);
 
@@ -572,7 +591,7 @@ const PhcFormatHasher = struct {
         if (expected_hash.len > hash_buf.len) return HasherError.InvalidEncoding;
         const hash = hash_buf[0..expected_hash.len];
 
-        try kdf(allocator, hash, password, hash_result.salt.constSlice(), params, mode);
+        try kdf(allocator, hash, password, hash_result.salt.constSlice(), params, mode, io);
         if (!mem.eql(u8, hash, expected_hash)) return HasherError.PasswordVerificationFailed;
     }
 };
@@ -595,6 +614,7 @@ pub fn strHash(
     password: []const u8,
     options: HashOptions,
     out: []u8,
+    io: Io,
 ) Error![]const u8 {
     const allocator = options.allocator orelse return Error.AllocatorRequired;
     switch (options.encoding) {
@@ -604,16 +624,15 @@ pub fn strHash(
             options.params,
             options.mode,
             out,
+            io,
         ),
         .crypt => return Error.InvalidEncoding,
     }
 }
 
 /// Options for hash verification.
-///
-/// Allocator is required for argon2.
 pub const VerifyOptions = struct {
-    allocator: ?mem.Allocator,
+    allocator: mem.Allocator,
 };
 
 /// Verify that a previously computed hash is valid for a given password.
@@ -621,16 +640,18 @@ pub fn strVerify(
     str: []const u8,
     password: []const u8,
     options: VerifyOptions,
+    io: Io,
 ) Error!void {
-    const allocator = options.allocator orelse return Error.AllocatorRequired;
-    return PhcFormatHasher.verify(allocator, str, password);
+    return PhcFormatHasher.verify(options.allocator, str, password, io);
 }
 
 test "argon2d" {
-    const password = [_]u8{0x01} ** 32;
-    const salt = [_]u8{0x02} ** 16;
-    const secret = [_]u8{0x03} ** 8;
-    const ad = [_]u8{0x04} ** 12;
+    if (true) return error.SkipZigTest; // https://codeberg.org/ziglang/zig/issues/30074
+
+    const password: [32]u8 = @splat(0x01);
+    const salt: [16]u8 = @splat(0x02);
+    const secret: [8]u8 = @splat(0x03);
+    const ad: [12]u8 = @splat(0x04);
 
     var dk: [32]u8 = undefined;
     try kdf(
@@ -640,6 +661,7 @@ test "argon2d" {
         &salt,
         .{ .t = 3, .m = 32, .p = 4, .secret = &secret, .ad = &ad },
         .argon2d,
+        std.testing.io,
     );
 
     const want = [_]u8{
@@ -652,10 +674,10 @@ test "argon2d" {
 }
 
 test "argon2i" {
-    const password = [_]u8{0x01} ** 32;
-    const salt = [_]u8{0x02} ** 16;
-    const secret = [_]u8{0x03} ** 8;
-    const ad = [_]u8{0x04} ** 12;
+    const password: [32]u8 = @splat(0x01);
+    const salt: [16]u8 = @splat(0x02);
+    const secret: [8]u8 = @splat(0x03);
+    const ad: [12]u8 = @splat(0x04);
 
     var dk: [32]u8 = undefined;
     try kdf(
@@ -665,6 +687,7 @@ test "argon2i" {
         &salt,
         .{ .t = 3, .m = 32, .p = 4, .secret = &secret, .ad = &ad },
         .argon2i,
+        std.testing.io,
     );
 
     const want = [_]u8{
@@ -677,10 +700,10 @@ test "argon2i" {
 }
 
 test "argon2id" {
-    const password = [_]u8{0x01} ** 32;
-    const salt = [_]u8{0x02} ** 16;
-    const secret = [_]u8{0x03} ** 8;
-    const ad = [_]u8{0x04} ** 12;
+    const password: [32]u8 = @splat(0x01);
+    const salt: [16]u8 = @splat(0x02);
+    const secret: [8]u8 = @splat(0x03);
+    const ad: [12]u8 = @splat(0x04);
 
     var dk: [32]u8 = undefined;
     try kdf(
@@ -690,6 +713,7 @@ test "argon2id" {
         &salt,
         .{ .t = 3, .m = 32, .p = 4, .secret = &secret, .ad = &ad },
         .argon2id,
+        std.testing.io,
     );
 
     const want = [_]u8{
@@ -702,6 +726,8 @@ test "argon2id" {
 }
 
 test "kdf" {
+    if (true) return error.SkipZigTest; // https://codeberg.org/ziglang/zig/issues/31402
+
     const password = "password";
     const salt = "somesalt";
 
@@ -800,44 +826,44 @@ test "kdf" {
         .{
             .mode = .argon2i,
             .time = 4,
-            .memory = 4096,
+            .memory = 256,
             .threads = 4,
-            .hash = "a11f7b7f3f93f02ad4bddb59ab62d121e278369288a0d0e7",
+            .hash = "f7dbbacbf16999e3700817a7e06f65a8db2e9fa9504ede4c",
         },
         .{
             .mode = .argon2d,
             .time = 4,
-            .memory = 4096,
+            .memory = 256,
             .threads = 4,
-            .hash = "935598181aa8dc2b720914aa6435ac8d3e3a4210c5b0fb2d",
+            .hash = "ea2970501cf49faa5ba1d2e6370204e9b57ca90a8fea937b",
         },
         .{
             .mode = .argon2id,
             .time = 4,
-            .memory = 4096,
+            .memory = 256,
             .threads = 4,
-            .hash = "145db9733a9f4ee43edf33c509be96b934d505a4efb33c5a",
+            .hash = "fbd40d5a8cb92f88c20bda4b3cdb1f9d5af1efa937032410",
         },
         .{
             .mode = .argon2i,
             .time = 4,
-            .memory = 1024,
+            .memory = 256,
             .threads = 8,
-            .hash = "0cdd3956aa35e6b475a7b0c63488822f774f15b43f6e6e17",
+            .hash = "15d3c398364e53f68fd12d19baf3f21432d964254fe27467",
         },
         .{
             .mode = .argon2d,
             .time = 4,
-            .memory = 1024,
+            .memory = 256,
             .threads = 8,
-            .hash = "83604fc2ad0589b9d055578f4d3cc55bc616df3578a896e9",
+            .hash = "23c9adc06f06e21e4612c1466a1be02627690932b02c0df0",
         },
         .{
             .mode = .argon2id,
             .time = 4,
-            .memory = 1024,
+            .memory = 256,
             .threads = 8,
-            .hash = "8dafa8e004f8ea96bf7c0f93eecf67a6047476143d15577f",
+            .hash = "f22802f8ca47be93f9954e4ce20c1e944e938fbd4a125d9d",
         },
         .{
             .mode = .argon2i,
@@ -863,23 +889,23 @@ test "kdf" {
         .{
             .mode = .argon2i,
             .time = 3,
-            .memory = 1024,
+            .memory = 256,
             .threads = 6,
-            .hash = "d236b29c2b2a09babee842b0dec6aa1e83ccbdea8023dced",
+            .hash = "ebc8f91964abd8ceab49a12963b0a9e57d635bfa2aad2884",
         },
         .{
             .mode = .argon2d,
             .time = 3,
-            .memory = 1024,
+            .memory = 256,
             .threads = 6,
-            .hash = "a3351b0319a53229152023d9206902f4ef59661cdca89481",
+            .hash = "1dd7202fd68da6675f769f4034b7a1db30d8785331954117",
         },
         .{
             .mode = .argon2id,
             .time = 3,
-            .memory = 1024,
+            .memory = 256,
             .threads = 6,
-            .hash = "1640b932f4b60e272f5d2207b9a9c626ffa1bd88d2349016",
+            .hash = "424436b6ee22a66b04b9d0cf78f190305c5c166bae8baa09",
         },
     };
     for (test_vectors) |v| {
@@ -894,6 +920,7 @@ test "kdf" {
             salt,
             .{ .t = v.time, .m = v.memory, .p = v.threads },
             v.mode,
+            std.testing.io,
         );
 
         try std.testing.expectEqualSlices(u8, &dk, &want);
@@ -903,6 +930,7 @@ test "kdf" {
 test "phc format hasher" {
     const allocator = std.testing.allocator;
     const password = "testpass";
+    const io = std.testing.io;
 
     var buf: [128]u8 = undefined;
     const hash = try PhcFormatHasher.create(
@@ -911,25 +939,31 @@ test "phc format hasher" {
         .{ .t = 3, .m = 32, .p = 4 },
         .argon2id,
         &buf,
+        io,
     );
-    try PhcFormatHasher.verify(allocator, hash, password);
+    try PhcFormatHasher.verify(allocator, hash, password, io);
 }
 
 test "password hash and password verify" {
     const allocator = std.testing.allocator;
     const password = "testpass";
+    const io = std.testing.io;
 
     var buf: [128]u8 = undefined;
     const hash = try strHash(
         password,
         .{ .allocator = allocator, .params = .{ .t = 3, .m = 32, .p = 4 } },
         &buf,
+        io,
     );
-    try strVerify(hash, password, .{ .allocator = allocator });
+    try strVerify(hash, password, .{ .allocator = allocator }, io);
 }
 
 test "kdf derived key length" {
+    if (true) return error.SkipZigTest; // https://codeberg.org/ziglang/zig/issues/31504
+
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     const password = "testpass";
     const salt = "saltsalt";
@@ -937,11 +971,11 @@ test "kdf derived key length" {
     const mode = Mode.argon2id;
 
     var dk1: [11]u8 = undefined;
-    try kdf(allocator, &dk1, password, salt, params, mode);
+    try kdf(allocator, &dk1, password, salt, params, mode, io);
 
     var dk2: [77]u8 = undefined;
-    try kdf(allocator, &dk2, password, salt, params, mode);
+    try kdf(allocator, &dk2, password, salt, params, mode, io);
 
     var dk3: [111]u8 = undefined;
-    try kdf(allocator, &dk3, password, salt, params, mode);
+    try kdf(allocator, &dk3, password, salt, params, mode, io);
 }

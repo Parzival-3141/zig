@@ -1,9 +1,13 @@
 const std = @import("std");
-const builtin = @import("builtin");
 
 /// This tests the path where DWARF information is embedded in a COFF binary
 pub fn build(b: *std.Build) void {
-    switch (builtin.cpu.arch) {
+    const host = b.graph.host;
+
+    // https://github.com/ziglang/zig/issues/25471
+    if (host.result.os.tag == .freebsd) return;
+
+    switch (host.result.cpu.arch) {
         .aarch64,
         .x86,
         .x86_64,
@@ -14,11 +18,11 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Test it");
     b.default_step = test_step;
 
-    const optimize: std.builtin.OptimizeMode = .Debug;
-    const target = if (builtin.os.tag == .windows)
-        b.standardTargetOptions(.{})
-    else
-        b.resolveTargetQuery(.{ .os_tag = .windows });
+    const optimize: std.builtin.Optimize = .debug;
+    const target = switch (host.result.os.tag) {
+        .windows => host,
+        else => b.resolveTargetQuery(.{ .os_tag = .windows }),
+    };
 
     const exe = b.addExecutable(.{
         .name = "main",

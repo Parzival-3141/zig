@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
+const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 
 test "flags in packed union" {
@@ -59,14 +60,17 @@ test "flags in packed union at offset" {
 
 fn testFlagsInPackedUnionAtOffset() !void {
     const FlagBits = packed union {
-        base_flags: packed union {
-            flags: packed struct(u4) {
-                enable_1: bool = true,
-                enable_2: bool = false,
-                enable_3: bool = false,
-                enable_4: bool = false,
+        base_flags: packed struct(u12) {
+            a: packed union {
+                flags: packed struct(u4) {
+                    enable_1: bool = true,
+                    enable_2: bool = false,
+                    enable_3: bool = false,
+                    enable_4: bool = false,
+                },
+                bits: u4,
             },
-            bits: u4,
+            pad: u8 = 0,
         },
         adv_flags: packed struct(u12) {
             pad: u8 = 0,
@@ -175,14 +179,81 @@ test "assigning to non-active field at comptime" {
     }
 }
 
-test "comptime packed union of pointers" {
-    const U = packed union {
-        a: *const u32,
-        b: *const [1]u32,
+test "packed union with explicit backing integer" {
+    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const U = packed union(i32) {
+        raw: i32,
+        unsigned_halves: packed struct { low: u16, high: u16 },
+
+        fn check(val: @This()) !void {
+            try expect(@as(i32, @bitCast(val)) == -2);
+            try expect(@as(u32, @bitCast(val)) == 0xFFFFFFFE);
+            try expect(val.raw == -2);
+            try expect(val.unsigned_halves.low == 0xFFFE);
+            try expect(val.unsigned_halves.high == 0xFFFF);
+        }
+    };
+    try U.check(.{ .raw = -2 });
+    try comptime U.check(.{ .raw = -2 });
+}
+
+test "packed union equality" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const Foo = packed union {
+        a: u4,
+        b: i4,
     };
 
-    const x: u32 = 123;
-    const u: U = .{ .a = &x };
+    const S = struct {
+        fn doTest(x: Foo, y: Foo) !void {
+            try expect(x == y);
+            try expect(!(x != y));
+        }
+    };
 
-    comptime assert(u.b[0] == 123);
+    const x: Foo = .{ .a = 3 };
+    const y: Foo = .{ .b = 3 };
+
+    try S.doTest(x, y);
+    comptime try S.doTest(x, y);
+}
+
+test "initialize packed union field to undefined at comptime" {
+    const U = packed union(u8) { x: u8 };
+    const val: U = .{ .x = undefined };
+    _ = val;
+}
+
+test "convert from/to backing int" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const U = packed union(u10) {
+        a: i10,
+        b: enum(u10) { x, y, z },
+        fn doTheTest(u: @This()) !void {
+            const backing_int = @backingInt(u);
+            const reconstructed: @This() = @fromBackingInt(backing_int);
+            try expect(reconstructed == u);
+        }
+    };
+    try U.doTheTest(.{ .a = 123 });
+    try comptime U.doTheTest(.{ .a = 123 });
+}
+
+test "equality with wide backing integer" {
+    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // https://codeberg.org/ziglang/zig/issues/35982
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const U = packed union(i200) {
+        x: u200,
+        fn doTheTest(s: @This(), int: i200) !void {
+            try expect(s == @as(@This(), @bitCast(int)));
+        }
+    };
+    try U.doTheTest(.{ .x = (1 << 200) - 1 }, -1);
+    try comptime U.doTheTest(.{ .x = (1 << 200) - 1 }, -1);
 }

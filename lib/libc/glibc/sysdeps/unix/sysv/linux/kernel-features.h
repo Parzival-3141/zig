@@ -1,6 +1,6 @@
 /* Set flags signalling availability of kernel features based on given
    kernel version number.
-   Copyright (C) 1999-2025 Free Software Foundation, Inc.
+   Copyright (C) 1999-2026 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -155,7 +155,7 @@
    similar to kernel:
 
    - __ASSUME_CLONE_BACKWARDS: for variant 1.
-   - __ASSUME_CLONE_BACKWARDS2: for variant 2 (s390).
+   - __ASSUME_CLONE_BACKWARDS2: for variant 2 (s390x).
    - __ASSUME_CLONE_BACKWARDS3: for variant 3 (microblaze).
    - __ASSUME_CLONE_DEFAULT: for variant 4.
    */
@@ -260,5 +260,15 @@
 #else
 # define __ASSUME_FCHMODAT2 0
 #endif
+
+/* The mseal system call was introduced across all architectures in Linux 6.10
+   (although only supported on 64-bit CPUs).  */
+/* zig patch: don't assume kernel version */
+#define __ASSUME_MSEAL 0
+
+/* The PIDFD_GET_INFO ioctl was introduced across all architectures in Linux
+   6.13.  */
+/* zig patch: don't assume kernel version */
+#define __ASSUME_PIDFD_GET_INFO 0
 
 #endif /* kernel-features.h */

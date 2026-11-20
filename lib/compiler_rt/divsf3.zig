@@ -3,32 +3,38 @@
 //! https://github.com/llvm/llvm-project/commit/d674d96bc56c0f377879d01c9d8dfdaaa7859cdb/compiler-rt/lib/builtins/divsf3.c
 
 const std = @import("std");
-const builtin = @import("builtin");
-const arch = builtin.cpu.arch;
 
-const common = @import("common.zig");
-const normalize = common.normalize;
-
-pub const panic = common.panic;
+const compiler_rt = @import("../compiler_rt.zig");
+const symbol = compiler_rt.symbol;
+const normalize = compiler_rt.normalize;
 
 comptime {
-    if (common.want_aeabi) {
-        @export(&__aeabi_fdiv, .{ .name = "__aeabi_fdiv", .linkage = common.linkage, .visibility = common.visibility });
+    symbol(&__divhf3, "__divhf3");
+    if (compiler_rt.want_aeabi) {
+        symbol(&__aeabi_fdiv, "__aeabi_fdiv");
     } else {
-        @export(&__divsf3, .{ .name = "__divsf3", .linkage = common.linkage, .visibility = common.visibility });
+        symbol(&__divsf3, "__divsf3");
     }
 }
 
-pub fn __divsf3(a: f32, b: f32) callconv(.c) f32 {
-    return div(a, b);
+fn __divhf3(a: compiler_rt.f16.Abi, b: compiler_rt.f16.Abi) callconv(.c) compiler_rt.f16.Abi {
+    return compiler_rt.f16.toAbi(div_f16(compiler_rt.f16.fromAbi(a), compiler_rt.f16.fromAbi(b)));
+}
+pub fn div_f16(a: f16, b: f16) f16 {
+    // TODO: more efficient implementation
+    return @floatCast(div_f32(a, b));
+}
+
+fn __divsf3(a: compiler_rt.f32.Abi, b: compiler_rt.f32.Abi) callconv(.c) compiler_rt.f32.Abi {
+    return compiler_rt.f32.toAbi(div_f32(compiler_rt.f32.fromAbi(a), compiler_rt.f32.fromAbi(b)));
 }
 
 fn __aeabi_fdiv(a: f32, b: f32) callconv(.{ .arm_aapcs = .{} }) f32 {
-    return div(a, b);
+    return div_f32(a, b);
 }
 
-inline fn div(a: f32, b: f32) f32 {
-    const Z = std.meta.Int(.unsigned, 32);
+pub fn div_f32(a: f32, b: f32) f32 {
+    const Z = @Int(.unsigned, 32);
 
     const significandBits = std.math.floatMantissaBits(f32);
     const exponentBits = std.math.floatExponentBits(f32);
@@ -173,14 +179,14 @@ inline fn div(a: f32, b: f32) f32 {
 
     const writtenExponent = quotientExponent +% exponentBias;
 
+    const round = @intFromBool((residual << 1) >= bSignificand);
+
     if (writtenExponent >= maxExponent) {
         // If we have overflowed the exponent, return infinity.
         return @bitCast(infRep | quotientSign);
     } else if (writtenExponent < 1) {
         if (writtenExponent == 0) {
             // Check whether the rounded result is normal.
-            const round = @intFromBool((residual << 1) > bSignificand);
-            // Clear the implicit bit.
             var absResult = quotient & significandMask;
             // Round.
             absResult += round;
@@ -189,11 +195,16 @@ inline fn div(a: f32, b: f32) f32 {
                 return @bitCast(absResult | quotientSign);
             }
         }
-        // Flush denormals to zero.  In the future, it would be nice to add
-        // code to round them correctly.
-        return @bitCast(quotientSign);
+
+        const roundedQuotient = quotient +% round;
+        const shiftAmount: u32 = @intCast(1 - writtenExponent);
+        if (shiftAmount > significandBits + 1) {
+            return @bitCast(quotientSign);
+        }
+
+        const denormQuotient = roundedQuotient >> @as(std.math.Log2Int(Z), @intCast(shiftAmount));
+        return @bitCast((denormQuotient & significandMask) | quotientSign);
     } else {
-        const round = @intFromBool((residual << 1) > bSignificand);
         // Clear the implicit bit
         var absResult = quotient & significandMask;
         // Insert the exponent

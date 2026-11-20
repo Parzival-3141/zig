@@ -14,13 +14,13 @@ const State = [8 * Cipher.block_length]u8;
 state: State,
 offset: usize,
 
-const nonce = [_]u8{0} ** Cipher.nonce_length;
+const nonce: [Cipher.nonce_length]u8 = @splat(0);
 
 pub const secret_seed_length = Cipher.key_length;
 
 /// The seed must be uniform, secret and `secret_seed_length` bytes long.
 pub fn init(secret_seed: [secret_seed_length]u8) Self {
-    var self = Self{ .state = undefined, .offset = 0 };
+    var self: Self = .{ .state = undefined, .offset = 0 };
     Cipher.stream(&self.state, 0, secret_seed, nonce);
     return self;
 }
@@ -38,7 +38,7 @@ pub fn addEntropy(self: *Self, bytes: []const u8) void {
         );
     }
     if (i < bytes.len) {
-        var k = [_]u8{0} ** Cipher.key_length;
+        var k: [Cipher.key_length]u8 = @splat(0);
         const src = bytes[i..];
         @memcpy(k[0..src.len], src);
         Cipher.xor(

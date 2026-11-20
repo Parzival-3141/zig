@@ -55,12 +55,14 @@
 //       - e.g. find a common previous symbol and put it after that one
 //       - they definitely need to go into the correct section
 
+const builtin = @import("builtin");
+const native_endian = builtin.cpu.arch.endian();
+
 const std = @import("std");
-const builtin = std.builtin;
+const Io = std.Io;
 const mem = std.mem;
 const log = std.log;
 const elf = std.elf;
-const native_endian = @import("builtin").cpu.arch.endian();
 
 const Arch = enum {
     aarch64,
@@ -139,10 +141,10 @@ const Family = enum {
     x86,
 };
 
-const arches: [@typeInfo(Arch).@"enum".fields.len]Arch = blk: {
-    var result: [@typeInfo(Arch).@"enum".fields.len]Arch = undefined;
-    for (@typeInfo(Arch).@"enum".fields) |field| {
-        const arch: Arch = @enumFromInt(field.value);
+const arches: [@typeInfo(Arch).@"enum".field_names.len]Arch = blk: {
+    var result: [@typeInfo(Arch).@"enum".field_names.len]Arch = undefined;
+    for (@typeInfo(Arch).@"enum".field_values) |field_value| {
+        const arch: Arch = @fromBackingInt(@intCast(field_value));
         result[archIndex(arch)] = arch;
     }
     break :blk result;
@@ -158,8 +160,8 @@ const MultiSym = struct {
 
     fn isSingleArch(ms: MultiSym) ?Arch {
         var result: ?Arch = null;
-        inline for (@typeInfo(Arch).@"enum".fields) |field| {
-            const arch: Arch = @enumFromInt(field.value);
+        inline for (@typeInfo(Arch).@"enum".field_values) |field_value| {
+            const arch: Arch = @fromBackingInt(@intCast(field_value));
             if (ms.present[archIndex(arch)]) {
                 if (result != null) return null;
                 result = arch;
@@ -170,8 +172,8 @@ const MultiSym = struct {
 
     fn isFamily(ms: MultiSym) ?Family {
         var result: ?Family = null;
-        inline for (@typeInfo(Arch).@"enum".fields) |field| {
-            const arch: Arch = @enumFromInt(field.value);
+        inline for (@typeInfo(Arch).@"enum".field_values) |field_value| {
+            const arch: Arch = @fromBackingInt(@intCast(field_value));
             if (ms.present[archIndex(arch)]) {
                 const family = arch.family();
                 if (result) |r| if (family != r) return null;
@@ -191,8 +193,8 @@ const MultiSym = struct {
     }
 
     fn isTime32Only(ms: MultiSym) bool {
-        inline for (@typeInfo(Arch).@"enum".fields) |field| {
-            const arch: Arch = @enumFromInt(field.value);
+        inline for (@typeInfo(Arch).@"enum".field_values) |field_value| {
+            const arch: Arch = @fromBackingInt(@intCast(field_value));
             if (ms.present[archIndex(arch)] != arch.isTime32()) {
                 return false;
             }
@@ -231,8 +233,8 @@ const MultiSym = struct {
     }
 
     fn isPtrSize(ms: MultiSym, mult: u16) bool {
-        inline for (@typeInfo(Arch).@"enum".fields) |field| {
-            const arch: Arch = @enumFromInt(field.value);
+        inline for (@typeInfo(Arch).@"enum".field_values) |field_value| {
+            const arch: Arch = @fromBackingInt(@intCast(field_value));
             const arch_index = archIndex(arch);
             if (ms.present[arch_index] and ms.size[arch_index] != arch.ptrSize() * mult) {
                 return false;
@@ -242,8 +244,8 @@ const MultiSym = struct {
     }
 
     fn isWeak64(ms: MultiSym) bool {
-        inline for (@typeInfo(Arch).@"enum".fields) |field| {
-            const arch: Arch = @enumFromInt(field.value);
+        inline for (@typeInfo(Arch).@"enum".field_values) |field_value| {
+            const arch: Arch = @fromBackingInt(@intCast(field_value));
             const arch_index = archIndex(arch);
             const binding: u4 = switch (arch.ptrSize()) {
                 4 => std.elf.STB_GLOBAL,
@@ -258,8 +260,8 @@ const MultiSym = struct {
     }
 
     fn isWeakTime64(ms: MultiSym) bool {
-        inline for (@typeInfo(Arch).@"enum".fields) |field| {
-            const arch: Arch = @enumFromInt(field.value);
+        inline for (@typeInfo(Arch).@"enum".field_values) |field_value| {
+            const arch: Arch = @fromBackingInt(@intCast(field_value));
             const arch_index = archIndex(arch);
             const binding: u4 = if (arch.isTime32()) std.elf.STB_GLOBAL else std.elf.STB_WEAK;
             if (ms.present[arch_index] and ms.binding[arch_index] != binding) {
@@ -272,43 +274,37 @@ const MultiSym = struct {
 
 const Parse = struct {
     arena: mem.Allocator,
-    sym_table: *std.StringArrayHashMap(MultiSym),
-    sections: *std.StringArrayHashMap(void),
+    sym_table: *std.array_hash_map.String(MultiSym),
+    sections: *std.array_hash_map.String(void),
     elf_bytes: []align(@alignOf(elf.Elf64_Ehdr)) u8,
     header: elf.Header,
     arch: Arch,
 };
 
-pub fn main() !void {
-    var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena_instance.deinit();
-    const arena = arena_instance.allocator();
-
-    const args = try std.process.argsAlloc(arena);
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const io = init.io;
+    const args = try init.minimal.args.toSlice(arena);
     const build_all_path = args[1];
 
-    var build_all_dir = try std.fs.cwd().openDir(build_all_path, .{});
+    var build_all_dir = try Io.Dir.cwd().openDir(io, build_all_path, .{});
 
-    var sym_table = std.StringArrayHashMap(MultiSym).init(arena);
-    var sections = std.StringArrayHashMap(void).init(arena);
+    var sym_table: std.array_hash_map.String(MultiSym) = .empty;
+    var sections: std.array_hash_map.String(void) = .empty;
 
     for (arches) |arch| {
-        const libc_so_path = try std.fmt.allocPrint(arena, "{s}/lib/libc.so", .{
-            @tagName(arch),
-        });
+        const libc_so_path = try std.fmt.allocPrint(arena, "{t}/lib/libc.so", .{arch});
 
         // Read the ELF header.
         const elf_bytes = build_all_dir.readFileAllocOptions(
-            arena,
+            io,
             libc_so_path,
-            100 * 1024 * 1024,
-            1 * 1024 * 1024,
+            arena,
+            .limited(100 * 1024 * 1024),
             .of(elf.Elf64_Ehdr),
             null,
         ) catch |err| {
-            std.debug.panic("unable to read '{s}/{s}': {s}", .{
-                build_all_path, libc_so_path, @errorName(err),
-            });
+            std.debug.panic("unable to read '{s}/{s}': {t}", .{ build_all_path, libc_so_path, err });
         };
         var stream: std.Io.Reader = .fixed(elf_bytes);
         const header = try elf.Header.read(&stream);
@@ -335,7 +331,7 @@ pub fn main() !void {
     }
 
     var stdout_buffer: [2000]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdout_writer = Io.File.stdout().writerStreaming(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
     try stdout.writeAll(
         \\#ifdef PTR64
@@ -359,8 +355,8 @@ pub fn main() !void {
 
     // Sort the symbols for deterministic output and cleaner vcs diffs.
     const SymTableSort = struct {
-        sections: *const std.StringArrayHashMap(void),
-        sym_table: *const std.StringArrayHashMap(MultiSym),
+        sections: *const std.array_hash_map.String(void),
+        sym_table: *const std.array_hash_map.String(MultiSym),
 
         /// Sort first by section name, then by symbol name
         pub fn lessThan(ctx: @This(), index_a: usize, index_b: usize) bool {
@@ -540,7 +536,7 @@ pub fn main() !void {
     try stdout.flush();
 }
 
-fn parseElf(parse: Parse, comptime is_64: bool, comptime endian: builtin.Endian) !void {
+fn parseElf(parse: Parse, comptime is_64: bool, comptime endian: std.builtin.Endian) !void {
     const arena = parse.arena;
     const elf_bytes = parse.elf_bytes;
     const header = parse.header;
@@ -580,7 +576,7 @@ fn parseElf(parse: Parse, comptime is_64: bool, comptime endian: builtin.Endian)
         if (mem.eql(u8, sh_name, ".dynsym")) {
             dynsym_index = @as(u16, @intCast(i));
         }
-        const gop = try parse.sections.getOrPut(sh_name);
+        const gop = try parse.sections.getOrPut(arena, sh_name);
         section_index_map[i] = @as(u16, @intCast(gop.index));
     }
     if (dynsym_index == 0) @panic("did not find the .dynsym section");
@@ -609,7 +605,7 @@ fn parseElf(parse: Parse, comptime is_64: bool, comptime endian: builtin.Endian)
         const name = try arena.dupe(u8, mem.sliceTo(dynstr[s(sym.st_name)..], 0));
         const ty = @as(u4, @truncate(sym.st_info));
         const binding = @as(u4, @truncate(sym.st_info >> 4));
-        const visib = @as(elf.STV, @enumFromInt(@as(u2, @truncate(sym.st_other))));
+        const visib = @as(elf.STV, @fromBackingInt(@intCast(@as(u3, @truncate(sym.st_other)))));
         const size = s(sym.st_size);
 
         if (size == 0) {
@@ -653,7 +649,7 @@ fn parseElf(parse: Parse, comptime is_64: bool, comptime endian: builtin.Endian)
             },
         }
 
-        const gop = try parse.sym_table.getOrPut(name);
+        const gop = try parse.sym_table.getOrPut(arena, name);
         if (gop.found_existing) {
             if (gop.value_ptr.section != section_index_map[this_section]) {
                 const sh_name = mem.sliceTo(shstrtab[s(shdrs[this_section].sh_name)..], 0);
@@ -706,12 +702,12 @@ fn parseElf(parse: Parse, comptime is_64: bool, comptime endian: builtin.Endian)
             }
         } else {
             gop.value_ptr.* = .{
-                .present = [1]bool{false} ** arches.len,
+                .present = @splat(false),
                 .section = section_index_map[this_section],
                 .ty = ty,
-                .binding = [1]u4{0} ** arches.len,
+                .binding = @splat(0),
                 .visib = visib,
-                .size = [1]u64{0} ** arches.len,
+                .size = @splat(0),
             };
         }
         gop.value_ptr.present[archIndex(parse.arch)] = true;
@@ -721,7 +717,7 @@ fn parseElf(parse: Parse, comptime is_64: bool, comptime endian: builtin.Endian)
 }
 
 fn archIndex(arch: Arch) u8 {
-    return @intFromEnum(arch);
+    return @backingInt(arch);
 }
 
 fn archSetName(arch_set: [arches.len]bool) []const u8 {

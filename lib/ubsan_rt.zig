@@ -3,6 +3,10 @@ const builtin = @import("builtin");
 const assert = std.debug.assert;
 const panic = std.debug.panicExtra;
 
+pub const std_options: std.Options = .{
+    .networking = false,
+};
+
 const SourceLocation = extern struct {
     file_name: ?[*:0]const u8,
     line: u32,
@@ -119,13 +123,7 @@ const Value = extern struct {
         }
     }
 
-    pub fn format(value: Value, writer: *std.io.Writer) std.io.Writer.Error!void {
-        // Work around x86_64 backend limitation.
-        if (builtin.zig_backend == .stage2_x86_64 and builtin.os.tag == .windows) {
-            try writer.writeAll("(unknown)");
-            return;
-        }
-
+    pub fn format(value: Value, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (value.td.kind) {
             .integer => {
                 if (value.td.isSigned()) {
@@ -494,10 +492,10 @@ const NonNullReturnData = extern struct {
     attribute_loc: SourceLocation,
 };
 
-fn nonNullReturnAbort(data: *const NonNullReturnData) callconv(.c) noreturn {
-    nonNullReturn(data);
+fn nonNullReturnAbort(data: *const NonNullReturnData, where: *const SourceLocation) callconv(.c) noreturn {
+    nonNullReturn(data, where);
 }
-fn nonNullReturn(_: *const NonNullReturnData) callconv(.c) noreturn {
+fn nonNullReturn(_: *const NonNullReturnData, _: *const SourceLocation) callconv(.c) noreturn {
     panic(@returnAddress(), "null pointer returned from function declared to never return null", .{});
 }
 
@@ -624,10 +622,11 @@ fn exportHandler(
     handler: anytype,
     comptime sym_name: []const u8,
 ) void {
-    // Work around x86_64 backend limitation.
-    const linkage = if (builtin.zig_backend == .stage2_x86_64 and builtin.os.tag == .windows) .internal else .weak;
-    const N = "__ubsan_handle_" ++ sym_name;
-    @export(handler, .{ .name = N, .linkage = linkage, .visibility = if (linkage == .internal) .default else .hidden });
+    @export(handler, .{
+        .name = "__ubsan_handle_" ++ sym_name,
+        .linkage = .weak,
+        .visibility = .hidden,
+    });
 }
 
 fn exportHandlerWithAbort(
@@ -635,19 +634,20 @@ fn exportHandlerWithAbort(
     abort_handler: anytype,
     comptime sym_name: []const u8,
 ) void {
-    // Work around x86_64 backend limitation.
-    const linkage = if (builtin.zig_backend == .stage2_x86_64 and builtin.os.tag == .windows) .internal else .weak;
-    {
-        const N = "__ubsan_handle_" ++ sym_name;
-        @export(handler, .{ .name = N, .linkage = linkage, .visibility = if (linkage == .internal) .default else .hidden });
-    }
-    {
-        const N = "__ubsan_handle_" ++ sym_name ++ "_abort";
-        @export(abort_handler, .{ .name = N, .linkage = linkage, .visibility = if (linkage == .internal) .default else .hidden });
-    }
+    @export(handler, .{
+        .name = "__ubsan_handle_" ++ sym_name,
+        .linkage = .weak,
+        .visibility = .hidden,
+    });
+    @export(abort_handler, .{
+        .name = "__ubsan_handle_" ++ sym_name ++ "_abort",
+        .linkage = .weak,
+        .visibility = .hidden,
+    });
 }
 
 const can_build_ubsan = switch (builtin.zig_backend) {
+    .stage2_loongarch,
     .stage2_powerpc,
     .stage2_riscv64,
     => false,

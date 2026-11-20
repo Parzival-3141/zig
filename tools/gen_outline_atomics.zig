@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 const AtomicOp = enum {
@@ -10,15 +11,14 @@ const AtomicOp = enum {
     ldset,
 };
 
-pub fn main() !void {
-    var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena_instance.deinit();
-    const arena = arena_instance.allocator();
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const io = init.io;
 
     //const args = try std.process.argsAlloc(arena);
 
     var stdout_buffer: [2000]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdout_writer = Io.File.stdout().writerStreaming(io, &stdout_buffer);
     const w = &stdout_writer.interface;
 
     try w.writeAll(
@@ -49,7 +49,7 @@ pub fn main() !void {
                     @tagName(op), n.toBytes(), @tagName(order),
                 });
                 try writeFunction(arena, w, name, op, n, order);
-                try footer.writer().print("    @export(&{s}, .{{ .name = \"{s}\", .linkage = common.linkage, .visibility = common.visibility }});\n", .{
+                try footer.print("    @export(&{s}, .{{ .name = \"{s}\", .linkage = common.linkage, .visibility = common.visibility }});\n", .{
                     name, name,
                 });
             }
@@ -145,11 +145,11 @@ const N = enum(u8) {
     }
 
     fn register(n: N) []const u8 {
-        return if (@intFromEnum(n) < 8) "w" else "x";
+        return if (@backingInt(n) < 8) "w" else "x";
     }
 
     fn toBytes(n: N) u8 {
-        return @intFromEnum(n);
+        return @backingInt(n);
     }
 
     fn toBits(n: N) u8 {
@@ -213,7 +213,7 @@ fn generateCas(arena: Allocator, n: N, order: Ordering) ![]const u8 {
 
     const reg = n.register();
 
-    if (@intFromEnum(n) < 16) {
+    if (@backingInt(n) < 16) {
         const cas = try std.fmt.allocPrint(arena, ".inst 0x08a07c41 + {s} + {s}", .{ s_def.b, o_def.m });
         const ldxr = try std.fmt.allocPrint(arena, "ld{s}xr{s}", .{ o_def.a, s_def.s });
         const stxr = try std.fmt.allocPrint(arena, "st{s}xr{s}", .{ o_def.l, s_def.s });

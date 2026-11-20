@@ -10,7 +10,7 @@ pub const File = union(enum) {
         };
     }
 
-    pub fn fmtPath(file: File) std.fmt.Formatter(File, formatPath) {
+    pub fn fmtPath(file: File) std.fmt.Alt(File, formatPath) {
         return .{ .data = file };
     }
 
@@ -192,21 +192,21 @@ pub const File = union(enum) {
         assert(file == .object or file == .zig_object);
 
         for (file.getSymbols(), file.getNlists(), 0..) |*sym, nlist, i| {
-            if (!nlist.ext()) continue;
-            if (!nlist.undf()) continue;
+            if (!nlist.n_type.bits.ext) continue;
+            if (nlist.n_type.bits.type != .undf) continue;
 
             if (file.getSymbolRef(@intCast(i), macho_file).getFile(macho_file) != null) continue;
 
             const is_import = switch (macho_file.undefined_treatment) {
                 .@"error" => false,
-                .warn, .suppress => nlist.weakRef(),
+                .warn, .suppress => nlist.n_desc.weak_ref,
                 .dynamic_lookup => true,
             };
             if (is_import) {
                 sym.value = 0;
                 sym.atom_ref = .{ .index = 0, .file = 0 };
                 sym.flags.weak = false;
-                sym.flags.weak_ref = nlist.weakRef();
+                sym.flags.weak_ref = nlist.n_desc.weak_ref;
                 sym.flags.import = is_import;
                 sym.visibility = .global;
 
@@ -223,13 +223,13 @@ pub const File = union(enum) {
         assert(file == .object or file == .zig_object);
 
         for (file.getSymbols(), file.getNlists(), 0..) |*sym, nlist, i| {
-            if (!nlist.ext()) continue;
-            if (!nlist.undf()) continue;
+            if (!nlist.n_type.bits.ext) continue;
+            if (nlist.n_type.bits.type != .undf) continue;
             if (file.getSymbolRef(@intCast(i), macho_file).getFile(macho_file) != null) continue;
 
             sym.value = 0;
             sym.atom_ref = .{ .index = 0, .file = 0 };
-            sym.flags.weak_ref = nlist.weakRef();
+            sym.flags.weak_ref = nlist.n_desc.weak_ref;
             sym.flags.import = true;
             sym.visibility = .global;
 
@@ -242,22 +242,23 @@ pub const File = union(enum) {
         const tracy = trace(@src());
         defer tracy.end();
 
+        const io = macho_file.base.comp.io;
         const gpa = macho_file.base.comp.gpa;
 
         for (file.getSymbols(), file.getNlists(), 0..) |sym, nlist, i| {
             if (sym.visibility != .global) continue;
             if (sym.flags.weak) continue;
-            if (nlist.undf()) continue;
+            if (nlist.n_type.bits.type == .undf) continue;
             const ref = file.getSymbolRef(@intCast(i), macho_file);
             const ref_file = ref.getFile(macho_file) orelse continue;
             if (ref_file.getIndex() == file.getIndex()) continue;
 
-            macho_file.dupes_mutex.lock();
-            defer macho_file.dupes_mutex.unlock();
+            macho_file.dupes_mutex.lockUncancelable(io);
+            defer macho_file.dupes_mutex.unlock(io);
 
             const gop = try macho_file.dupes.getOrPut(gpa, file.getGlobals()[i]);
             if (!gop.found_existing) {
-                gop.value_ptr.* = .{};
+                gop.value_ptr.* = .empty;
             }
             try gop.value_ptr.append(gpa, file.getIndex());
         }
@@ -321,11 +322,11 @@ pub const File = union(enum) {
         };
     }
 
-    pub fn writeAr(file: File, ar_format: Archive.Format, macho_file: *MachO, writer: anytype) !void {
+    pub fn writeAr(file: File, macho_file: *MachO, writer: anytype) !void {
         return switch (file) {
             .dylib, .internal => unreachable,
-            .zig_object => |x| x.writeAr(ar_format, writer),
-            .object => |x| x.writeAr(ar_format, macho_file, writer),
+            .zig_object => |x| x.writeAr(writer),
+            .object => |x| x.writeAr(macho_file, writer),
         };
     }
 
@@ -354,17 +355,18 @@ pub const File = union(enum) {
         dylib: Dylib,
     };
 
-    pub const Handle = std.fs.File;
+    pub const Handle = Io.File;
     pub const HandleIndex = Index;
 };
 
 const std = @import("std");
+const Io = std.Io;
 const assert = std.debug.assert;
 const log = std.log.scoped(.link);
 const macho = std.macho;
 const Allocator = std.mem.Allocator;
 const Path = std.Build.Cache.Path;
-const Writer = std.io.Writer;
+const Writer = std.Io.Writer;
 
 const trace = @import("../../tracy.zig").trace;
 const Archive = @import("Archive.zig");

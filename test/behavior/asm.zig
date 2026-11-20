@@ -82,7 +82,6 @@ test "sized integer/float in asm input" {
     if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
     if (builtin.zig_backend == .stage2_c and builtin.os.tag == .windows) return error.SkipZigTest; // MSVC doesn't support inline assembly
@@ -173,4 +172,51 @@ test "asm modifiers (AArch64)" {
         : [in] "r" (x),
     );
     try expectEqual(2 * x, double);
+}
+
+test "packed output types (x86_64)" {
+    if (builtin.target.cpu.arch != .x86_64) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_c and builtin.os.tag == .windows) return error.SkipZigTest; // MSVC doesn't support inline assembly
+
+    const S = packed struct(u32) { x: u32 };
+    {
+        const s: S = asm volatile ("mov $123, %[ret]"
+            : [ret] "=r" (-> S),
+        );
+        try expect(s.x == 123);
+    }
+    {
+        var s: S = undefined;
+        asm volatile ("mov $123, %[ret]"
+            : [ret] "=r" (s),
+        );
+        try expect(s.x == 123);
+    }
+
+    const U = packed union(u32) { x: u32 };
+    {
+        const u: U = asm volatile ("mov $123, %[ret]"
+            : [ret] "=r" (-> U),
+        );
+        try expect(u.x == 123);
+    }
+    {
+        var u: U = undefined;
+        asm volatile ("mov $123, %[ret]"
+            : [ret] "=r" (u),
+        );
+        try expect(u.x == 123);
+    }
+}
+
+test "abi register aliases as clobbers (RISC-V)" {
+    if (!builtin.target.cpu.arch.isRISCV()) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
+
+    // Verify that ABI alias names are accepted as clobbers for RISC-V.
+    asm volatile ("" ::: .{ .ra = true, .sp = true, .gp = true, .tp = true });
+    asm volatile ("" ::: .{ .a0 = true, .a1 = true, .a2 = true, .a3 = true, .a4 = true, .a5 = true, .a6 = true, .a7 = true });
+    asm volatile ("" ::: .{ .t0 = true, .t1 = true, .t2 = true, .t3 = true, .t4 = true, .t5 = true, .t6 = true });
+    asm volatile ("" ::: .{ .s0 = true, .fp = true, .s1 = true, .s2 = true, .s3 = true, .s4 = true, .s5 = true, .s6 = true, .s7 = true, .s8 = true, .s9 = true, .s10 = true, .s11 = true });
+    asm volatile ("" ::: .{ .fa0 = true, .fa1 = true, .ft0 = true, .fs0 = true });
 }

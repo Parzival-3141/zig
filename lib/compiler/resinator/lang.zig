@@ -74,7 +74,7 @@ test parseInt {
 pub fn tagToInt(tag: []const u8) error{InvalidLanguageTag}!u16 {
     const maybe_id = try tagToId(tag);
     if (maybe_id) |id| {
-        return @intFromEnum(id);
+        return @backingInt(id);
     } else {
         return LOCALE_CUSTOM_UNSPECIFIED;
     }
@@ -87,8 +87,8 @@ pub fn tagToId(tag: []const u8) error{InvalidLanguageTag}!?LanguageId {
     if (parsed.multiple_suffixes) return null;
     const longest_known_tag = comptime blk: {
         var len = 0;
-        for (@typeInfo(LanguageId).@"enum".fields) |field| {
-            if (field.name.len > len) len = field.name.len;
+        for (@typeInfo(LanguageId).@"enum".field_names) |field_name| {
+            if (field_name.len > len) len = field_name.len;
         }
         break :blk len;
     };
@@ -119,20 +119,21 @@ test tagToId {
 }
 
 test "exhaustive tagToId" {
-    inline for (@typeInfo(LanguageId).@"enum".fields) |field| {
-        const id = tagToId(field.name) catch |err| {
-            std.debug.print("tag: {s}\n", .{field.name});
+    @setEvalBranchQuota(2000);
+    inline for (@typeInfo(LanguageId).@"enum".field_names) |field_name| {
+        const id = tagToId(field_name) catch |err| {
+            std.debug.print("tag: {s}\n", .{field_name});
             return err;
         };
-        try std.testing.expectEqual(@field(LanguageId, field.name), id orelse {
-            std.debug.print("tag: {s}, got null\n", .{field.name});
+        try std.testing.expectEqual(@field(LanguageId, field_name), id orelse {
+            std.debug.print("tag: {s}, got null\n", .{field_name});
             return error.TestExpectedEqual;
         });
     }
     var buf: [32]u8 = undefined;
     inline for (valid_alternate_sorts) |parsed_sort| {
-        var fbs = std.io.fixedBufferStream(&buf);
-        const writer = fbs.writer();
+        var fbs: std.Io.Writer = .fixed(&buf);
+        const writer = &fbs;
         writer.writeAll(parsed_sort.language_code) catch unreachable;
         writer.writeAll("-") catch unreachable;
         writer.writeAll(parsed_sort.country_code.?) catch unreachable;
@@ -146,12 +147,12 @@ test "exhaustive tagToId" {
             break :field name_buf;
         };
         const expected = @field(LanguageId, &expected_field_name);
-        const id = tagToId(fbs.getWritten()) catch |err| {
-            std.debug.print("tag: {s}\n", .{fbs.getWritten()});
+        const id = tagToId(fbs.buffered()) catch |err| {
+            std.debug.print("tag: {s}\n", .{fbs.buffered()});
             return err;
         };
         try std.testing.expectEqual(expected, id orelse {
-            std.debug.print("tag: {s}, expected: {}, got null\n", .{ fbs.getWritten(), expected });
+            std.debug.print("tag: {s}, expected: {}, got null\n", .{ fbs.buffered(), expected });
             return error.TestExpectedEqual;
         });
     }

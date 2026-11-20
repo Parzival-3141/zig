@@ -43,6 +43,9 @@ pub const Edwards25519 = struct {
             return error.InvalidEncoding;
         }
         x.cMov(x.mul(Fe.sqrtm1), 1 - @intFromBool(has_m_root));
+        if (x.isZero() and (s[31] >> 7) != 0) {
+            return error.InvalidEncoding;
+        }
         x.cMov(x.neg(), @intFromBool(x.isNegative()) ^ (s[31] >> 7));
         const t = x.mul(y);
         return Edwards25519{ .x = x, .y = y, .z = z, .t = t };
@@ -115,7 +118,7 @@ pub const Edwards25519 = struct {
             .add(_1010011)).shift(9).add(_11110101))).shift(7).add(_1100111)).shift(9).add(_11110101).shift(11)
             .add(_10111101)).shift(8).add(_11100111)).shift(9))).shift(6).add(_1011)).shift(14).add(_10010011).shift(10)
             .add(_1100011)).shift(9).add(_10010111)).shift(10))).shift(8).add(_11010011)).shift(8).add(_11101101);
-        q.rejectIdentity() catch return;
+        if (q.x.isZero() and q.y.equivalent(q.z)) return;
         return error.UnexpectedSubgroup;
     }
 
@@ -127,12 +130,10 @@ pub const Edwards25519 = struct {
     /// Check that the point does not generate a low-order group.
     /// Return a `WeakPublicKey` error if it does.
     pub fn rejectLowOrder(p: Edwards25519) WeakPublicKeyError!void {
-        const zi = p.z.invert();
-        const x = p.x.mul(zi);
-        const y = p.y.mul(zi);
-        const x_neg = x.neg();
-        const iy = Fe.sqrtm1.mul(y);
-        if (x.isZero() or y.isZero() or iy.equivalent(x) or iy.equivalent(x_neg)) {
+        const y_sqrtm1 = Fe.sqrtm1.mul(p.y);
+        if (p.x.isZero() or p.y.isZero() or p.z.isZero() or
+            y_sqrtm1.sub(p.x).isZero() or y_sqrtm1.add(p.x).isZero())
+        {
             return error.WeakPublicKey;
         }
     }
@@ -311,7 +312,7 @@ pub const Edwards25519 = struct {
 
     /// Double-base multiplication of public parameters - Compute (p1*s1)+(p2*s2) *IN VARIABLE TIME*
     /// This can be used for signature verification.
-    pub fn mulDoubleBasePublic(p1: Edwards25519, s1: [32]u8, p2: Edwards25519, s2: [32]u8) (IdentityElementError || WeakPublicKeyError)!Edwards25519 {
+    pub fn mulDoubleBasePublic(p1: Edwards25519, s1: [32]u8, p2: Edwards25519, s2: [32]u8) WeakPublicKeyError!Edwards25519 {
         var pc1_array: [9]Edwards25519 = undefined;
         const pc1 = if (p1.is_base) basePointPc[0..9] else pc: {
             pc1_array = precompute(p1, 8);
@@ -344,7 +345,6 @@ pub const Edwards25519 = struct {
             if (pos == 0) break;
             q = q.dbl().dbl().dbl().dbl();
         }
-        try q.rejectIdentity();
         return q;
     }
 
@@ -473,7 +473,7 @@ pub const Edwards25519 = struct {
             st.final(&hctx);
             xctx = hctx[0..];
         }
-        const empty_block = [_]u8{0} ** H.block_length;
+        const empty_block: [H.block_length]u8 = @splat(0);
         var t = [3]u8{ 0, n * h_l, 0 };
         var xctx_len_u8 = [1]u8{@as(u8, @intCast(xctx.len))};
         var st = H.init(.{});
@@ -542,11 +542,11 @@ pub const Edwards25519 = struct {
 const htest = @import("../test.zig");
 
 test "packing/unpacking" {
-    const s = [_]u8{170} ++ [_]u8{0} ** 31;
+    const s = [1]u8{170} ++ @as([31]u8, @splat(0));
     var b = Edwards25519.basePoint;
     const pk = try b.mul(s);
     var buf: [128]u8 = undefined;
-    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{X}", .{&pk.toBytes()}), "074BC7E0FCBD587FDBC0969444245FADC562809C8F6E97E949AF62484B5B81A6");
+    try std.testing.expectEqualStrings(try std.mem.print(&buf, "{X}", .{&pk.toBytes()}), "074BC7E0FCBD587FDBC0969444245FADC562809C8F6E97E949AF62484B5B81A6");
 
     const small_order_ss: [7][32]u8 = .{
         .{
@@ -578,10 +578,11 @@ test "packing/unpacking" {
 }
 
 test "point addition/subtraction" {
+    const io = std.testing.io;
     var s1: [32]u8 = undefined;
     var s2: [32]u8 = undefined;
-    crypto.random.bytes(&s1);
-    crypto.random.bytes(&s2);
+    io.random(&s1);
+    io.random(&s2);
     const p = try Edwards25519.basePoint.clampedMul(s1);
     const q = try Edwards25519.basePoint.clampedMul(s2);
     const r = p.add(q).add(q).sub(q).sub(q);
@@ -611,7 +612,7 @@ test "hash-to-curve operation" {
 }
 
 test "implicit reduction of invalid scalars" {
-    const s = [_]u8{0} ** 31 ++ [_]u8{255};
+    const s = @as([31]u8, @splat(0)) ++ [1]u8{255};
     const p1 = try Edwards25519.basePoint.mulPublic(s);
     const p2 = try Edwards25519.basePoint.mul(s);
     const p3 = try p1.mulPublic(s);
@@ -625,9 +626,10 @@ test "implicit reduction of invalid scalars" {
 }
 
 test "subgroup check" {
+    const io = std.testing.io;
     for (0..100) |_| {
         var p = Edwards25519.basePoint;
-        const s = Edwards25519.scalar.random();
+        const s = Edwards25519.scalar.random(io);
         p = try p.mulPublic(s);
         try p.rejectUnexpectedSubgroup();
     }
@@ -635,4 +637,9 @@ test "subgroup check" {
     _ = try std.fmt.hexToBytes(&bogus, "4dc95e3c28d78c48a60531525e6327e259b7ba0d2f5c81b694052c766a14b625");
     const p = try Edwards25519.fromBytes(bogus);
     try std.testing.expectError(error.UnexpectedSubgroup, p.rejectUnexpectedSubgroup());
+
+    var torsion2L: [Edwards25519.encoded_length]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&torsion2L, "9599999999999999999999999999999999999999999999999999999999999999");
+    const p2L = try Edwards25519.fromBytes(torsion2L);
+    try std.testing.expectError(error.UnexpectedSubgroup, p2L.rejectUnexpectedSubgroup());
 }

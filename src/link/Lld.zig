@@ -19,7 +19,7 @@ const Coff = struct {
     minor_subsystem_version: u16,
     lib_directories: []const Cache.Directory,
     module_definition_file: ?[]const u8,
-    subsystem: ?std.Target.SubSystem,
+    subsystem: ?std.zig.Subsystem,
     /// These flags are populated by `codegen.llvm.updateExports` to allow us to guess the subsystem.
     lld_export_flags: struct {
         c_main: bool,
@@ -75,11 +75,13 @@ pub const Elf = struct {
     entry_name: ?[]const u8,
     hash_style: HashStyle,
     image_base: u64,
-    linker_script: ?[]const u8,
-    version_script: ?[]const u8,
+    linker_script: ?Cache.Path,
+    version_script: ?Cache.Path,
     sort_section: ?SortSection,
     print_icf_sections: bool,
     print_map: bool,
+    nmagic: bool,
+    fatal_warnings: bool,
     emit_relocs: bool,
     z_nodelete: bool,
     z_notext: bool,
@@ -95,11 +97,10 @@ pub const Elf = struct {
     soname: ?[]const u8,
     allow_undefined_version: bool,
     enable_new_dtags: ?bool,
-    compress_debug_sections: CompressDebugSections,
+    compress_debug_sections: std.zig.CompressDebugSections,
     bind_global_refs_locally: bool,
     pub const HashStyle = enum { sysv, gnu, both };
     pub const SortSection = enum { name, alignment };
-    pub const CompressDebugSections = enum { none, zlib, zstd };
 
     fn init(comp: *Compilation, options: link.File.OpenOptions) !Elf {
         const PtrWidth = enum { p32, p64 };
@@ -125,7 +126,7 @@ pub const Elf = struct {
             .hash_style = options.hash_style,
             .image_base = b: {
                 if (is_dyn_lib) break :b 0;
-                if (output_mode == .Exe and comp.config.pie) break :b 0;
+                if (output_mode == .Exe and (comp.config.pie or target.os.tag == .haiku)) break :b 0;
                 break :b options.image_base orelse switch (ptr_width) {
                     .p32 => 0x10000,
                     .p64 => 0x1000000,
@@ -136,6 +137,8 @@ pub const Elf = struct {
             .sort_section = options.sort_section,
             .print_icf_sections = options.print_icf_sections,
             .print_map = options.print_map,
+            .nmagic = options.nmagic,
+            .fatal_warnings = options.fatal_warnings,
             .emit_relocs = options.emit_relocs,
             .z_nodelete = options.z_nodelete,
             .z_notext = options.z_notext,
@@ -163,6 +166,8 @@ const Wasm = struct {
     import_table: bool,
     /// When true, will export the function table to the host environment.
     export_table: bool,
+    /// When true, remove maximum size from function table, allowing table to grow.
+    growable_table: bool,
     /// When defined, sets the initial memory size of the memory.
     initial_memory: ?u64,
     /// When defined, sets the maximum memory size of the memory.
@@ -187,6 +192,7 @@ const Wasm = struct {
             },
             .import_table = options.import_table,
             .export_table = options.export_table,
+            .growable_table = options.growable_table,
             .initial_memory = options.initial_memory,
             .max_memory = options.max_memory,
             .global_base = options.global_base,
@@ -206,14 +212,9 @@ pub fn createEmpty(
     const output_mode = comp.config.output_mode;
     const optimize_mode = comp.root_mod.optimize_mode;
 
-    const obj_file_ext: []const u8 = switch (target.ofmt) {
-        .coff => "obj",
-        .elf, .wasm => "o",
-        else => unreachable,
-    };
     const gc_sections: bool = options.gc_sections orelse switch (target.ofmt) {
-        .coff => optimize_mode != .Debug,
-        .elf => optimize_mode != .Debug and output_mode != .Obj,
+        .coff => optimize_mode != .debug,
+        .elf => optimize_mode != .debug and output_mode != .Obj,
         .wasm => output_mode != .Obj,
         else => unreachable,
     };
@@ -229,7 +230,6 @@ pub fn createEmpty(
             .tag = .lld,
             .comp = comp,
             .emit = emit,
-            .zcu_object_basename = try allocPrint(arena, "{s}_zcu.{s}", .{ fs.path.stem(emit.sub_path), obj_file_ext }),
             .gc_sections = gc_sections,
             .print_gc_sections = options.print_gc_sections,
             .stack_size = stack_size,
@@ -254,7 +254,7 @@ pub fn flush(
     arena: Allocator,
     tid: Zcu.PerThread.Id,
     prog_node: std.Progress.Node,
-) link.File.FlushError!void {
+) link.Error!void {
     dev.check(.lld_linker);
     _ = tid;
 
@@ -276,21 +276,21 @@ pub fn flush(
         .wasm => wasmLink(lld, arena),
     };
     result catch |err| switch (err) {
-        error.OutOfMemory, error.LinkFailure => |e| return e,
-        else => |e| return lld.base.comp.link_diags.fail("failed to link with LLD: {s}", .{@errorName(e)}),
+        error.OutOfMemory, error.AlreadyReported, error.Canceled => |e| return e,
+        else => |e| return lld.base.comp.link_diags.fail("failed to link with LLD: {t}", .{e}),
     };
 }
 
-fn linkAsArchive(lld: *Lld, arena: Allocator) !void {
+fn linkAsArchive(lld: *Lld, arena: Allocator) link.Error!void {
     const base = &lld.base;
     const comp = base.comp;
     const directory = base.emit.root_dir; // Just an alias to make it shorter to type.
     const full_out_path = try directory.join(arena, &[_][]const u8{base.emit.sub_path});
-    const full_out_path_z = try arena.dupeZ(u8, full_out_path);
+    const full_out_path_z = try arena.dupeSentinel(u8, full_out_path, 0);
     const opt_zcu = comp.zcu;
 
-    const zcu_obj_path: ?Cache.Path = if (opt_zcu != null) p: {
-        break :p try comp.resolveEmitPathFlush(arena, .temp, base.zcu_object_basename.?);
+    const zcu_obj_path: ?Cache.Path = if (opt_zcu) |zcu| p: {
+        break :p try comp.resolveEmitPathFlush(arena, .temp, zcu.llvm_object.?.out_bin_basename);
     } else null;
 
     log.debug("zcu_obj_path={?f}", .{zcu_obj_path});
@@ -305,27 +305,25 @@ fn linkAsArchive(lld: *Lld, arena: Allocator) !void {
     else
         null;
 
-    // This function follows the same pattern as link.Elf.linkWithLLD so if you want some
-    // insight as to what's going on here you can read that function body which is more
-    // well-commented.
+    var object_files: std.ArrayList([*:0]const u8) = .empty;
 
-    const link_inputs = comp.link_inputs;
+    try object_files.ensureUnusedCapacity(arena, comp.link_inputs.len);
+    for (comp.link_inputs) |input| switch (input) {
+        .dso, .tbd, .archive => {}, // static archives should not contain shared libraries or other static archives
+        .res, .object => {
+            const path = try input.path().toStringZ(arena);
+            object_files.appendAssumeCapacity(path);
+        },
+    };
 
-    var object_files: std.ArrayListUnmanaged([*:0]const u8) = .empty;
+    try object_files.ensureUnusedCapacity(arena, comp.c_objects.items.len +
+        comp.win32_resources.items.len + 2);
 
-    try object_files.ensureUnusedCapacity(arena, link_inputs.len);
-    for (link_inputs) |input| {
-        object_files.appendAssumeCapacity(try input.path().?.toStringZ(arena));
+    for (comp.c_objects.items) |c_object| {
+        object_files.appendAssumeCapacity(try c_object.status.success.object_path.toStringZ(arena));
     }
-
-    try object_files.ensureUnusedCapacity(arena, comp.c_object_table.count() +
-        comp.win32_resource_table.count() + 2);
-
-    for (comp.c_object_table.keys()) |key| {
-        object_files.appendAssumeCapacity(try key.status.success.object_path.toStringZ(arena));
-    }
-    for (comp.win32_resource_table.keys()) |key| {
-        object_files.appendAssumeCapacity(try arena.dupeZ(u8, key.status.success.res_path));
+    for (comp.win32_resources.items) |win32_resource| {
+        object_files.appendAssumeCapacity(try arena.dupeSentinel(u8, win32_resource.status.success.res_path, 0));
     }
     if (zcu_obj_path) |p| object_files.appendAssumeCapacity(try p.toStringZ(arena));
     if (compiler_rt_path) |p| object_files.appendAssumeCapacity(try p.toStringZ(arena));
@@ -342,31 +340,54 @@ fn linkAsArchive(lld: *Lld, arena: Allocator) !void {
     const llvm_bindings = @import("../codegen/llvm/bindings.zig");
     const llvm = @import("../codegen/llvm.zig");
     const target = &comp.root_mod.resolved_target.result;
-    llvm.initializeLLVMTarget(target.cpu.arch);
-    const bad = llvm_bindings.WriteArchive(
+    llvm.initializeLLVMTarget(comp.io, target.cpu.arch);
+    var err_file_index: usize = undefined;
+    var err_msg: [*:0]u8 = undefined;
+    if (llvm_bindings.WriteArchive(
         full_out_path_z,
         object_files.items.ptr,
         object_files.items.len,
         switch (target.os.tag) {
-            .aix => .AIXBIG,
             .windows => .COFF,
             else => if (target.os.tag.isDarwin()) .DARWIN else .GNU,
         },
-    );
-    if (bad) return error.UnableToWriteArchive;
+        &err_file_index,
+        &err_msg,
+    )) {
+        defer std.c.free(err_msg);
+        if (err_file_index < object_files.items.len) {
+            return comp.link_diags.fail("LLD failed to open input file '{s}': {s}", .{
+                object_files.items[err_file_index],
+                err_msg,
+            });
+        } else {
+            return comp.link_diags.fail("LLD failed to write archive: {s}", .{err_msg});
+        }
+    }
+}
+
+fn addCommonArgs(argv: *std.array_list.Managed([]const u8), coff: bool) !void {
+    if (builtin.os.tag == .netbsd) {
+        // NetBSD 10.1's `malloc` appears to have some nasty bugs that occur
+        // when doing parallel linking in LLD, manifesting as input and/or
+        // output section memory randomly being unmapped. So just don't do
+        // parallel linking for now.
+        try argv.append(if (coff) "-threads:1" else "--threads=1");
+    }
 }
 
 fn coffLink(lld: *Lld, arena: Allocator) !void {
     const comp = lld.base.comp;
     const gpa = comp.gpa;
+    const io = comp.io;
     const base = &lld.base;
     const coff = &lld.ofmt.coff;
 
     const directory = base.emit.root_dir; // Just an alias to make it shorter to type.
     const full_out_path = try directory.join(arena, &[_][]const u8{base.emit.sub_path});
 
-    const zcu_obj_path: ?Cache.Path = if (comp.zcu != null) p: {
-        break :p try comp.resolveEmitPathFlush(arena, .temp, base.zcu_object_basename.?);
+    const zcu_obj_path: ?Cache.Path = if (comp.zcu) |zcu| p: {
+        break :p try comp.resolveEmitPathFlush(arena, .temp, zcu.llvm_object.?.out_bin_basename);
     } else null;
 
     const is_lib = comp.config.output_mode == .Lib;
@@ -376,7 +397,7 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
     const target = &comp.root_mod.resolved_target.result;
     const optimize_mode = comp.root_mod.optimize_mode;
     const entry_name: ?[]const u8 = switch (coff.entry) {
-        // This logic isn't quite right for disabled or enabled. No point in fixing it
+        // This logic isn't quite right for default or enabled. No point in fixing it
         // when the goal is to eliminate dependency on LLD anyway.
         // https://github.com/ziglang/zig/issues/17751
         .disabled, .default, .enabled => null,
@@ -390,8 +411,8 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
         const the_object_path = blk: {
             if (link.firstObjectInput(comp.link_inputs)) |obj| break :blk obj.path;
 
-            if (comp.c_object_table.count() != 0)
-                break :blk comp.c_object_table.keys()[0].status.success.object_path;
+            if (comp.c_objects.items.len != 0)
+                break :blk comp.c_objects.items[0].status.success.object_path;
 
             if (zcu_obj_path) |p|
                 break :blk p;
@@ -400,11 +421,12 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
             // regarding eliding redundant object -> object transformations.
             return error.NoObjectsToLink;
         };
-        try std.fs.Dir.copyFile(
+        try Io.Dir.copyFile(
             the_object_path.root_dir.handle,
             the_object_path.sub_path,
             directory.handle,
             base.emit.sub_path,
+            io,
             .{},
         );
     } else {
@@ -416,6 +438,7 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
         // it calls exit() and does not reset all global data between invocations.
         const linker_command = "lld-link";
         try argv.appendSlice(&[_][]const u8{ comp.self_exe_path.?, linker_command });
+        try addCommonArgs(&argv, true);
 
         if (target.isMinGW()) {
             try argv.append("-lldmingw");
@@ -427,35 +450,35 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
             try argv.append("-DEBUG");
 
             const out_ext = std.fs.path.extension(full_out_path);
-            const out_pdb = coff.pdb_out_path orelse try allocPrint(arena, "{s}.pdb", .{
+            const out_pdb = coff.pdb_out_path orelse try arena.print("{s}.pdb", .{
                 full_out_path[0 .. full_out_path.len - out_ext.len],
             });
             const out_pdb_basename = std.fs.path.basename(out_pdb);
 
-            try argv.append(try allocPrint(arena, "-PDB:{s}", .{out_pdb}));
-            try argv.append(try allocPrint(arena, "-PDBALTPATH:{s}", .{out_pdb_basename}));
+            try argv.append(try arena.print("-PDB:{s}", .{out_pdb}));
+            try argv.append(try arena.print("-PDBALTPATH:{s}", .{out_pdb_basename}));
         }
         if (comp.version) |version| {
-            try argv.append(try allocPrint(arena, "-VERSION:{d}.{d}", .{ version.major, version.minor }));
+            try argv.append(try arena.print("-VERSION:{d}.{d}", .{ version.major, version.minor }));
         }
 
         if (target_util.llvmMachineAbi(target)) |mabi| {
-            try argv.append(try allocPrint(arena, "-MLLVM:-target-abi={s}", .{mabi}));
+            try argv.append(try arena.print("-MLLVM:-target-abi={s}", .{mabi}));
         }
 
-        try argv.append(try allocPrint(arena, "-MLLVM:-float-abi={s}", .{if (target.abi.float() == .hard) "hard" else "soft"}));
+        try argv.append(try arena.print("-MLLVM:-float-abi={s}", .{if (target.abi.float() == .hard) "hard" else "soft"}));
 
         if (comp.config.lto != .none) {
             switch (optimize_mode) {
-                .Debug => {},
-                .ReleaseSmall => try argv.append("-OPT:lldlto=2"),
-                .ReleaseFast, .ReleaseSafe => try argv.append("-OPT:lldlto=3"),
+                .debug => {},
+                .small => try argv.append("-OPT:lldlto=2"),
+                .fast, .safe => try argv.append("-OPT:lldlto=3"),
             }
         }
         if (comp.config.output_mode == .Exe) {
-            try argv.append(try allocPrint(arena, "-STACK:{d}", .{base.stack_size}));
+            try argv.append(try arena.print("-STACK:{d}", .{base.stack_size}));
         }
-        try argv.append(try allocPrint(arena, "-BASE:{d}", .{coff.image_base}));
+        try argv.append(try arena.print("-BASE:{d}", .{coff.image_base}));
 
         switch (base.build_id) {
             .none => try argv.append("-BUILD-ID:NO"),
@@ -474,7 +497,7 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
         }
 
         for (comp.force_undefined_symbols.keys()) |symbol| {
-            try argv.append(try allocPrint(arena, "-INCLUDE:{s}", .{symbol}));
+            try argv.append(try arena.print("-INCLUDE:{s}", .{symbol}));
         }
 
         if (is_dyn_lib) {
@@ -482,7 +505,9 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
         }
 
         if (entry_name) |name| {
-            try argv.append(try allocPrint(arena, "-ENTRY:{s}", .{name}));
+            try argv.append(try arena.print("-ENTRY:{s}", .{name}));
+        } else if (coff.entry == .disabled) {
+            try argv.append("-NOENTRY");
         }
 
         if (coff.repro) {
@@ -502,49 +527,49 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
             try argv.append("-FORCE:UNRESOLVED");
         }
 
-        try argv.append(try allocPrint(arena, "-OUT:{s}", .{full_out_path}));
+        try argv.append(try arena.print("-OUT:{s}", .{full_out_path}));
 
         if (comp.emit_implib) |raw_emit_path| {
             const path = try comp.resolveEmitPathFlush(arena, .artifact, raw_emit_path);
-            try argv.append(try allocPrint(arena, "-IMPLIB:{f}", .{path}));
+            try argv.append(try arena.print("-IMPLIB:{f}", .{path}));
         }
 
         if (comp.config.link_libc) {
             if (comp.libc_installation) |libc_installation| {
-                try argv.append(try allocPrint(arena, "-LIBPATH:{s}", .{libc_installation.crt_dir.?}));
+                try argv.append(try arena.print("-LIBPATH:{s}", .{libc_installation.crt_dir.?}));
 
                 if (target.abi == .msvc or target.abi == .itanium) {
-                    try argv.append(try allocPrint(arena, "-LIBPATH:{s}", .{libc_installation.msvc_lib_dir.?}));
-                    try argv.append(try allocPrint(arena, "-LIBPATH:{s}", .{libc_installation.kernel32_lib_dir.?}));
+                    try argv.append(try arena.print("-LIBPATH:{s}", .{libc_installation.msvc_lib_dir.?}));
+                    try argv.append(try arena.print("-LIBPATH:{s}", .{libc_installation.kernel32_lib_dir.?}));
                 }
             }
         }
 
         for (coff.lib_directories) |lib_directory| {
-            try argv.append(try allocPrint(arena, "-LIBPATH:{s}", .{lib_directory.path orelse "."}));
+            try argv.append(try arena.print("-LIBPATH:{s}", .{lib_directory.path orelse "."}));
         }
 
         try argv.ensureUnusedCapacity(comp.link_inputs.len);
         for (comp.link_inputs) |link_input| switch (link_input) {
-            .dso_exact => unreachable, // not applicable to PE/COFF
             inline .dso, .res => |x| {
                 argv.appendAssumeCapacity(try x.path.toString(arena));
             },
             .object, .archive => |obj| {
                 if (obj.must_link) {
-                    argv.appendAssumeCapacity(try allocPrint(arena, "-WHOLEARCHIVE:{f}", .{@as(Cache.Path, obj.path)}));
+                    argv.appendAssumeCapacity(try arena.print("-WHOLEARCHIVE:{f}", .{@as(Cache.Path, obj.path)}));
                 } else {
                     argv.appendAssumeCapacity(try obj.path.toString(arena));
                 }
             },
+            .tbd => unreachable,
         };
 
-        for (comp.c_object_table.keys()) |key| {
-            try argv.append(try key.status.success.object_path.toString(arena));
+        for (comp.c_objects.items) |c_object| {
+            try argv.append(try c_object.status.success.object_path.toString(arena));
         }
 
-        for (comp.win32_resource_table.keys()) |key| {
-            try argv.append(key.status.success.res_path);
+        for (comp.win32_resources.items) |win32_resource| {
+            try argv.append(win32_resource.status.success.res_path);
         }
 
         if (zcu_obj_path) |p| {
@@ -552,10 +577,10 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
         }
 
         if (coff.module_definition_file) |def| {
-            try argv.append(try allocPrint(arena, "-DEF:{s}", .{def}));
+            try argv.append(try arena.print("-DEF:{s}", .{def}));
         }
 
-        const resolved_subsystem: ?std.Target.SubSystem = blk: {
+        const resolved_subsystem: ?std.zig.Subsystem = blk: {
             if (coff.subsystem) |explicit| break :blk explicit;
             switch (target.os.tag) {
                 .windows => {
@@ -566,13 +591,13 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
                             coff.lld_export_flags.winmain_crt_startup or
                             coff.lld_export_flags.wwinmain_crt_startup)
                         {
-                            break :blk .Console;
+                            break :blk .console;
                         }
                         if (coff.lld_export_flags.winmain or coff.lld_export_flags.wwinmain)
-                            break :blk .Windows;
+                            break :blk .windows;
                     }
                 },
-                .uefi => break :blk .EfiApplication,
+                .uefi => break :blk .efi_application,
                 else => {},
             }
             break :blk null;
@@ -581,60 +606,23 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
         const Mode = enum { uefi, win32 };
         const mode: Mode = mode: {
             if (resolved_subsystem) |subsystem| {
-                const subsystem_suffix = try allocPrint(arena, ",{d}.{d}", .{
-                    coff.major_subsystem_version, coff.minor_subsystem_version,
-                });
-
-                switch (subsystem) {
-                    .Console => {
-                        try argv.append(try allocPrint(arena, "-SUBSYSTEM:console{s}", .{
-                            subsystem_suffix,
-                        }));
-                        break :mode .win32;
-                    },
-                    .EfiApplication => {
-                        try argv.append(try allocPrint(arena, "-SUBSYSTEM:efi_application{s}", .{
-                            subsystem_suffix,
-                        }));
-                        break :mode .uefi;
-                    },
-                    .EfiBootServiceDriver => {
-                        try argv.append(try allocPrint(arena, "-SUBSYSTEM:efi_boot_service_driver{s}", .{
-                            subsystem_suffix,
-                        }));
-                        break :mode .uefi;
-                    },
-                    .EfiRom => {
-                        try argv.append(try allocPrint(arena, "-SUBSYSTEM:efi_rom{s}", .{
-                            subsystem_suffix,
-                        }));
-                        break :mode .uefi;
-                    },
-                    .EfiRuntimeDriver => {
-                        try argv.append(try allocPrint(arena, "-SUBSYSTEM:efi_runtime_driver{s}", .{
-                            subsystem_suffix,
-                        }));
-                        break :mode .uefi;
-                    },
-                    .Native => {
-                        try argv.append(try allocPrint(arena, "-SUBSYSTEM:native{s}", .{
-                            subsystem_suffix,
-                        }));
-                        break :mode .win32;
-                    },
-                    .Posix => {
-                        try argv.append(try allocPrint(arena, "-SUBSYSTEM:posix{s}", .{
-                            subsystem_suffix,
-                        }));
-                        break :mode .win32;
-                    },
-                    .Windows => {
-                        try argv.append(try allocPrint(arena, "-SUBSYSTEM:windows{s}", .{
-                            subsystem_suffix,
-                        }));
-                        break :mode .win32;
-                    },
-                }
+                try argv.append(try arena.print("-SUBSYSTEM:{s},{d}.{d}", .{
+                    @tagName(subsystem),
+                    coff.major_subsystem_version,
+                    coff.minor_subsystem_version,
+                }));
+                break :mode switch (subsystem) {
+                    .console,
+                    .windows,
+                    .posix,
+                    .native,
+                    => .win32,
+                    .efi_application,
+                    .efi_boot_service_driver,
+                    .efi_rom,
+                    .efi_runtime_driver,
+                    => .uefi,
+                };
             } else if (target.os.tag == .uefi) {
                 break :mode .uefi;
             } else {
@@ -661,17 +649,7 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
                             try argv.append("-ALTERNATENAME:__image_base__=__ImageBase");
                         }
 
-                        if (is_dyn_lib) {
-                            try argv.append(try comp.crtFileAsString(arena, "dllcrt2.obj"));
-                            if (target.cpu.arch == .x86) {
-                                try argv.append("-ALTERNATENAME:__DllMainCRTStartup@12=_DllMainCRTStartup@12");
-                            } else {
-                                try argv.append("-ALTERNATENAME:_DllMainCRTStartup=DllMainCRTStartup");
-                            }
-                        } else {
-                            try argv.append(try comp.crtFileAsString(arena, "crt2.obj"));
-                        }
-
+                        try argv.append(try comp.crtFileAsString(arena, if (is_dyn_lib) "dllcrt2.obj" else "crt2.obj"));
                         try argv.append(try comp.crtFileAsString(arena, "libmingw32.lib"));
                     } else {
                         try argv.append(switch (comp.config.link_mode) {
@@ -683,8 +661,8 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
                             .static => "lib",
                             .dynamic => "",
                         };
-                        try argv.append(try allocPrint(arena, "{s}vcruntime.lib", .{lib_str}));
-                        try argv.append(try allocPrint(arena, "{s}ucrt.lib", .{lib_str}));
+                        try argv.append(try arena.print("{s}vcruntime.lib", .{lib_str}));
+                        try argv.append(try arena.print("{s}ucrt.lib", .{lib_str}));
 
                         //Visual C++ 2015 Conformance Changes
                         //https://msdn.microsoft.com/en-us/library/bb531344.aspx
@@ -750,18 +728,18 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
 
         try argv.ensureUnusedCapacity(comp.windows_libs.count());
         for (comp.windows_libs.keys()) |key| {
-            const lib_basename = try allocPrint(arena, "{s}.lib", .{key});
+            const lib_basename = try arena.print("{s}.lib", .{key});
             if (comp.crt_files.get(lib_basename)) |crt_file| {
                 argv.appendAssumeCapacity(try crt_file.full_object_path.toString(arena));
                 continue;
             }
-            if (try findLib(arena, lib_basename, coff.lib_directories)) |full_path| {
+            if (try findLib(arena, io, lib_basename, coff.lib_directories)) |full_path| {
                 argv.appendAssumeCapacity(full_path);
                 continue;
             }
             if (target.abi.isGnu()) {
-                const fallback_name = try allocPrint(arena, "lib{s}.dll.a", .{key});
-                if (try findLib(arena, fallback_name, coff.lib_directories)) |full_path| {
+                const fallback_name = try arena.print("lib{s}.dll.a", .{key});
+                if (try findLib(arena, io, fallback_name, coff.lib_directories)) |full_path| {
                     argv.appendAssumeCapacity(full_path);
                     continue;
                 }
@@ -778,9 +756,9 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
         try spawnLld(comp, arena, argv.items);
     }
 }
-fn findLib(arena: Allocator, name: []const u8, lib_directories: []const Cache.Directory) !?[]const u8 {
+fn findLib(arena: Allocator, io: Io, name: []const u8, lib_directories: []const Cache.Directory) !?[]const u8 {
     for (lib_directories) |lib_directory| {
-        lib_directory.handle.access(name, .{}) catch |err| switch (err) {
+        lib_directory.handle.access(io, name, .{}) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => |e| return e,
         };
@@ -792,6 +770,7 @@ fn findLib(arena: Allocator, name: []const u8, lib_directories: []const Cache.Di
 fn elfLink(lld: *Lld, arena: Allocator) !void {
     const comp = lld.base.comp;
     const gpa = comp.gpa;
+    const io = comp.io;
     const diags = &comp.link_diags;
     const base = &lld.base;
     const elf = &lld.ofmt.elf;
@@ -799,8 +778,8 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
     const directory = base.emit.root_dir; // Just an alias to make it shorter to type.
     const full_out_path = try directory.join(arena, &[_][]const u8{base.emit.sub_path});
 
-    const zcu_obj_path: ?Cache.Path = if (comp.zcu != null) p: {
-        break :p try comp.resolveEmitPathFlush(arena, .temp, base.zcu_object_basename.?);
+    const zcu_obj_path: ?Cache.Path = if (comp.zcu) |zcu| p: {
+        break :p try comp.resolveEmitPathFlush(arena, .temp, zcu.llvm_object.?.out_bin_basename);
     } else null;
 
     const output_mode = comp.config.output_mode;
@@ -809,7 +788,6 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
     const link_mode = comp.config.link_mode;
     const is_dyn_lib = link_mode == .dynamic and is_lib;
     const is_exe_or_dyn_lib = is_dyn_lib or output_mode == .Exe;
-    const have_dynamic_linker = link_mode == .dynamic and is_exe_or_dyn_lib;
     const target = &comp.root_mod.resolved_target.result;
     const compiler_rt_path: ?Cache.Path = blk: {
         if (comp.compiler_rt_lib) |x| break :blk x.full_object_path;
@@ -836,7 +814,8 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
             target.cpu.arch == .m68k or
             target.cpu.arch.isSPARC() or
             target.cpu.arch == .ve or
-            target.cpu.arch == .xcore))
+            target.cpu.arch == .xcore or
+            target.cpu.arch == .xtensa))
     {
         // In this case we must do a simple file copy
         // here. TODO: think carefully about how we can avoid this redundant operation when doing
@@ -844,8 +823,8 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
         const the_object_path = blk: {
             if (link.firstObjectInput(comp.link_inputs)) |obj| break :blk obj.path;
 
-            if (comp.c_object_table.count() != 0)
-                break :blk comp.c_object_table.keys()[0].status.success.object_path;
+            if (comp.c_objects.items.len != 0)
+                break :blk comp.c_objects.items[0].status.success.object_path;
 
             if (zcu_obj_path) |p|
                 break :blk p;
@@ -854,11 +833,12 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
             // regarding eliding redundant object -> object transformations.
             return error.NoObjectsToLink;
         };
-        try std.fs.Dir.copyFile(
+        try Io.Dir.copyFile(
             the_object_path.root_dir.handle,
             the_object_path.sub_path,
             directory.handle,
             base.emit.sub_path,
+            io,
             .{},
         );
     } else {
@@ -870,6 +850,8 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
         // it calls exit() and does not reset all global data between invocations.
         const linker_command = "ld.lld";
         try argv.appendSlice(&[_][]const u8{ comp.self_exe_path.?, linker_command });
+        try addCommonArgs(&argv, false);
+
         if (is_obj) {
             try argv.append("-r");
         }
@@ -877,32 +859,37 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
         try argv.append("--error-limit=0");
 
         if (comp.sysroot) |sysroot| {
-            try argv.append(try std.fmt.allocPrint(arena, "--sysroot={s}", .{sysroot}));
+            try argv.append(try arena.print("--sysroot={s}", .{sysroot}));
         }
 
         if (target_util.llvmMachineAbi(target)) |mabi| {
             try argv.appendSlice(&.{
                 "-mllvm",
-                try std.fmt.allocPrint(arena, "-target-abi={s}", .{mabi}),
+                try arena.print("-target-abi={s}", .{mabi}),
             });
         }
 
         try argv.appendSlice(&.{
             "-mllvm",
-            try std.fmt.allocPrint(arena, "-float-abi={s}", .{if (target.abi.float() == .hard) "hard" else "soft"}),
+            try arena.print("-float-abi={s}", .{if (target.abi.float() == .hard) "hard" else "soft"}),
         });
+
+        switch (target.cpu.arch) {
+            .armeb, .thumbeb => if (is_exe_or_dyn_lib and target.cpu.has(.arm, .has_v6)) try argv.append("--be8"),
+            else => {},
+        }
 
         if (comp.config.lto != .none) {
             switch (comp.root_mod.optimize_mode) {
-                .Debug => {},
-                .ReleaseSmall => try argv.append("--lto-O2"),
-                .ReleaseFast, .ReleaseSafe => try argv.append("--lto-O3"),
+                .debug => {},
+                .small => try argv.append("--lto-O2"),
+                .fast, .safe => try argv.append("--lto-O3"),
             }
         }
         switch (comp.root_mod.optimize_mode) {
-            .Debug => {},
-            .ReleaseSmall => try argv.append("-O2"),
-            .ReleaseFast, .ReleaseSafe => try argv.append("-O3"),
+            .debug => {},
+            .small => try argv.append("-O2"),
+            .fast, .safe => try argv.append("-O3"),
         }
 
         if (elf.entry_name) |name| {
@@ -923,27 +910,27 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
         if (output_mode == .Exe) {
             try argv.appendSlice(&.{
                 "-z",
-                try std.fmt.allocPrint(arena, "stack-size={d}", .{base.stack_size}),
+                try arena.print("stack-size={d}", .{base.stack_size}),
             });
         }
 
         switch (base.build_id) {
             .none => try argv.append("--build-id=none"),
-            .fast, .uuid, .sha1, .md5 => try argv.append(try std.fmt.allocPrint(arena, "--build-id={s}", .{
+            .fast, .uuid, .sha1, .md5 => try argv.append(try arena.print("--build-id={s}", .{
                 @tagName(base.build_id),
             })),
-            .hexstring => |hs| try argv.append(try std.fmt.allocPrint(arena, "--build-id=0x{x}", .{hs.toSlice()})),
+            .hexstring => |hs| try argv.append(try arena.print("--build-id=0x{x}", .{hs.toSlice()})),
         }
 
-        try argv.append(try std.fmt.allocPrint(arena, "--image-base={d}", .{elf.image_base}));
+        try argv.append(try arena.print("--image-base={d}", .{elf.image_base}));
 
         if (elf.linker_script) |linker_script| {
             try argv.append("-T");
-            try argv.append(linker_script);
+            try argv.append(try linker_script.toString(arena));
         }
 
         if (elf.sort_section) |how| {
-            const arg = try std.fmt.allocPrint(arena, "--sort-section={s}", .{@tagName(how)});
+            const arg = try arena.print("--sort-section={s}", .{@tagName(how)});
             try argv.append(arg);
         }
 
@@ -961,6 +948,14 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
 
         if (elf.print_map) {
             try argv.append("--print-map");
+        }
+
+        if (elf.nmagic) {
+            try argv.append("--nmagic");
+        }
+
+        if (elf.fatal_warnings) {
+            try argv.append("--fatal-warnings");
         }
 
         if (comp.link_eh_frame_hdr) {
@@ -1009,11 +1004,11 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
         }
         if (elf.z_common_page_size) |size| {
             try argv.append("-z");
-            try argv.append(try std.fmt.allocPrint(arena, "common-page-size={d}", .{size}));
+            try argv.append(try arena.print("common-page-size={d}", .{size}));
         }
         if (elf.z_max_page_size) |size| {
             try argv.append("-z");
-            try argv.append(try std.fmt.allocPrint(arena, "max-page-size={d}", .{size}));
+            try argv.append(try arena.print("max-page-size={d}", .{size}));
         }
 
         if (getLDMOption(target)) |ldm| {
@@ -1034,13 +1029,15 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
             try argv.append("-shared");
         }
 
-        if (comp.config.pie and output_mode == .Exe) {
-            try argv.append("-pie");
+        if (output_mode == .Exe) {
+            // Always be explicit: some lld builds (e.g. OpenBSD's) default
+            // to PIE, which breaks non-PIE executables for other targets.
+            try argv.append(if (comp.config.pie) "-pie" else "-no-pie");
         }
 
         if (is_exe_or_dyn_lib and target.os.tag == .netbsd) {
-            // Add options to produce shared objects with only 2 PT_LOAD segments.
-            // NetBSD expects 2 PT_LOAD segments in a shared object, otherwise
+            // Add options to produce shared objects with only 2 PT.LOAD segments.
+            // NetBSD expects 2 PT.LOAD segments in a shared object, otherwise
             // ld.elf_so fails loading dynamic libraries with "not found" error.
             // See https://github.com/ziglang/zig/issues/9109 .
             try argv.append("--no-rosegment");
@@ -1071,12 +1068,12 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
             }
         }
 
-        if (have_dynamic_linker and
-            (comp.config.link_libc or comp.root_mod.resolved_target.is_explicit_dynamic_linker))
-        {
+        if (output_mode == .Exe and link_mode == .dynamic) {
             if (target.dynamic_linker.get()) |dynamic_linker| {
-                try argv.append("-dynamic-linker");
+                try argv.append("--dynamic-linker");
                 try argv.append(dynamic_linker);
+            } else {
+                try argv.append("--no-dynamic-linker");
             }
         }
 
@@ -1087,7 +1084,7 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
             }
             if (elf.version_script) |version_script| {
                 try argv.append("-version-script");
-                try argv.append(version_script);
+                try argv.append(try version_script.toString(arena));
             }
             if (elf.allow_undefined_version) {
                 try argv.append("--undefined-version");
@@ -1108,30 +1105,27 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
 
         for (base.comp.link_inputs) |link_input| switch (link_input) {
             .res => unreachable, // Windows-only
+            .tbd => unreachable, // Darwin-only
             .dso => continue,
             .object, .archive => |obj| {
                 if (obj.must_link and !whole_archive) {
-                    try argv.append("-whole-archive");
+                    try argv.append("--whole-archive");
                     whole_archive = true;
                 } else if (!obj.must_link and whole_archive) {
-                    try argv.append("-no-whole-archive");
+                    try argv.append("--no-whole-archive");
                     whole_archive = false;
                 }
                 try argv.append(try obj.path.toString(arena));
             },
-            .dso_exact => |dso_exact| {
-                assert(dso_exact.name[0] == ':');
-                try argv.appendSlice(&.{ "-l", dso_exact.name });
-            },
         };
 
         if (whole_archive) {
-            try argv.append("-no-whole-archive");
+            try argv.append("--no-whole-archive");
             whole_archive = false;
         }
 
-        for (comp.c_object_table.keys()) |key| {
-            try argv.append(try key.status.success.object_path.toString(arena));
+        for (comp.c_objects.items) |c_object| {
+            try argv.append(try c_object.status.success.object_path.toString(arena));
         }
 
         if (zcu_obj_path) |p| {
@@ -1140,7 +1134,11 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
 
         if (comp.tsan_lib) |lib| {
             assert(comp.config.any_sanitize_thread);
-            try argv.append(try lib.full_object_path.toString(arena));
+            try argv.appendSlice(&.{
+                "--whole-archive",
+                try lib.full_object_path.toString(arena),
+                "--no-whole-archive",
+            });
         }
 
         if (comp.fuzzer_lib) |lib| {
@@ -1160,9 +1158,20 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
             argv.appendAssumeCapacity("--as-needed");
             var as_needed = true;
 
+            // When we have a DSO input, in order to trick LLD into putting the basename in its
+            // `DT_NEEDED` entry while still allowing us to tell it the exact path to the shared
+            // object, we pass it on the CLI as "-l:/absolute/path/to/libfoo.so". This will treat
+            // the given path not actually as an absolute path, but as relative to the library
+            // search path, so the root directory must therefore be the only library search path.
+            switch (builtin.os.tag) {
+                .windows => try argv.appendSlice(&.{ "-L", "" }),
+                else => try argv.append("-L/"),
+            }
+
             for (base.comp.link_inputs) |link_input| switch (link_input) {
                 .res => unreachable, // Windows-only
-                .object, .archive, .dso_exact => continue,
+                .tbd => unreachable, // Darwin-only
+                .object, .archive => continue,
                 .dso => |dso| {
                     const lib_as_needed = !dso.needed;
                     switch ((@as(u2, @intFromBool(lib_as_needed)) << 1) | @intFromBool(as_needed)) {
@@ -1177,11 +1186,17 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
                         },
                     }
 
-                    // By this time, we depend on these libs being dynamically linked
-                    // libraries and not static libraries (the check for that needs to be earlier),
-                    // but they could be full paths to .so files, in which case we
-                    // want to avoid prepending "-l".
-                    argv.appendAssumeCapacity(try dso.path.toString(arena));
+                    // By this time, we depend on these libs being dynamically linked libraries and
+                    // not static libraries (the check for that needs to be earlier), but they could
+                    // be full file paths, in which case we don't want to use the "-l:" strategy.
+                    switch (dso.fallback_soname) {
+                        .basename => try argv.append(try arena.print("-l:{s}", .{try fs.path.resolve(arena, &.{
+                            comp.dirs.cwd,
+                            dso.path.root_dir.path orelse ".",
+                            dso.path.sub_path,
+                        })})),
+                        .full_path => try argv.append(try dso.path.toString(arena)),
+                    }
                 },
             };
 
@@ -1215,7 +1230,7 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
                             if (target.os.versionRange().gnuLibCVersion().?.order(rem_in) != .lt) continue;
                         }
 
-                        const lib_path = try std.fmt.allocPrint(arena, "{f}{c}lib{s}.so.{d}", .{
+                        const lib_path = try arena.print("{f}{c}lib{s}.so.{d}", .{
                             comp.glibc_so_files.?.dir_path, fs.path.sep, lib.name, lib.sover,
                         });
                         try argv.append(lib_path);
@@ -1228,15 +1243,26 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
                     }));
                 } else if (target.isFreeBSDLibC()) {
                     for (freebsd.libs) |lib| {
-                        const lib_path = try std.fmt.allocPrint(arena, "{f}{c}lib{s}.so.{d}", .{
-                            comp.freebsd_so_files.?.dir_path, fs.path.sep, lib.name, lib.sover,
+                        if (lib.added_in) |add_in| {
+                            if (target.os.version_range.semver.min.order(add_in) == .lt) continue;
+                        }
+
+                        const lib_path = try arena.print("{f}{c}lib{s}.so.{d}", .{
+                            comp.freebsd_so_files.?.dir_path, fs.path.sep, lib.name, lib.getSoVersion(&target.os),
                         });
                         try argv.append(lib_path);
                     }
                 } else if (target.isNetBSDLibC()) {
                     for (netbsd.libs) |lib| {
-                        const lib_path = try std.fmt.allocPrint(arena, "{f}{c}lib{s}.so.{d}", .{
+                        const lib_path = try arena.print("{f}{c}lib{s}.so.{d}", .{
                             comp.netbsd_so_files.?.dir_path, fs.path.sep, lib.name, lib.sover,
+                        });
+                        try argv.append(lib_path);
+                    }
+                } else if (target.isOpenBSDLibC()) {
+                    for (openbsd.libs) |lib| {
+                        const lib_path = try arena.print("{f}{c}lib{s}.so", .{
+                            comp.openbsd_so_files.?.dir_path, fs.path.sep, lib.name,
                         });
                         try argv.append(lib_path);
                     }
@@ -1311,21 +1337,21 @@ fn getLDMOption(target: *const std.Target) ?[]const u8 {
         },
         .mips64 => switch (target.os.tag) {
             .freebsd => switch (target.abi) {
-                .gnuabin32, .muslabin32 => "elf32btsmipn32_fbsd",
+                .gnuabin32, .muslabin32, .abin32 => "elf32btsmipn32_fbsd",
                 else => "elf64btsmip_fbsd",
             },
             else => switch (target.abi) {
-                .gnuabin32, .muslabin32 => "elf32btsmipn32",
+                .gnuabin32, .muslabin32, .abin32 => "elf32btsmipn32",
                 else => "elf64btsmip",
             },
         },
         .mips64el => switch (target.os.tag) {
             .freebsd => switch (target.abi) {
-                .gnuabin32, .muslabin32 => "elf32ltsmipn32_fbsd",
+                .gnuabin32, .muslabin32, .abin32 => "elf32ltsmipn32_fbsd",
                 else => "elf64ltsmip_fbsd",
             },
             else => switch (target.abi) {
-                .gnuabin32, .muslabin32 => "elf32ltsmipn32",
+                .gnuabin32, .muslabin32, .abin32 => "elf32ltsmipn32",
                 else => "elf64ltsmip",
             },
         },
@@ -1342,7 +1368,9 @@ fn getLDMOption(target: *const std.Target) ?[]const u8 {
         .powerpc64 => "elf64ppc",
         .powerpc64le => "elf64lppc",
         .riscv32 => "elf32lriscv",
+        .riscv32be => "elf32briscv",
         .riscv64 => "elf64lriscv",
+        .riscv64be => "elf64briscv",
         .s390x => "elf64_s390",
         .sparc64 => "elf64_sparc",
         .x86 => switch (target.os.tag) {
@@ -1350,7 +1378,7 @@ fn getLDMOption(target: *const std.Target) ?[]const u8 {
             else => "elf_i386",
         },
         .x86_64 => switch (target.abi) {
-            .gnux32, .muslx32 => "elf32_x86_64",
+            .gnux32, .muslx32, .x32 => "elf32_x86_64",
             else => "elf_x86_64",
         },
         else => null,
@@ -1358,6 +1386,7 @@ fn getLDMOption(target: *const std.Target) ?[]const u8 {
 }
 fn wasmLink(lld: *Lld, arena: Allocator) !void {
     const comp = lld.base.comp;
+    const diags = &comp.link_diags;
     const shared_memory = comp.config.shared_memory;
     const export_memory = comp.config.export_memory;
     const import_memory = comp.config.import_memory;
@@ -1366,12 +1395,13 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
     const wasm = &lld.ofmt.wasm;
 
     const gpa = comp.gpa;
+    const io = comp.io;
 
     const directory = base.emit.root_dir; // Just an alias to make it shorter to type.
     const full_out_path = try directory.join(arena, &[_][]const u8{base.emit.sub_path});
 
-    const zcu_obj_path: ?Cache.Path = if (comp.zcu != null) p: {
-        break :p try comp.resolveEmitPathFlush(arena, .temp, base.zcu_object_basename.?);
+    const zcu_obj_path: ?Cache.Path = if (comp.zcu) |zcu| p: {
+        break :p try comp.resolveEmitPathFlush(arena, .temp, zcu.llvm_object.?.out_bin_basename);
     } else null;
 
     const is_obj = comp.config.output_mode == .Obj;
@@ -1393,8 +1423,8 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
         const the_object_path = blk: {
             if (link.firstObjectInput(comp.link_inputs)) |obj| break :blk obj.path;
 
-            if (comp.c_object_table.count() != 0)
-                break :blk comp.c_object_table.keys()[0].status.success.object_path;
+            if (comp.c_objects.items.len != 0)
+                break :blk comp.c_objects.items[0].status.success.object_path;
 
             if (zcu_obj_path) |p|
                 break :blk p;
@@ -1403,11 +1433,12 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
             // regarding eliding redundant object -> object transformations.
             return error.NoObjectsToLink;
         };
-        try fs.Dir.copyFile(
+        try Io.Dir.copyFile(
             the_object_path.root_dir.handle,
             the_object_path.sub_path,
             directory.handle,
             base.emit.sub_path,
+            io,
             .{},
         );
     } else {
@@ -1419,13 +1450,15 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
         // it calls exit() and does not reset all global data between invocations.
         const linker_command = "wasm-ld";
         try argv.appendSlice(&[_][]const u8{ comp.self_exe_path.?, linker_command });
+        try addCommonArgs(&argv, false);
+
         try argv.append("--error-limit=0");
 
         if (comp.config.lto != .none) {
             switch (comp.root_mod.optimize_mode) {
-                .Debug => {},
-                .ReleaseSmall => try argv.append("-O2"),
-                .ReleaseFast, .ReleaseSafe => try argv.append("-O3"),
+                .debug => {},
+                .small => try argv.append("-O2"),
+                .fast, .safe => try argv.append("-O3"),
             }
         }
 
@@ -1447,6 +1480,10 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
             try argv.append("--export-table");
         }
 
+        if (wasm.growable_table) {
+            try argv.append("--growable-table");
+        }
+
         // For wasm-ld we only need to specify '--no-gc-sections' when the user explicitly
         // specified it as garbage collection is enabled by default.
         if (!base.gc_sections) {
@@ -1458,12 +1495,12 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
         }
 
         if (wasm.initial_memory) |initial_memory| {
-            const arg = try std.fmt.allocPrint(arena, "--initial-memory={d}", .{initial_memory});
+            const arg = try arena.print("--initial-memory={d}", .{initial_memory});
             try argv.append(arg);
         }
 
         if (wasm.max_memory) |max_memory| {
-            const arg = try std.fmt.allocPrint(arena, "--max-memory={d}", .{max_memory});
+            const arg = try arena.print("--max-memory={d}", .{max_memory});
             try argv.append(arg);
         }
 
@@ -1472,7 +1509,7 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
         }
 
         if (wasm.global_base) |global_base| {
-            const arg = try std.fmt.allocPrint(arena, "--global-base={d}", .{global_base});
+            const arg = try arena.print("--global-base={d}", .{global_base});
             try argv.append(arg);
         } else {
             // We prepend it by default, so when a stack overflow happens the runtime will trap correctly,
@@ -1484,7 +1521,7 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
 
         // Users are allowed to specify which symbols they want to export to the wasm host.
         for (wasm.export_symbol_names) |symbol_name| {
-            const arg = try std.fmt.allocPrint(arena, "--export={s}", .{symbol_name});
+            const arg = try arena.print("--export={s}", .{symbol_name});
             try argv.append(arg);
         }
 
@@ -1500,15 +1537,15 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
 
         try argv.appendSlice(&.{
             "-z",
-            try std.fmt.allocPrint(arena, "stack-size={d}", .{base.stack_size}),
+            try arena.print("stack-size={d}", .{base.stack_size}),
         });
 
         switch (base.build_id) {
             .none => try argv.append("--build-id=none"),
-            .fast, .uuid, .sha1 => try argv.append(try std.fmt.allocPrint(arena, "--build-id={s}", .{
+            .fast, .uuid, .sha1 => try argv.append(try arena.print("--build-id={s}", .{
                 @tagName(base.build_id),
             })),
-            .hexstring => |hs| try argv.append(try std.fmt.allocPrint(arena, "--build-id=0x{x}", .{hs.toSlice()})),
+            .hexstring => |hs| try argv.append(try arena.print("--build-id=0x{x}", .{hs.toSlice()})),
             .md5 => {},
         }
 
@@ -1556,10 +1593,10 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
         for (comp.link_inputs) |link_input| switch (link_input) {
             .object, .archive => |obj| {
                 if (obj.must_link and !whole_archive) {
-                    try argv.append("-whole-archive");
+                    try argv.append("--whole-archive");
                     whole_archive = true;
                 } else if (!obj.must_link and whole_archive) {
-                    try argv.append("-no-whole-archive");
+                    try argv.append("--no-whole-archive");
                     whole_archive = false;
                 }
                 try argv.append(try obj.path.toString(arena));
@@ -1567,16 +1604,16 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
             .dso => |dso| {
                 try argv.append(try dso.path.toString(arena));
             },
-            .dso_exact => unreachable,
+            .tbd => unreachable,
             .res => unreachable,
         };
         if (whole_archive) {
-            try argv.append("-no-whole-archive");
+            try argv.append("--no-whole-archive");
             whole_archive = false;
         }
 
-        for (comp.c_object_table.keys()) |key| {
-            try argv.append(try key.status.success.object_path.toString(arena));
+        for (comp.c_objects.items) |c_object| {
+            try argv.append(try c_object.status.success.object_path.toString(arena));
         }
         if (zcu_obj_path) |p| {
             try argv.append(try p.toString(arena));
@@ -1597,29 +1634,22 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
         // is not the case, it means we will get "exec format error" when trying to run
         // it, and then can react to that in the same way as trying to run an ELF file
         // from a foreign CPU architecture.
-        if (fs.has_executable_bit and target.os.tag == .wasi and
+        if (Io.File.Permissions.has_executable_bit and target.os.tag == .wasi and
             comp.config.output_mode == .Exe)
         {
-            // TODO: what's our strategy for reporting linker errors from this function?
-            // report a nice error here with the file path if it fails instead of
-            // just returning the error code.
             // chmod does not interact with umask, so we use a conservative -rwxr--r-- here.
-            std.posix.fchmodat(fs.cwd().fd, full_out_path, 0o744, 0) catch |err| switch (err) {
-                error.OperationNotSupported => unreachable, // Not a symlink.
-                else => |e| return e,
-            };
+            Io.Dir.cwd().setFilePermissions(io, full_out_path, .fromMode(0o744), .{}) catch |err|
+                return diags.fail("{s}: failed to enable executable permissions: {t}", .{ full_out_path, err });
         }
     }
 }
 
-fn spawnLld(
-    comp: *Compilation,
-    arena: Allocator,
-    argv: []const []const u8,
-) !void {
+fn spawnLld(comp: *Compilation, arena: Allocator, argv: []const []const u8) !void {
+    const io = comp.io;
+
     if (comp.verbose_link) {
         // Skip over our own name so that the LLD linker name is the first argv item.
-        Compilation.dump_argv(argv[1..]);
+        try Compilation.dumpArgv(io, argv[1..]);
     }
 
     // If possible, we run LLD as a child process because it does not always
@@ -1629,104 +1659,46 @@ fn spawnLld(
         const exit_code = try lldMain(arena, argv, false);
         if (exit_code == 0) return;
         if (comp.clang_passthrough_mode) std.process.exit(exit_code);
-        return error.LinkFailure;
+        return error.AlreadyReported;
     }
 
-    var stderr: []u8 = &.{};
-    defer comp.gpa.free(stderr);
-
-    var child = std.process.Child.init(argv, arena);
-    const term = (if (comp.clang_passthrough_mode) term: {
-        child.stdin_behavior = .Inherit;
-        child.stdout_behavior = .Inherit;
-        child.stderr_behavior = .Inherit;
-
-        break :term child.spawnAndWait();
-    } else term: {
-        child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Pipe;
-
-        child.spawn() catch |err| break :term err;
-        stderr = try child.stderr.?.deprecatedReader().readAllAlloc(comp.gpa, std.math.maxInt(usize));
-        break :term child.wait();
-    }) catch |first_err| term: {
-        const err = switch (first_err) {
-            error.NameTooLong => err: {
-                const s = fs.path.sep_str;
-                const rand_int = std.crypto.random.int(u64);
-                const rsp_path = "tmp" ++ s ++ std.fmt.hex(rand_int) ++ ".rsp";
-
-                const rsp_file = try comp.dirs.local_cache.handle.createFileZ(rsp_path, .{});
-                defer comp.dirs.local_cache.handle.deleteFileZ(rsp_path) catch |err|
-                    log.warn("failed to delete response file {s}: {s}", .{ rsp_path, @errorName(err) });
-                {
-                    defer rsp_file.close();
-                    var rsp_file_buffer: [1024]u8 = undefined;
-                    var rsp_file_writer = rsp_file.writer(&rsp_file_buffer);
-                    const rsp_writer = &rsp_file_writer.interface;
-                    for (argv[2..]) |arg| {
-                        try rsp_writer.writeByte('"');
-                        for (arg) |c| {
-                            switch (c) {
-                                '\"', '\\' => try rsp_writer.writeByte('\\'),
-                                else => {},
-                            }
-                            try rsp_writer.writeByte(c);
-                        }
-                        try rsp_writer.writeByte('"');
-                        try rsp_writer.writeByte('\n');
-                    }
-                    try rsp_writer.flush();
-                }
-
-                var rsp_child = std.process.Child.init(&.{ argv[0], argv[1], try std.fmt.allocPrint(
-                    arena,
-                    "@{s}",
-                    .{try comp.dirs.local_cache.join(arena, &.{rsp_path})},
-                ) }, arena);
-                if (comp.clang_passthrough_mode) {
-                    rsp_child.stdin_behavior = .Inherit;
-                    rsp_child.stdout_behavior = .Inherit;
-                    rsp_child.stderr_behavior = .Inherit;
-
-                    break :term rsp_child.spawnAndWait() catch |err| break :err err;
-                } else {
-                    rsp_child.stdin_behavior = .Ignore;
-                    rsp_child.stdout_behavior = .Ignore;
-                    rsp_child.stderr_behavior = .Pipe;
-
-                    rsp_child.spawn() catch |err| break :err err;
-                    stderr = try rsp_child.stderr.?.deprecatedReader().readAllAlloc(comp.gpa, std.math.maxInt(usize));
-                    break :term rsp_child.wait() catch |err| break :err err;
-                }
-            },
-            else => first_err,
-        };
-        log.err("unable to spawn LLD {s}: {s}", .{ argv[0], @errorName(err) });
-        return error.UnableToSpawnSelf;
+    var diags: Compilation.EvalZigLlvmProcessDiagnostics = undefined;
+    const result = comp.evalZigLlvmProcess(arena, &diags, argv) catch |err| switch (err) {
+        else => |e| return e,
+        error.EvalZigLlvmFail => {
+            log.err("failed to evaluate LLD '{s}': {f}", .{ argv[0], diags });
+            return error.UnableToSpawnSelf;
+        },
     };
 
-    const diags = &comp.link_diags;
-    switch (term) {
-        .Exited => |code| if (code != 0) {
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
             if (comp.clang_passthrough_mode) std.process.exit(code);
-            diags.lockAndParseLldStderr(argv[1], stderr);
-            return error.LinkFailure;
+            comp.link_diags.lockAndParseLldStderr(argv[1], result.stderr);
+            return error.AlreadyReported;
         },
-        else => {
+        .signal => |sig| {
             if (comp.clang_passthrough_mode) std.process.abort();
-            return diags.fail("{s} terminated with stderr:\n{s}", .{ argv[0], stderr });
+            return comp.link_diags.fail("{s} terminated with signal {t} and stderr:\n{s}", .{ argv[0], sig, result.stderr });
+        },
+        .stopped => |sig| {
+            if (comp.clang_passthrough_mode) std.process.abort();
+            return comp.link_diags.fail("{s} stopped with signal {t} and stderr:\n{s}", .{ argv[0], sig, result.stderr });
+        },
+        .unknown => |code| {
+            if (comp.clang_passthrough_mode) std.process.abort();
+            return comp.link_diags.fail("{s} terminated for unknown reason with code {d} and stderr:\n{s}", .{ argv[0], code, result.stderr });
         },
     }
 
-    if (stderr.len > 0) log.warn("unexpected LLD stderr:\n{s}", .{stderr});
+    if (result.stderr.len > 0) log.warn("unexpected LLD stderr:\n{s}", .{result.stderr});
 }
 
+const builtin = @import("builtin");
 const std = @import("std");
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Cache = std.Build.Cache;
-const allocPrint = std.fmt.allocPrint;
 const assert = std.debug.assert;
 const fs = std.fs;
 const log = std.log.scoped(.link);
@@ -1738,6 +1710,7 @@ const dev = @import("../dev.zig");
 const freebsd = @import("../libs/freebsd.zig");
 const glibc = @import("../libs/glibc.zig");
 const netbsd = @import("../libs/netbsd.zig");
+const openbsd = @import("../libs/openbsd.zig");
 const wasi_libc = @import("../libs/wasi_libc.zig");
 const link = @import("../link.zig");
 const lldMain = @import("../main.zig").lldMain;

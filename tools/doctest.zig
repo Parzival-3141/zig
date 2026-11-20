@@ -1,8 +1,11 @@
 const builtin = @import("builtin");
+
 const std = @import("std");
+const Io = std.Io;
+const Dir = std.Io.Dir;
+const Writer = std.Io.Writer;
 const fatal = std.process.fatal;
 const mem = std.mem;
-const fs = std.fs;
 const process = std.process;
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
@@ -26,13 +29,15 @@ const usage =
     \\
 ;
 
-pub fn main() !void {
-    var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena_instance.deinit();
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const io = init.io;
+    const environ_map = init.environ_map;
+    const cwd_path = try std.process.currentPathAlloc(io, arena);
 
-    const arena = arena_instance.allocator();
+    try environ_map.put("CLICOLOR_FORCE", "1");
 
-    var args_it = try process.argsWithAllocator(arena);
+    var args_it = try init.minimal.args.iterateAllocator(arena);
     if (!args_it.skip()) fatal("missing argv[0]", .{});
 
     var opt_input: ?[]const u8 = null;
@@ -44,7 +49,7 @@ pub fn main() !void {
     while (args_it.next()) |arg| {
         if (mem.startsWith(u8, arg, "-")) {
             if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help")) {
-                try std.fs.File.stdout().writeAll(usage);
+                try Io.File.stdout().writeStreamingAll(io, usage);
                 process.exit(0);
             } else if (mem.eql(u8, arg, "-i")) {
                 opt_input = args_it.next() orelse fatal("expected parameter after -i", .{});
@@ -69,38 +74,41 @@ pub fn main() !void {
     const zig_path = opt_zig orelse fatal("missing zig compiler path (--zig)", .{});
     const cache_root = opt_cache_root orelse fatal("missing cache root path (--cache-root)", .{});
 
-    const source_bytes = try fs.cwd().readFileAlloc(arena, input_path, std.math.maxInt(u32));
+    const source_bytes = try Dir.cwd().readFileAlloc(io, input_path, arena, .limited(std.math.maxInt(u32)));
     const code = try parseManifest(arena, source_bytes);
     const source = stripManifest(source_bytes);
 
-    const tmp_dir_path = try std.fmt.allocPrint(arena, "{s}/tmp/{x}", .{
-        cache_root, std.crypto.random.int(u64),
-    });
-    fs.cwd().makePath(tmp_dir_path) catch |err|
-        fatal("unable to create tmp dir '{s}': {s}", .{ tmp_dir_path, @errorName(err) });
-    defer fs.cwd().deleteTree(tmp_dir_path) catch |err| std.log.err("unable to delete '{s}': {s}", .{
-        tmp_dir_path, @errorName(err),
+    var random_integer: u64 = undefined;
+    io.random(@ptrCast(&random_integer));
+
+    const tmp_dir_path = try std.fmt.allocPrint(arena, "{s}/tmp/{x}", .{ cache_root, random_integer });
+    Dir.cwd().createDirPath(io, tmp_dir_path) catch |err|
+        fatal("unable to create tmp dir '{s}': {t}", .{ tmp_dir_path, err });
+    defer Dir.cwd().deleteTree(io, tmp_dir_path) catch |err| std.log.err("unable to delete '{s}': {t}", .{
+        tmp_dir_path, err,
     });
 
-    var out_file = try fs.cwd().createFile(output_path, .{});
-    defer out_file.close();
+    var out_file = try Dir.cwd().createFile(io, output_path, .{});
+    defer out_file.close(io);
     var out_file_buffer: [4096]u8 = undefined;
-    var out_file_writer = out_file.writer(&out_file_buffer);
+    var out_file_writer = out_file.writer(io, &out_file_buffer);
 
     const out = &out_file_writer.interface;
 
-    try printSourceBlock(arena, out, source, fs.path.basename(input_path));
+    try printSourceBlock(arena, out, source, Dir.path.basename(input_path));
     try printOutput(
         arena,
+        io,
         out,
         code,
         tmp_dir_path,
-        try std.fs.path.relative(arena, tmp_dir_path, zig_path),
-        try std.fs.path.relative(arena, tmp_dir_path, input_path),
+        try Dir.path.relative(arena, cwd_path, environ_map, tmp_dir_path, zig_path),
+        try Dir.path.relative(arena, cwd_path, environ_map, tmp_dir_path, input_path),
         if (opt_zig_lib_dir) |zig_lib_dir|
-            try std.fs.path.relative(arena, tmp_dir_path, zig_lib_dir)
+            try Dir.path.relative(arena, cwd_path, environ_map, tmp_dir_path, zig_lib_dir)
         else
             null,
+        environ_map,
     );
 
     try out_file_writer.end();
@@ -108,7 +116,8 @@ pub fn main() !void {
 
 fn printOutput(
     arena: Allocator,
-    out: anytype,
+    io: Io,
+    out: *Writer,
     code: Code,
     /// Relative to this process' cwd.
     tmp_dir_path: []const u8,
@@ -118,19 +127,17 @@ fn printOutput(
     input_path: []const u8,
     /// Relative to `tmp_dir_path`.
     opt_zig_lib_dir: ?[]const u8,
+    environ_map: *const process.Environ.Map,
 ) !void {
-    var env_map = try process.getEnvMap(arena);
-    try env_map.put("CLICOLOR_FORCE", "1");
-
-    const host = try std.zig.system.resolveTargetQuery(.{});
+    const host = try std.zig.system.resolveTargetQuery(io, .{});
     const obj_ext = builtin.object_format.fileExt(builtin.cpu.arch);
     const print = std.debug.print;
 
-    var shell_buffer = std.array_list.Managed(u8).init(arena);
+    var shell_buffer: Writer.Allocating = .init(arena);
     defer shell_buffer.deinit();
-    var shell_out = shell_buffer.writer();
+    const shell_out = &shell_buffer.writer;
 
-    const code_name = std.fs.path.stem(input_path);
+    const code_name = Dir.path.stem(input_path);
 
     switch (code.id) {
         .exe => |expected_outcome| code_block: {
@@ -149,7 +156,7 @@ fn printOutput(
             try shell_out.print("$ zig build-exe {s}.zig ", .{code_name});
 
             switch (code.mode) {
-                .Debug => {},
+                .debug => {},
                 else => {
                     try build_args.appendSlice(&[_][]const u8{ "-O", @tagName(code.mode) });
                     try shell_out.print("-O {s} ", .{@tagName(code.mode)});
@@ -178,10 +185,6 @@ fn printOutput(
                     try shell_out.print("-fno-llvm", .{});
                 }
             }
-            if (code.verbose_cimport) {
-                try build_args.append("--verbose-cimport");
-                try shell_out.print("--verbose-cimport ", .{});
-            }
             for (code.additional_options) |option| {
                 try build_args.append(option);
                 try shell_out.print("{s} ", .{option});
@@ -190,15 +193,13 @@ fn printOutput(
             try shell_out.print("\n", .{});
 
             if (expected_outcome == .build_fail) {
-                const result = try process.Child.run(.{
-                    .allocator = arena,
+                const result = try process.run(arena, io, .{
                     .argv = build_args.items,
-                    .cwd = tmp_dir_path,
-                    .env_map = &env_map,
-                    .max_output_bytes = max_doc_file_size,
+                    .cwd = .{ .path = tmp_dir_path },
+                    .environ_map = environ_map,
                 });
                 switch (result.term) {
-                    .Exited => |exit_code| {
+                    .exited => |exit_code| {
                         if (exit_code == 0) {
                             print("{s}\nThe following command incorrectly succeeded:\n", .{result.stderr});
                             dumpArgs(build_args.items);
@@ -216,13 +217,9 @@ fn printOutput(
                 try shell_out.writeAll(colored_stderr);
                 break :code_block;
             }
-            const exec_result = run(arena, &env_map, tmp_dir_path, build_args.items) catch
+            const exec_result = run(arena, io, environ_map, tmp_dir_path, build_args.items) catch
                 fatal("example failed to compile", .{});
-
-            if (code.verbose_cimport) {
-                const escaped_build_stderr = try escapeHtml(arena, exec_result.stderr);
-                try shell_out.writeAll(escaped_build_stderr);
-            }
+            _ = exec_result;
 
             if (code.target_str) |triple| {
                 if (mem.startsWith(u8, triple, "wasm32") or
@@ -237,7 +234,7 @@ fn printOutput(
             const target_query = try std.Target.Query.parse(.{
                 .arch_os_abi = code.target_str orelse "native",
             });
-            const target = try std.zig.system.resolveTargetQuery(target_query);
+            const target = try std.zig.system.resolveTargetQuery(io, target_query);
 
             const path_to_exe = try std.fmt.allocPrint(arena, "./{s}{s}", .{
                 code_name, target.exeFileExt(),
@@ -247,27 +244,25 @@ fn printOutput(
             var exited_with_signal = false;
 
             const result = if (expected_outcome == .fail) blk: {
-                const result = try process.Child.run(.{
-                    .allocator = arena,
+                const result = try process.run(arena, io, .{
                     .argv = run_args,
-                    .env_map = &env_map,
-                    .cwd = tmp_dir_path,
-                    .max_output_bytes = max_doc_file_size,
+                    .environ_map = environ_map,
+                    .cwd = .{ .path = tmp_dir_path },
                 });
                 switch (result.term) {
-                    .Exited => |exit_code| {
+                    .exited => |exit_code| {
                         if (exit_code == 0) {
                             print("{s}\nThe following command incorrectly succeeded:\n", .{result.stderr});
                             dumpArgs(run_args);
                             fatal("example incorrectly compiled", .{});
                         }
                     },
-                    .Signal => exited_with_signal = true,
+                    .signal => exited_with_signal = true,
                     else => {},
                 }
                 break :blk result;
             } else blk: {
-                break :blk run(arena, &env_map, tmp_dir_path, run_args) catch
+                break :blk run(arena, io, environ_map, tmp_dir_path, run_args) catch
                     fatal("example crashed", .{});
             };
 
@@ -296,7 +291,7 @@ fn printOutput(
             try shell_out.print("$ zig test {s}.zig ", .{code_name});
 
             switch (code.mode) {
-                .Debug => {},
+                .debug => {},
                 else => {
                     try test_args.appendSlice(&[_][]const u8{
                         "-O", @tagName(code.mode),
@@ -315,10 +310,11 @@ fn printOutput(
                 const target_query = try std.Target.Query.parse(.{
                     .arch_os_abi = triple,
                 });
-                const target = try std.zig.system.resolveTargetQuery(
-                    target_query,
-                );
-                switch (getExternalExecutor(&host, &target, .{
+                const target = try std.zig.system.resolveTargetQuery(io, target_query);
+                switch (getExternalExecutor(io, &target, .{
+                    .host_cpu_arch = host.cpu.arch,
+                    .host_os_tag = host.os.tag,
+                    .link_mode = code.link_mode orelse .dynamic,
                     .link_libc = code.link_libc,
                 })) {
                     .native => {},
@@ -338,7 +334,7 @@ fn printOutput(
                 }
             }
 
-            const result = run(arena, &env_map, tmp_dir_path, test_args.items) catch
+            const result = run(arena, io, environ_map, tmp_dir_path, test_args.items) catch
                 fatal("test failed", .{});
             const escaped_stderr = try escapeHtml(arena, result.stderr);
             const escaped_stdout = try escapeHtml(arena, result.stdout);
@@ -359,7 +355,7 @@ fn printOutput(
             try shell_out.print("$ zig test {s}.zig ", .{code_name});
 
             switch (code.mode) {
-                .Debug => {},
+                .debug => {},
                 else => {
                     try test_args.appendSlice(&[_][]const u8{ "-O", @tagName(code.mode) });
                     try shell_out.print("-O {s} ", .{@tagName(code.mode)});
@@ -369,15 +365,13 @@ fn printOutput(
                 try test_args.append("-lc");
                 try shell_out.print("-lc ", .{});
             }
-            const result = try process.Child.run(.{
-                .allocator = arena,
+            const result = try process.run(arena, io, .{
                 .argv = test_args.items,
-                .env_map = &env_map,
-                .cwd = tmp_dir_path,
-                .max_output_bytes = max_doc_file_size,
+                .environ_map = environ_map,
+                .cwd = .{ .path = tmp_dir_path },
             });
             switch (result.term) {
-                .Exited => |exit_code| {
+                .exited => |exit_code| {
                     if (exit_code == 0) {
                         print("{s}\nThe following command incorrectly succeeded:\n", .{result.stderr});
                         dumpArgs(test_args.items);
@@ -390,7 +384,7 @@ fn printOutput(
                     fatal("example compile crashed", .{});
                 },
             }
-            if (mem.indexOf(u8, result.stderr, error_match) == null) {
+            if (mem.find(u8, result.stderr, error_match) == null) {
                 print("{s}\nExpected to find '{s}' in stderr\n", .{ result.stderr, error_match });
                 fatal("example did not have expected compile error", .{});
             }
@@ -411,30 +405,28 @@ fn printOutput(
             }
             var mode_arg: []const u8 = "";
             switch (code.mode) {
-                .Debug => {},
-                .ReleaseSafe => {
-                    try test_args.append("-OReleaseSafe");
-                    mode_arg = "-OReleaseSafe";
+                .debug => {},
+                .safe => {
+                    try test_args.append("-Osafe");
+                    mode_arg = "-Osafe";
                 },
-                .ReleaseFast => {
-                    try test_args.append("-OReleaseFast");
-                    mode_arg = "-OReleaseFast";
+                .fast => {
+                    try test_args.append("-Ofast");
+                    mode_arg = "-Ofast";
                 },
-                .ReleaseSmall => {
-                    try test_args.append("-OReleaseSmall");
-                    mode_arg = "-OReleaseSmall";
+                .small => {
+                    try test_args.append("-Osmall");
+                    mode_arg = "-Osmall";
                 },
             }
 
-            const result = try process.Child.run(.{
-                .allocator = arena,
+            const result = try process.run(arena, io, .{
                 .argv = test_args.items,
-                .env_map = &env_map,
-                .cwd = tmp_dir_path,
-                .max_output_bytes = max_doc_file_size,
+                .environ_map = environ_map,
+                .cwd = .{ .path = tmp_dir_path },
             });
             switch (result.term) {
-                .Exited => |exit_code| {
+                .exited => |exit_code| {
                     if (exit_code == 0) {
                         print("{s}\nThe following command incorrectly succeeded:\n", .{result.stderr});
                         dumpArgs(test_args.items);
@@ -447,7 +439,7 @@ fn printOutput(
                     fatal("example compile crashed", .{});
                 },
             }
-            if (mem.indexOf(u8, result.stderr, error_match) == null) {
+            if (mem.find(u8, result.stderr, error_match) == null) {
                 print("{s}\nExpected to find '{s}' in stderr\n", .{ result.stderr, error_match });
                 fatal("example did not have expected runtime safety error message", .{});
             }
@@ -477,7 +469,7 @@ fn printOutput(
             try shell_out.print("$ zig build-obj {s}.zig ", .{code_name});
 
             switch (code.mode) {
-                .Debug => {},
+                .debug => {},
                 else => {
                     try build_args.appendSlice(&[_][]const u8{ "-O", @tagName(code.mode) });
                     try shell_out.print("-O {s} ", .{@tagName(code.mode)});
@@ -503,15 +495,13 @@ fn printOutput(
             }
 
             if (maybe_error_match) |error_match| {
-                const result = try process.Child.run(.{
-                    .allocator = arena,
+                const result = try process.run(arena, io, .{
                     .argv = build_args.items,
-                    .env_map = &env_map,
-                    .cwd = tmp_dir_path,
-                    .max_output_bytes = max_doc_file_size,
+                    .environ_map = environ_map,
+                    .cwd = .{ .path = tmp_dir_path },
                 });
                 switch (result.term) {
-                    .Exited => |exit_code| {
+                    .exited => |exit_code| {
                         if (exit_code == 0) {
                             print("{s}\nThe following command incorrectly succeeded:\n", .{result.stderr});
                             dumpArgs(build_args.items);
@@ -524,7 +514,7 @@ fn printOutput(
                         fatal("example compile crashed", .{});
                     },
                 }
-                if (mem.indexOf(u8, result.stderr, error_match) == null) {
+                if (mem.find(u8, result.stderr, error_match) == null) {
                     print("{s}\nExpected to find '{s}' in stderr\n", .{ result.stderr, error_match });
                     fatal("example did not have expected compile error message", .{});
                 }
@@ -532,14 +522,17 @@ fn printOutput(
                 const colored_stderr = try termColor(arena, escaped_stderr);
                 try shell_out.print("\n{s} ", .{colored_stderr});
             } else {
-                _ = run(arena, &env_map, tmp_dir_path, build_args.items) catch fatal("example failed to compile", .{});
+                _ = run(arena, io, environ_map, tmp_dir_path, build_args.items) catch fatal("example failed to compile", .{});
             }
             try shell_out.writeAll("\n");
         },
         .lib => {
             const bin_basename = try std.zig.binNameAlloc(arena, .{
                 .root_name = code_name,
-                .target = &builtin.target,
+                .cpu_arch = builtin.target.cpu.arch,
+                .os_tag = builtin.target.os.tag,
+                .ofmt = builtin.target.ofmt,
+                .abi = builtin.target.abi,
                 .output_mode = .Lib,
             });
 
@@ -556,7 +549,7 @@ fn printOutput(
             try shell_out.print("$ zig build-lib {s}.zig ", .{code_name});
 
             switch (code.mode) {
-                .Debug => {},
+                .debug => {},
                 else => {
                     try test_args.appendSlice(&[_][]const u8{ "-O", @tagName(code.mode) });
                     try shell_out.print("-O {s} ", .{@tagName(code.mode)});
@@ -591,7 +584,7 @@ fn printOutput(
                 try test_args.append(option);
                 try shell_out.print("{s} ", .{option});
             }
-            const result = run(arena, &env_map, tmp_dir_path, test_args.items) catch fatal("test failed", .{});
+            const result = run(arena, io, environ_map, tmp_dir_path, test_args.items) catch fatal("test failed", .{});
             const escaped_stderr = try escapeHtml(arena, result.stderr);
             const escaped_stdout = try escapeHtml(arena, result.stdout);
             try shell_out.print("\n{s}{s}\n", .{ escaped_stderr, escaped_stdout });
@@ -599,7 +592,7 @@ fn printOutput(
     }
 
     if (!code.just_check_syntax) {
-        try printShell(out, shell_buffer.items, false);
+        try printShell(out, shell_buffer.written(), false);
     }
 }
 
@@ -610,7 +603,7 @@ fn dumpArgs(args: []const []const u8) void {
         std.debug.print("\n", .{});
 }
 
-fn printSourceBlock(arena: Allocator, out: anytype, source_bytes: []const u8, name: []const u8) !void {
+fn printSourceBlock(arena: Allocator, out: *Writer, source_bytes: []const u8, name: []const u8) !void {
     try out.print("<figure><figcaption class=\"{s}-cap\"><cite class=\"file\">{s}</cite></figcaption><pre>", .{
         "zig", name,
     });
@@ -618,9 +611,9 @@ fn printSourceBlock(arena: Allocator, out: anytype, source_bytes: []const u8, na
     try out.writeAll("</pre></figure>");
 }
 
-fn tokenizeAndPrint(arena: Allocator, out: anytype, raw_src: []const u8) !void {
+fn tokenizeAndPrint(arena: Allocator, out: *Writer, raw_src: []const u8) !void {
     const src_non_terminated = mem.trim(u8, raw_src, " \r\n");
-    const src = try arena.dupeZ(u8, src_non_terminated);
+    const src = try arena.dupeSentinel(u8, src_non_terminated, 0);
 
     try out.writeAll("<code>");
     var tokenizer = std.zig.Tokenizer.init(src);
@@ -631,10 +624,10 @@ fn tokenizeAndPrint(arena: Allocator, out: anytype, raw_src: []const u8) !void {
         next_tok_is_fn = false;
 
         const token = tokenizer.next();
-        if (mem.indexOf(u8, src[index..token.loc.start], "//")) |comment_start_off| {
+        if (mem.find(u8, src[index..token.loc.start], "//")) |comment_start_off| {
             // render one comment
             const comment_start = index + comment_start_off;
-            const comment_end_off = mem.indexOf(u8, src[comment_start..token.loc.start], "\n");
+            const comment_end_off = mem.find(u8, src[comment_start..token.loc.start], "\n");
             const comment_end = if (comment_end_off) |o| comment_start + o else token.loc.start;
 
             try writeEscapedLines(out, src[index..comment_start]);
@@ -813,7 +806,6 @@ fn tokenizeAndPrint(arena: Allocator, out: anytype, raw_src: []const u8) !void {
             .minus_pipe_equal,
             .asterisk,
             .asterisk_equal,
-            .asterisk_asterisk,
             .asterisk_percent,
             .asterisk_percent_equal,
             .asterisk_pipe,
@@ -839,26 +831,25 @@ fn tokenizeAndPrint(arena: Allocator, out: anytype, raw_src: []const u8) !void {
             .tilde,
             => try writeEscaped(out, src[token.loc.start..token.loc.end]),
 
-            .invalid, .invalid_periodasterisks => fatal("syntax error", .{}),
+            .invalid => fatal("syntax error", .{}),
         }
         index = token.loc.end;
     }
     try out.writeAll("</code>");
 }
 
-fn writeEscapedLines(out: anytype, text: []const u8) !void {
+fn writeEscapedLines(out: *Writer, text: []const u8) !void {
     return writeEscaped(out, text);
 }
 
 const Code = struct {
     id: Id,
-    mode: std.builtin.OptimizeMode,
+    mode: std.builtin.Optimize,
     link_objects: []const []const u8,
     target_str: ?[]const u8,
     link_libc: bool,
     link_mode: ?std.builtin.LinkMode,
     disable_cache: bool,
-    verbose_cimport: bool,
     just_check_syntax: bool,
     additional_options: []const []const u8,
     use_llvm: ?bool,
@@ -880,13 +871,13 @@ const Code = struct {
 };
 
 fn stripManifest(source_bytes: []const u8) []const u8 {
-    const manifest_start = mem.lastIndexOf(u8, source_bytes, "\n\n// ") orelse
+    const manifest_start = mem.findLast(u8, source_bytes, "\n\n// ") orelse
         fatal("missing manifest comment", .{});
     return source_bytes[0 .. manifest_start + 1];
 }
 
 fn parseManifest(arena: Allocator, source_bytes: []const u8) !Code {
-    const manifest_start = mem.lastIndexOf(u8, source_bytes, "\n\n// ") orelse
+    const manifest_start = mem.findLast(u8, source_bytes, "\n\n// ") orelse
         fatal("missing manifest comment", .{});
     var it = mem.tokenizeScalar(u8, source_bytes[manifest_start..], '\n');
     const first_line = skipPrefix(it.next().?);
@@ -913,24 +904,23 @@ fn parseManifest(arena: Allocator, source_bytes: []const u8) !Code {
     else
         fatal("unrecognized manifest id: '{s}'", .{first_line});
 
-    var mode: std.builtin.OptimizeMode = .Debug;
+    var mode: std.builtin.Optimize = .debug;
     var link_mode: ?std.builtin.LinkMode = null;
-    var link_objects: std.ArrayListUnmanaged([]const u8) = .empty;
-    var additional_options: std.ArrayListUnmanaged([]const u8) = .empty;
+    var link_objects: std.ArrayList([]const u8) = .empty;
+    var additional_options: std.ArrayList([]const u8) = .empty;
     var target_str: ?[]const u8 = null;
     var link_libc = false;
     var disable_cache = false;
-    var verbose_cimport = false;
     var use_llvm: ?bool = null;
 
     while (it.next()) |prefixed_line| {
         const line = skipPrefix(prefixed_line);
         if (mem.startsWith(u8, line, "optimize=")) {
-            mode = std.meta.stringToEnum(std.builtin.OptimizeMode, line["optimize=".len..]) orelse
-                fatal("bad optimization mode line: '{s}'", .{line});
+            mode = std.builtin.Optimize.fromString(line["optimize=".len..]) orelse
+                fatal("bad optimization mode line: {q}", .{line});
         } else if (mem.startsWith(u8, line, "link_mode=")) {
             link_mode = std.meta.stringToEnum(std.builtin.LinkMode, line["link_mode=".len..]) orelse
-                fatal("bad link mode line: '{s}'", .{line});
+                fatal("bad link mode line: {q}", .{line});
         } else if (mem.startsWith(u8, line, "link_object=")) {
             try link_objects.append(arena, line["link_object=".len..]);
         } else if (mem.startsWith(u8, line, "additional_option=")) {
@@ -945,8 +935,6 @@ fn parseManifest(arena: Allocator, source_bytes: []const u8) !Code {
             link_libc = true;
         } else if (mem.eql(u8, line, "disable_cache")) {
             disable_cache = true;
-        } else if (mem.eql(u8, line, "verbose_cimport")) {
-            verbose_cimport = true;
         } else {
             fatal("unrecognized manifest line: {s}", .{line});
         }
@@ -961,7 +949,6 @@ fn parseManifest(arena: Allocator, source_bytes: []const u8) !Code {
         .link_libc = link_libc,
         .link_mode = link_mode,
         .disable_cache = disable_cache,
-        .verbose_cimport = verbose_cimport,
         .just_check_syntax = just_check_syntax,
         .use_llvm = use_llvm,
     };
@@ -974,25 +961,21 @@ fn skipPrefix(line: []const u8) []const u8 {
     return line[3..];
 }
 
-fn escapeHtml(allocator: Allocator, input: []const u8) ![]u8 {
-    var buf = std.array_list.Managed(u8).init(allocator);
-    defer buf.deinit();
-
-    const out = buf.writer();
-    try writeEscaped(out, input);
-    return try buf.toOwnedSlice();
+fn escapeHtml(gpa: Allocator, input: []const u8) ![]u8 {
+    var allocating: Writer.Allocating = .init(gpa);
+    defer allocating.deinit();
+    try writeEscaped(&allocating.writer, input);
+    return allocating.toOwnedSlice();
 }
 
-fn writeEscaped(out: anytype, input: []const u8) !void {
-    for (input) |c| {
-        try switch (c) {
-            '&' => out.writeAll("&amp;"),
-            '<' => out.writeAll("&lt;"),
-            '>' => out.writeAll("&gt;"),
-            '"' => out.writeAll("&quot;"),
-            else => out.writeByte(c),
-        };
-    }
+fn writeEscaped(w: *Writer, input: []const u8) !void {
+    for (input) |c| try switch (c) {
+        '&' => w.writeAll("&amp;"),
+        '<' => w.writeAll("&lt;"),
+        '>' => w.writeAll("&gt;"),
+        '"' => w.writeAll("&quot;"),
+        else => w.writeByte(c),
+    };
 }
 
 fn termColor(allocator: Allocator, input: []const u8) ![]u8 {
@@ -1014,7 +997,6 @@ fn termColor(allocator: Allocator, input: []const u8) ![]u8 {
     var buf = std.array_list.Managed(u8).init(allocator);
     defer buf.deinit();
 
-    var out = buf.writer();
     var sgr_param_start_index: usize = undefined;
     var sgr_num: u8 = undefined;
     var sgr_color: u8 = undefined;
@@ -1037,10 +1019,10 @@ fn termColor(allocator: Allocator, input: []const u8) ![]u8 {
             .start => switch (c) {
                 '\x1b' => state = .escape,
                 '\n' => {
-                    try out.writeByte(c);
+                    try buf.append(c);
                     last_new_line = buf.items.len;
                 },
-                else => try out.writeByte(c),
+                else => try buf.append(c),
             },
             .escape => switch (c) {
                 '[' => state = .lbracket,
@@ -1101,16 +1083,16 @@ fn termColor(allocator: Allocator, input: []const u8) ![]u8 {
                 'm' => {
                     state = .start;
                     while (open_span_count != 0) : (open_span_count -= 1) {
-                        try out.writeAll("</span>");
+                        try buf.appendSlice("</span>");
                     }
                     if (sgr_num == 0) {
                         if (sgr_color != 0) return error.UnsupportedColor;
                         continue;
                     }
                     if (sgr_color != 0) {
-                        try out.print("<span class=\"sgr-{d}_{d}m\">", .{ sgr_color, sgr_num });
+                        try buf.print("<span class=\"sgr-{d}_{d}m\">", .{ sgr_color, sgr_num });
                     } else {
-                        try out.print("<span class=\"sgr-{d}m\">", .{sgr_num});
+                        try buf.print("<span class=\"sgr-{d}m\">", .{sgr_num});
                     }
                     open_span_count += 1;
                 },
@@ -1123,31 +1105,40 @@ fn termColor(allocator: Allocator, input: []const u8) ![]u8 {
 
 // Returns true if number is in slice.
 fn in(slice: []const u8, number: u8) bool {
-    return mem.indexOfScalar(u8, slice, number) != null;
+    return mem.findScalar(u8, slice, number) != null;
 }
 
 fn run(
     allocator: Allocator,
-    env_map: *process.EnvMap,
+    io: Io,
+    environ_map: *const process.Environ.Map,
     cwd: []const u8,
     args: []const []const u8,
-) !process.Child.RunResult {
-    const result = try process.Child.run(.{
-        .allocator = allocator,
+) !process.RunResult {
+    const result = try process.run(allocator, io, .{
         .argv = args,
-        .env_map = env_map,
-        .cwd = cwd,
-        .max_output_bytes = max_doc_file_size,
+        .environ_map = environ_map,
+        .cwd = .{ .path = cwd },
     });
     switch (result.term) {
-        .Exited => |exit_code| {
+        .exited => |exit_code| {
             if (exit_code != 0) {
                 std.debug.print("{s}\nThe following command exited with code {}:\n", .{ result.stderr, exit_code });
                 dumpArgs(args);
                 return error.ChildExitError;
             }
         },
-        else => {
+        .signal => |sig| {
+            std.debug.print("{s}\nThe following command terminated with signal {t}:\n", .{ result.stderr, sig });
+            dumpArgs(args);
+            return error.ChildCrashed;
+        },
+        .stopped => |sig| {
+            std.debug.print("{s}\nThe following command stopped with signal {t}:\n", .{ result.stderr, sig });
+            dumpArgs(args);
+            return error.ChildCrashed;
+        },
+        .unknown => {
             std.debug.print("{s}\nThe following command crashed:\n", .{result.stderr});
             dumpArgs(args);
             return error.ChildCrashed;
@@ -1156,7 +1147,7 @@ fn run(
     return result;
 }
 
-fn printShell(out: anytype, shell_content: []const u8, escape: bool) !void {
+fn printShell(out: *Writer, shell_content: []const u8, escape: bool) !void {
     const trimmed_shell_content = mem.trim(u8, shell_content, " \r\n");
     try out.writeAll("<figure><figcaption class=\"shell-cap\">Shell</figcaption><pre><samp>");
     var cmd_cont: bool = false;
@@ -1401,11 +1392,11 @@ test "printShell" {
             \\</samp></pre></figure>
         ;
 
-        var buffer = std.array_list.Managed(u8).init(test_allocator);
+        var buffer: Writer.Allocating = .init(test_allocator);
         defer buffer.deinit();
 
-        try printShell(buffer.writer(), shell_out, false);
-        try testing.expectEqualSlices(u8, expected, buffer.items);
+        try printShell(&buffer.writer, shell_out, false);
+        try testing.expectEqualSlices(u8, expected, buffer.written());
     }
     {
         const shell_out =
@@ -1418,11 +1409,11 @@ test "printShell" {
             \\</samp></pre></figure>
         ;
 
-        var buffer = std.array_list.Managed(u8).init(test_allocator);
+        var buffer: Writer.Allocating = .init(test_allocator);
         defer buffer.deinit();
 
-        try printShell(buffer.writer(), shell_out, false);
-        try testing.expectEqualSlices(u8, expected, buffer.items);
+        try printShell(&buffer.writer, shell_out, false);
+        try testing.expectEqualSlices(u8, expected, buffer.written());
     }
     {
         const shell_out = "$ zig build test.zig\r\nbuild output\r\n";
@@ -1432,11 +1423,11 @@ test "printShell" {
             \\</samp></pre></figure>
         ;
 
-        var buffer = std.array_list.Managed(u8).init(test_allocator);
+        var buffer: Writer.Allocating = .init(test_allocator);
         defer buffer.deinit();
 
-        try printShell(buffer.writer(), shell_out, false);
-        try testing.expectEqualSlices(u8, expected, buffer.items);
+        try printShell(&buffer.writer, shell_out, false);
+        try testing.expectEqualSlices(u8, expected, buffer.written());
     }
     {
         const shell_out =
@@ -1451,11 +1442,11 @@ test "printShell" {
             \\</samp></pre></figure>
         ;
 
-        var buffer = std.array_list.Managed(u8).init(test_allocator);
+        var buffer: Writer.Allocating = .init(test_allocator);
         defer buffer.deinit();
 
-        try printShell(buffer.writer(), shell_out, false);
-        try testing.expectEqualSlices(u8, expected, buffer.items);
+        try printShell(&buffer.writer, shell_out, false);
+        try testing.expectEqualSlices(u8, expected, buffer.written());
     }
     {
         const shell_out =
@@ -1472,11 +1463,11 @@ test "printShell" {
             \\</samp></pre></figure>
         ;
 
-        var buffer = std.array_list.Managed(u8).init(test_allocator);
+        var buffer: Writer.Allocating = .init(test_allocator);
         defer buffer.deinit();
 
-        try printShell(buffer.writer(), shell_out, false);
-        try testing.expectEqualSlices(u8, expected, buffer.items);
+        try printShell(&buffer.writer, shell_out, false);
+        try testing.expectEqualSlices(u8, expected, buffer.written());
     }
     {
         const shell_out =
@@ -1491,11 +1482,11 @@ test "printShell" {
             \\</samp></pre></figure>
         ;
 
-        var buffer = std.array_list.Managed(u8).init(test_allocator);
+        var buffer: Writer.Allocating = .init(test_allocator);
         defer buffer.deinit();
 
-        try printShell(buffer.writer(), shell_out, false);
-        try testing.expectEqualSlices(u8, expected, buffer.items);
+        try printShell(&buffer.writer, shell_out, false);
+        try testing.expectEqualSlices(u8, expected, buffer.written());
     }
     {
         const shell_out =
@@ -1514,11 +1505,11 @@ test "printShell" {
             \\</samp></pre></figure>
         ;
 
-        var buffer = std.array_list.Managed(u8).init(test_allocator);
+        var buffer: Writer.Allocating = .init(test_allocator);
         defer buffer.deinit();
 
-        try printShell(buffer.writer(), shell_out, false);
-        try testing.expectEqualSlices(u8, expected, buffer.items);
+        try printShell(&buffer.writer, shell_out, false);
+        try testing.expectEqualSlices(u8, expected, buffer.written());
     }
     {
         // intentional space after "--build-option1 \"
@@ -1536,11 +1527,11 @@ test "printShell" {
             \\</samp></pre></figure>
         ;
 
-        var buffer = std.array_list.Managed(u8).init(test_allocator);
+        var buffer: Writer.Allocating = .init(test_allocator);
         defer buffer.deinit();
 
-        try printShell(buffer.writer(), shell_out, false);
-        try testing.expectEqualSlices(u8, expected, buffer.items);
+        try printShell(&buffer.writer, shell_out, false);
+        try testing.expectEqualSlices(u8, expected, buffer.written());
     }
     {
         const shell_out =
@@ -1553,11 +1544,11 @@ test "printShell" {
             \\</samp></pre></figure>
         ;
 
-        var buffer = std.array_list.Managed(u8).init(test_allocator);
+        var buffer: Writer.Allocating = .init(test_allocator);
         defer buffer.deinit();
 
-        try printShell(buffer.writer(), shell_out, false);
-        try testing.expectEqualSlices(u8, expected, buffer.items);
+        try printShell(&buffer.writer, shell_out, false);
+        try testing.expectEqualSlices(u8, expected, buffer.written());
     }
     {
         const shell_out =
@@ -1572,11 +1563,11 @@ test "printShell" {
             \\</samp></pre></figure>
         ;
 
-        var buffer = std.array_list.Managed(u8).init(test_allocator);
+        var buffer: Writer.Allocating = .init(test_allocator);
         defer buffer.deinit();
 
-        try printShell(buffer.writer(), shell_out, false);
-        try testing.expectEqualSlices(u8, expected, buffer.items);
+        try printShell(&buffer.writer, shell_out, false);
+        try testing.expectEqualSlices(u8, expected, buffer.written());
     }
     {
         const shell_out =
@@ -1587,10 +1578,10 @@ test "printShell" {
             \\</samp></pre></figure>
         ;
 
-        var buffer = std.array_list.Managed(u8).init(test_allocator);
+        var buffer: Writer.Allocating = .init(test_allocator);
         defer buffer.deinit();
 
-        try printShell(buffer.writer(), shell_out, false);
-        try testing.expectEqualSlices(u8, expected, buffer.items);
+        try printShell(&buffer.writer, shell_out, false);
+        try testing.expectEqualSlices(u8, expected, buffer.written());
     }
 }

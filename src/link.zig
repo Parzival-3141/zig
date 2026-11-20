@@ -1,40 +1,55 @@
-const std = @import("std");
-const build_options = @import("build_options");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
+
+const std = @import("std");
+const Io = std.Io;
 const assert = std.debug.assert;
 const fs = std.fs;
 const mem = std.mem;
 const log = std.log.scoped(.link);
-const trace = @import("tracy.zig").trace;
-const wasi_libc = @import("libs/wasi_libc.zig");
-
 const Allocator = std.mem.Allocator;
 const Cache = std.Build.Cache;
 const Path = std.Build.Cache.Path;
 const Directory = std.Build.Cache.Directory;
 const Compilation = @import("Compilation.zig");
 const LibCInstallation = std.zig.LibCInstallation;
+
+const trace = @import("tracy.zig").trace;
+const wasi_libc = @import("libs/wasi_libc.zig");
+
 const Zcu = @import("Zcu.zig");
 const InternPool = @import("InternPool.zig");
 const Type = @import("Type.zig");
 const Value = @import("Value.zig");
-const Package = @import("Package.zig");
 const dev = @import("dev.zig");
 const target_util = @import("target.zig");
 const codegen = @import("codegen.zig");
+const crash_report = @import("crash_report.zig");
+
+pub const ConstPool = @import("link/ConstPool.zig");
+pub const LdScript = @import("link/LdScript.zig");
+pub const MappedFile = @import("link/MappedFile.zig");
+pub const Queue = @import("link/Queue.zig");
 
 pub const aarch64 = @import("link/aarch64.zig");
-pub const LdScript = @import("link/LdScript.zig");
-pub const Queue = @import("link/Queue.zig");
+pub const loongarch = @import("link/loongarch.zig");
+
+pub const Error = Allocator.Error || Io.Cancelable || error{
+    /// An error message has already been stored in persistent state on `Compilation` or `Zcu`, for
+    /// instance in `Compilation.link_diags`.
+    AlreadyReported,
+};
+pub const EmitError = Error || Io.Writer.Error;
 
 pub const Diags = struct {
     /// Stored here so that function definitions can distinguish between
     /// needing an allocator for things besides error reporting.
     gpa: Allocator,
-    mutex: std.Thread.Mutex,
-    msgs: std.ArrayListUnmanaged(Msg),
+    io: Io,
+    mutex: Io.Mutex,
+    msgs: std.ArrayList(Msg),
     flags: Flags,
-    lld: std.ArrayListUnmanaged(Lld),
+    lld: std.ArrayList(Lld),
 
     pub const SourceLocation = union(enum) {
         none,
@@ -47,11 +62,8 @@ pub const Diags = struct {
         alloc_failure_occurred: bool = false,
 
         const Int = blk: {
-            const bits = @typeInfo(@This()).@"struct".fields.len;
-            break :blk @Type(.{ .int = .{
-                .signedness = .unsigned,
-                .bits = bits,
-            } });
+            const bits = @typeInfo(@This()).@"struct".field_names.len;
+            break :blk @Int(.unsigned, bits);
         };
 
         pub fn anySet(ef: Flags) bool {
@@ -85,7 +97,6 @@ pub const Diags = struct {
             return switch (msg.source_location) {
                 .none => try bundle.addString(msg.msg),
                 .wasm => |sl| {
-                    dev.check(.wasm_linker);
                     const wasm = base.?.cast(.wasm).?;
                     return sl.string(msg.msg, bundle, wasm);
                 },
@@ -110,7 +121,7 @@ pub const Diags = struct {
             err: ErrorWithNotes,
             comptime format: []const u8,
             args: anytype,
-        ) error{OutOfMemory}!void {
+        ) Allocator.Error!void {
             const gpa = err.diags.gpa;
             const err_msg = &err.diags.msgs.items[err.index];
             err_msg.msg = try std.fmt.allocPrint(gpa, format, args);
@@ -126,10 +137,11 @@ pub const Diags = struct {
         }
     };
 
-    pub fn init(gpa: Allocator) Diags {
+    pub fn init(gpa: Allocator, io: Io) Diags {
         return .{
             .gpa = gpa,
-            .mutex = .{},
+            .io = io,
+            .mutex = .init,
             .msgs = .empty,
             .flags = .{},
             .lld = .empty,
@@ -153,8 +165,10 @@ pub const Diags = struct {
     }
 
     pub fn lockAndParseLldStderr(diags: *Diags, prefix: []const u8, stderr: []const u8) void {
-        diags.mutex.lock();
-        defer diags.mutex.unlock();
+        const io = diags.io;
+
+        diags.mutex.lockUncancelable(io);
+        defer diags.mutex.unlock(io);
 
         diags.parseLldStderr(prefix, stderr) catch diags.setAllocFailure();
     }
@@ -166,8 +180,8 @@ pub const Diags = struct {
     ) Allocator.Error!void {
         const gpa = diags.gpa;
 
-        var context_lines = std.array_list.Managed([]const u8).init(gpa);
-        defer context_lines.deinit();
+        var context_lines: std.ArrayList([]const u8) = .empty;
+        defer context_lines.deinit(gpa);
 
         var current_err: ?*Lld = null;
         var lines = mem.splitSequence(u8, stderr, if (builtin.os.tag == .windows) "\r\n" else "\n");
@@ -176,16 +190,17 @@ pub const Diags = struct {
                 mem.eql(u8, line[0..prefix.len], prefix) and line[prefix.len] == ':')
             {
                 if (current_err) |err| {
-                    err.context_lines = try context_lines.toOwnedSlice();
+                    err.context_lines = try context_lines.toOwnedSlice(gpa);
                 }
 
                 var split = mem.splitSequence(u8, line, "error: ");
                 _ = split.first();
 
-                const duped_msg = try std.fmt.allocPrint(gpa, "{s}: {s}", .{ prefix, split.rest() });
-                errdefer gpa.free(duped_msg);
+                try diags.lld.ensureUnusedCapacity(gpa, 1);
 
-                current_err = try diags.lld.addOne(gpa);
+                const duped_msg = try std.fmt.allocPrint(gpa, "{s}: {s}", .{ prefix, split.rest() });
+
+                current_err = diags.lld.addOneAssumeCapacity();
                 current_err.?.* = .{ .msg = duped_msg };
             } else if (current_err != null) {
                 const context_prefix = ">>> ";
@@ -195,39 +210,41 @@ pub const Diags = struct {
                 }
 
                 if (trimmed.len > 0) {
-                    const duped_line = try gpa.dupe(u8, trimmed);
-                    try context_lines.append(duped_line);
+                    try context_lines.ensureUnusedCapacity(gpa, 1);
+                    context_lines.appendAssumeCapacity(try gpa.dupe(u8, trimmed));
                 }
             }
         }
 
         if (current_err) |err| {
-            err.context_lines = try context_lines.toOwnedSlice();
+            err.context_lines = try context_lines.toOwnedSlice(gpa);
         }
     }
 
-    pub fn fail(diags: *Diags, comptime format: []const u8, args: anytype) error{LinkFailure} {
+    pub fn fail(diags: *Diags, comptime format: []const u8, args: anytype) error{AlreadyReported} {
         @branchHint(.cold);
         addError(diags, format, args);
-        return error.LinkFailure;
+        return error.AlreadyReported;
     }
 
-    pub fn failSourceLocation(diags: *Diags, sl: SourceLocation, comptime format: []const u8, args: anytype) error{LinkFailure} {
+    pub fn failSourceLocation(diags: *Diags, sl: SourceLocation, comptime format: []const u8, args: anytype) error{AlreadyReported} {
         @branchHint(.cold);
         addErrorSourceLocation(diags, sl, format, args);
-        return error.LinkFailure;
+        return error.AlreadyReported;
     }
 
     pub fn addError(diags: *Diags, comptime format: []const u8, args: anytype) void {
+        @branchHint(.cold);
         return addErrorSourceLocation(diags, .none, format, args);
     }
 
     pub fn addErrorSourceLocation(diags: *Diags, sl: SourceLocation, comptime format: []const u8, args: anytype) void {
         @branchHint(.cold);
         const gpa = diags.gpa;
+        const io = diags.io;
         const eu_main_msg = std.fmt.allocPrint(gpa, format, args);
-        diags.mutex.lock();
-        defer diags.mutex.unlock();
+        diags.mutex.lockUncancelable(io);
+        defer diags.mutex.unlock(io);
         addErrorLockedFallible(diags, sl, eu_main_msg) catch |err| switch (err) {
             error.OutOfMemory => diags.setAllocFailureLocked(),
         };
@@ -243,16 +260,17 @@ pub const Diags = struct {
         });
     }
 
-    pub fn addErrorWithNotes(diags: *Diags, note_count: usize) error{OutOfMemory}!ErrorWithNotes {
+    pub fn addErrorWithNotes(diags: *Diags, note_count: usize) Allocator.Error!ErrorWithNotes {
         @branchHint(.cold);
         const gpa = diags.gpa;
-        diags.mutex.lock();
-        defer diags.mutex.unlock();
+        const io = diags.io;
+        diags.mutex.lockUncancelable(io);
+        defer diags.mutex.unlock(io);
         try diags.msgs.ensureUnusedCapacity(gpa, 1);
         return addErrorWithNotesAssumeCapacity(diags, note_count);
     }
 
-    pub fn addErrorWithNotesAssumeCapacity(diags: *Diags, note_count: usize) error{OutOfMemory}!ErrorWithNotes {
+    pub fn addErrorWithNotesAssumeCapacity(diags: *Diags, note_count: usize) Allocator.Error!ErrorWithNotes {
         @branchHint(.cold);
         const gpa = diags.gpa;
         const index = diags.msgs.items.len;
@@ -275,9 +293,10 @@ pub const Diags = struct {
     ) void {
         @branchHint(.cold);
         const gpa = diags.gpa;
+        const io = diags.io;
         const eu_main_msg = std.fmt.allocPrint(gpa, format, args);
-        diags.mutex.lock();
-        defer diags.mutex.unlock();
+        diags.mutex.lockUncancelable(io);
+        defer diags.mutex.unlock(io);
         addMissingLibraryErrorLockedFallible(diags, checked_paths, eu_main_msg) catch |err| switch (err) {
             error.OutOfMemory => diags.setAllocFailureLocked(),
         };
@@ -311,9 +330,10 @@ pub const Diags = struct {
     ) void {
         @branchHint(.cold);
         const gpa = diags.gpa;
+        const io = diags.io;
         const eu_main_msg = std.fmt.allocPrint(gpa, format, args);
-        diags.mutex.lock();
-        defer diags.mutex.unlock();
+        diags.mutex.lockUncancelable(io);
+        defer diags.mutex.unlock(io);
         addParseErrorLockedFallible(diags, path, eu_main_msg) catch |err| switch (err) {
             error.OutOfMemory => diags.setAllocFailureLocked(),
         };
@@ -340,16 +360,17 @@ pub const Diags = struct {
         path: Path,
         comptime format: []const u8,
         args: anytype,
-    ) error{LinkFailure} {
+    ) error{AlreadyReported} {
         @branchHint(.cold);
         addParseError(diags, path, format, args);
-        return error.LinkFailure;
+        return error.AlreadyReported;
     }
 
     pub fn setAllocFailure(diags: *Diags) void {
         @branchHint(.cold);
-        diags.mutex.lock();
-        defer diags.mutex.unlock();
+        const io = diags.io;
+        diags.mutex.lockUncancelable(io);
+        defer diags.mutex.unlock(io);
         setAllocFailureLocked(diags);
     }
 
@@ -366,15 +387,13 @@ pub const Diags = struct {
             });
             const notes_start = try bundle.reserveNotes(@intCast(link_err.notes.len));
             for (link_err.notes, 0..) |note, i| {
-                bundle.extra.items[notes_start + i] = @intFromEnum(try bundle.addErrorMessage(.{
+                bundle.extra.items[notes_start + i] = @backingInt(try bundle.addErrorMessage(.{
                     .msg = try note.string(bundle, base),
                 }));
             }
         }
     }
 };
-
-pub const producer_string = if (builtin.is_test) "zig test" else "zig " ++ build_options.version;
 
 pub const File = struct {
     tag: Tag,
@@ -383,12 +402,7 @@ pub const File = struct {
     comp: *Compilation,
     emit: Path,
 
-    file: ?fs.File,
-    /// When using the LLVM backend, the emitted object is written to a file with this name. This
-    /// object file then becomes a normal link input to LLD or a self-hosted linker.
-    ///
-    /// To convert this to an actual path, see `Compilation.resolveEmitPath` (with `kind == .temp`).
-    zcu_object_basename: ?[]const u8 = null,
+    file: ?Io.File,
     gc_sections: bool,
     print_gc_sections: bool,
     build_id: std.zig.BuildId,
@@ -424,11 +438,12 @@ pub const File = struct {
         tsaware: bool,
         nxcompat: bool,
         dynamicbase: bool,
-        compress_debug_sections: Lld.Elf.CompressDebugSections,
+        compress_debug_sections: std.zig.CompressDebugSections,
         bind_global_refs_locally: bool,
         import_symbols: bool,
         import_table: bool,
         export_table: bool,
+        growable_table: bool,
         initial_memory: ?u64,
         max_memory: ?u64,
         object_host_name: ?[]const u8,
@@ -444,13 +459,15 @@ pub const File = struct {
         allow_shlib_undefined: ?bool,
         allow_undefined_version: bool,
         enable_new_dtags: ?bool,
-        subsystem: ?std.Target.SubSystem,
-        linker_script: ?[]const u8,
-        version_script: ?[]const u8,
+        subsystem: ?std.zig.Subsystem,
+        linker_script: ?Path,
+        version_script: ?Path,
         soname: ?[]const u8,
         print_gc_sections: bool,
         print_icf_sections: bool,
         print_map: bool,
+        nmagic: bool,
+        fatal_warnings: bool,
 
         /// Use a wrapper function for symbol. Any undefined reference to symbol
         /// will be resolved to __wrap_symbol. Any undefined reference to
@@ -458,24 +475,23 @@ pub const File = struct {
         /// wrapper for a system function. The wrapper function should be called
         /// __wrap_symbol. If it wishes to call the system function, it should call
         /// __real_symbol.
-        symbol_wrap_set: std.StringArrayHashMapUnmanaged(void),
+        symbol_wrap_set: std.array_hash_map.String(void),
 
         compatibility_version: ?std.SemanticVersion,
 
         // TODO: remove this. libraries are resolved by the frontend.
         lib_directories: []const Directory,
-        framework_dirs: []const []const u8,
         rpath_list: []const []const u8,
 
         /// Zig compiler development linker flags.
-        /// Enable dumping of linker's state as JSON.
+        /// Enable dumping of linker's state.
         enable_link_snapshots: bool,
 
         /// Darwin-specific linker flags:
         /// Install name for the dylib
         install_name: ?[]const u8,
         /// Path to entitlements file
-        entitlements: ?[]const u8,
+        entitlements: ?Path,
         /// size of the __PAGEZERO segment
         pagezero_size: ?u64,
         /// Set minimum space for future expansion of the load commands
@@ -484,8 +500,6 @@ pub const File = struct {
         headerpad_max_install_names: bool,
         /// Remove dylibs that are unreachable by the entry point or exported symbols
         dead_strip_dylibs: bool,
-        frameworks: []const MachO.Framework,
-        darwin_sdk_layout: ?MachO.SdkLayout,
         /// Force load all members of static archives that implement an
         /// Objective-C class or category
         force_load_objc: bool,
@@ -529,7 +543,7 @@ pub const File = struct {
             const lld: *Lld = try .createEmpty(arena, comp, emit, options);
             return &lld.base;
         }
-        switch (Tag.fromObjectFormat(comp.root_mod.resolved_target.result.ofmt)) {
+        switch (Tag.fromObjectFormat(comp.root_mod.resolved_target.result.ofmt, comp.config.use_new_linker)) {
             .plan9 => return error.UnsupportedObjectFormat,
             inline else => |tag| {
                 dev.check(tag.devFeature());
@@ -552,7 +566,7 @@ pub const File = struct {
             const lld: *Lld = try .createEmpty(arena, comp, emit, options);
             return &lld.base;
         }
-        switch (Tag.fromObjectFormat(comp.root_mod.resolved_target.result.ofmt)) {
+        switch (Tag.fromObjectFormat(comp.root_mod.resolved_target.result.ofmt, comp.config.use_new_linker)) {
             .plan9 => return error.UnsupportedObjectFormat,
             inline else => |tag| {
                 dev.check(tag.devFeature());
@@ -567,55 +581,97 @@ pub const File = struct {
         return if (dev.env.supports(tag.devFeature()) and base.tag == tag) @fieldParentPtr("base", base) else null;
     }
 
+    pub fn startProgress(base: *File, prog_node: std.Progress.Node) void {
+        switch (base.tag) {
+            else => {},
+            inline .elf2, .coff, .macho2 => |tag| {
+                dev.check(tag.devFeature());
+                return @as(*tag.Type(), @fieldParentPtr("base", base)).startProgress(prog_node);
+            },
+        }
+    }
+
+    pub fn endProgress(base: *File) void {
+        switch (base.tag) {
+            else => {},
+            inline .elf2, .coff, .macho2 => |tag| {
+                dev.check(tag.devFeature());
+                return @as(*tag.Type(), @fieldParentPtr("base", base)).endProgress();
+            },
+        }
+    }
+
     pub fn makeWritable(base: *File) !void {
         dev.check(.make_writable);
         const comp = base.comp;
         const gpa = comp.gpa;
+        const io = comp.io;
         switch (base.tag) {
             .lld => assert(base.file == null),
-            .coff, .elf, .macho, .wasm, .goff, .xcoff => {
+            .elf, .macho, .wasm => {
+                dev.checkAny(&.{ .coff_linker, .elf_linker, .macho_linker, .plan9_linker, .wasm_linker });
                 if (base.file != null) return;
-                dev.checkAny(&.{ .coff_linker, .elf_linker, .macho_linker, .plan9_linker, .wasm_linker, .goff_linker, .xcoff_linker });
                 const emit = base.emit;
                 if (base.child_pid) |pid| {
                     if (builtin.os.tag == .windows) {
-                        base.cast(.coff).?.ptraceAttach(pid) catch |err| {
-                            log.warn("attaching failed with error: {s}", .{@errorName(err)});
-                        };
+                        return error.HotSwapUnavailableOnHostOperatingSystem;
                     } else {
                         // If we try to open the output file in write mode while it is running,
                         // it will return ETXTBSY. So instead, we copy the file, atomically rename it
                         // over top of the exe path, and then proceed normally. This changes the inode,
                         // avoiding the error.
+                        const random_integer = r: {
+                            var x: u32 = undefined;
+                            io.random(@ptrCast(&x));
+                            break :r x;
+                        };
                         const tmp_sub_path = try std.fmt.allocPrint(gpa, "{s}-{x}", .{
-                            emit.sub_path, std.crypto.random.int(u32),
+                            emit.sub_path, random_integer,
                         });
                         defer gpa.free(tmp_sub_path);
-                        try emit.root_dir.handle.copyFile(emit.sub_path, emit.root_dir.handle, tmp_sub_path, .{});
-                        try emit.root_dir.handle.rename(tmp_sub_path, emit.sub_path);
+                        try emit.root_dir.handle.copyFile(emit.sub_path, emit.root_dir.handle, tmp_sub_path, io, .{});
+                        try emit.root_dir.handle.rename(tmp_sub_path, emit.root_dir.handle, emit.sub_path, io);
                         switch (builtin.os.tag) {
                             .linux => std.posix.ptrace(std.os.linux.PTRACE.ATTACH, pid, 0, 0) catch |err| {
-                                log.warn("ptrace failure: {s}", .{@errorName(err)});
+                                log.warn("ptrace failure: {t}", .{err});
                             },
-                            .macos => base.cast(.macho).?.ptraceAttach(pid) catch |err| {
-                                log.warn("attaching failed with error: {s}", .{@errorName(err)});
+                            .maccatalyst, .macos => {
+                                const macho_file = base.cast(.macho).?;
+                                macho_file.ptraceAttach(pid) catch |err| {
+                                    log.warn("attaching failed with error: {t}", .{err});
+                                };
                             },
                             .windows => unreachable,
                             else => return error.HotSwapUnavailableOnHostOperatingSystem,
                         }
                     }
                 }
-                const output_mode = comp.config.output_mode;
-                const link_mode = comp.config.link_mode;
-                base.file = try emit.root_dir.handle.createFile(emit.sub_path, .{
-                    .truncate = false,
-                    .read = true,
-                    .mode = determineMode(output_mode, link_mode),
+                base.file = try emit.root_dir.handle.openFile(io, emit.sub_path, .{ .mode = .read_write });
+            },
+            .elf2, .coff, .macho2 => if (base.file == null) {
+                const mf = if (base.cast(.elf2)) |elf|
+                    &elf.mf
+                else if (base.cast(.coff)) |coff|
+                    &coff.mf
+                else if (base.cast(.macho2)) |macho|
+                    &macho.mf
+                else
+                    unreachable;
+                mf.memory_map.file = try base.emit.root_dir.handle.openFile(io, base.emit.sub_path, .{
+                    .mode = .read_write,
+                });
+                base.file = mf.memory_map.file;
+                try mf.ensureTotalCapacity(@intCast(mf.nodes.items[0].location().resolve(mf)[1]));
+            },
+            .c, .spirv => if (base.file == null) {
+                dev.checkAny(&.{ .c_linker, .spirv_linker });
+                base.file = try base.emit.root_dir.handle.openFile(io, base.emit.sub_path, .{
+                    .mode = .write_only,
                 });
             },
-            .c, .spirv => dev.checkAny(&.{ .c_linker, .spirv_linker }),
-            .quakec => dev.check(.quakec_linker),
             .plan9 => unreachable,
+            .spork8 => dev.check(.spork8_linker),
+            .quakec => dev.check(.quakec_linker),
         }
     }
 
@@ -633,25 +689,29 @@ pub const File = struct {
         return macho.reopenDebugInfo();
     }
 
+    pub fn canMakeExecutable(base: *File) bool {
+        const comp = base.comp;
+        return switch (comp.config.output_mode) {
+            .Obj => false,
+            .Lib => switch (comp.config.link_mode) {
+                .static => false,
+                .dynamic => true,
+            },
+            .Exe => true,
+        };
+    }
+
     pub fn makeExecutable(base: *File) !void {
         dev.check(.make_executable);
         const comp = base.comp;
-        const output_mode = comp.config.output_mode;
-        const link_mode = comp.config.link_mode;
-
-        switch (output_mode) {
-            .Obj => return,
-            .Lib => switch (link_mode) {
-                .static => return,
-                .dynamic => {},
-            },
-            .Exe => {},
-        }
+        const io = comp.io;
+        if (!base.canMakeExecutable())
+            return;
         switch (base.tag) {
             .lld => assert(base.file == null),
             .elf => if (base.file) |f| {
                 dev.check(.elf_linker);
-                f.close();
+                f.close(io);
                 base.file = null;
 
                 if (base.child_pid) |pid| {
@@ -663,44 +723,71 @@ pub const File = struct {
                     }
                 }
             },
-            .coff, .macho, .wasm, .goff, .xcoff => if (base.file) |f| {
-                dev.checkAny(&.{ .coff_linker, .macho_linker, .plan9_linker, .wasm_linker, .goff_linker, .xcoff_linker });
-                f.close();
+            .macho, .wasm => if (base.file) |f| {
+                dev.checkAny(&.{ .coff_linker, .macho_linker, .plan9_linker, .wasm_linker });
+                f.close(io);
                 base.file = null;
 
                 if (base.child_pid) |pid| {
                     switch (builtin.os.tag) {
-                        .macos => base.cast(.macho).?.ptraceDetach(pid) catch |err| {
-                            log.warn("detaching failed with error: {s}", .{@errorName(err)});
+                        .maccatalyst, .macos => {
+                            const macho_file = base.cast(.macho).?;
+                            macho_file.ptraceDetach(pid) catch |err| {
+                                log.warn("detaching failed with error: {s}", .{@errorName(err)});
+                            };
                         },
-                        .windows => base.cast(.coff).?.ptraceDetach(pid),
                         else => return error.HotSwapUnavailableOnHostOperatingSystem,
                     }
                 }
             },
+            .elf2, .coff, .macho2 => if (base.file) |f| {
+                const mf = if (base.cast(.elf2)) |elf|
+                    &elf.mf
+                else if (base.cast(.coff)) |coff|
+                    &coff.mf
+                else if (base.cast(.macho2)) |macho|
+                    &macho.mf
+                else
+                    unreachable;
+                mf.unmap();
+                assert(mf.memory_map.file.handle == f.handle);
+                mf.memory_map.file.close(io);
+                mf.memory_map.file = undefined;
+                base.file = null;
+            },
             .c, .spirv => dev.checkAny(&.{ .c_linker, .spirv_linker }),
             .quakec => dev.check(.quakec_linker),
             .plan9 => unreachable,
+            .spork8 => dev.check(.spork8_linker),
         }
     }
 
     pub const DebugInfoOutput = union(enum) {
         dwarf: *Dwarf.WipNav,
+        eh_frame: *Dwarf2.WipFunc,
+        dwarf2: *Dwarf2.WipFunc.Debug,
         none,
     };
     pub const UpdateDebugInfoError = Dwarf.UpdateError;
-    pub const FlushDebugInfoError = Dwarf.FlushError;
 
-    /// Note that `LinkFailure` is not a member of this error set because the error message
-    /// must be attached to `Zcu.failed_codegen` rather than `Compilation.link_diags`.
-    pub const UpdateNavError = codegen.CodeGenError;
+    /// Opaque identifier for a function currently being emitted.
+    ///
+    /// The function may be an interned function with a NAV, or it may be a lazy function.
+    ///
+    /// This type exists for type-safe interaction between codegen and link.
+    pub const AtomId = enum(u32) { _ };
+
+    /// Opaque identifier for some symbol in the output binary.
+    ///
+    /// This type exists for type-safe interaction between codegen and link.
+    pub const SymbolId = enum(u32) { _ };
 
     /// Called from within CodeGen to retrieve the symbol index of a global symbol.
     /// If no symbol exists yet with this name, a new undefined global symbol will
     /// be created. This symbol may get resolved once all relocatables are (re-)linked.
     /// Optionally, it is possible to specify where to expect the symbol defined if it
     /// is an import.
-    pub fn getGlobalSymbol(base: *File, name: []const u8, lib_name: ?[]const u8) UpdateNavError!u32 {
+    pub fn getGlobalSymbol(base: *File, name: []const u8, lib_name: ?[]const u8) Error!SymbolId {
         log.debug("getGlobalSymbol '{s}' (expected in '{?s}')", .{ name, lib_name });
         switch (base.tag) {
             .lld => unreachable,
@@ -713,12 +800,34 @@ pub const File = struct {
         }
     }
 
-    /// May be called before or after updateExports for any given Nav.
+    /// When there is a ZCU, this is called exactly once per update, to indicate that all per-file
+    /// state (e.g. `Zcu.alive_files`) has been populated by the frontend, so can now be safely
+    /// accessed by the linker.
+    ///
+    /// This call occurs before any call to any of these functions:
+    /// * `updateNav`
+    /// * `updateFunc`
+    /// * `updateContainerType`
+    /// * `updateLineNumber`
+    ///
     /// Asserts that the ZCU is not using the LLVM backend.
-    fn updateNav(base: *File, pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) UpdateNavError!void {
-        assert(base.comp.zcu.?.llvm_object == null);
+    fn zcuFilesReady(base: *File, zcu: *Zcu) Error!void {
+        assert(zcu.llvm_object == null);
+        switch (base.tag) {
+            else => {},
+            inline .elf2 => |tag| {
+                dev.check(tag.devFeature());
+                return @as(*tag.Type(), @fieldParentPtr("base", base)).zcuFilesReady(zcu);
+            },
+        }
+    }
+
+    /// Asserts that the ZCU is not using the LLVM backend.
+    fn updateNav(base: *File, pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) Error!void {
+        assert(pt.zcu.llvm_object == null);
         const nav = pt.zcu.intern_pool.getNav(nav_index);
-        assert(nav.status == .fully_resolved);
+        assert(nav.resolved.?.value != .none);
+
         switch (base.tag) {
             .lld => unreachable,
             .plan9 => unreachable,
@@ -729,26 +838,19 @@ pub const File = struct {
         }
     }
 
-    pub const UpdateContainerTypeError = error{
-        OutOfMemory,
-        /// `Zcu.failed_types` is already populated with the error message.
-        TypeFailureReported,
-    };
-
     /// Never called when LLVM is codegenning the ZCU.
-    fn updateContainerType(base: *File, pt: Zcu.PerThread, ty: InternPool.Index) UpdateContainerTypeError!void {
-        assert(base.comp.zcu.?.llvm_object == null);
+    fn updateContainerType(base: *File, pt: Zcu.PerThread, ty: InternPool.Index, success: bool) Error!void {
+        assert(pt.zcu.llvm_object == null);
         switch (base.tag) {
             .lld => unreachable,
             else => {},
-            inline .elf => |tag| {
+            inline .elf, .elf2, .c, .coff => |tag| {
                 dev.check(tag.devFeature());
-                return @as(*tag.Type(), @fieldParentPtr("base", base)).updateContainerType(pt, ty);
+                return @as(*tag.Type(), @fieldParentPtr("base", base)).updateContainerType(pt, ty, success);
             },
         }
     }
 
-    /// May be called before or after updateExports for any given Decl.
     /// The active tag of `mir` is determined by the backend used for the module this function is in.
     /// Never called when LLVM is codegenning the ZCU.
     fn updateFunc(
@@ -759,11 +861,10 @@ pub const File = struct {
         /// that `mir.deinit` remains legal for the caller. For instance, the callee can
         /// take ownership of an embedded slice and replace it with `&.{}` in `mir`.
         mir: *codegen.AnyMir,
-    ) UpdateNavError!void {
-        assert(base.comp.zcu.?.llvm_object == null);
+    ) Error!void {
+        assert(pt.zcu.llvm_object == null);
         switch (base.tag) {
             .lld => unreachable,
-            .spirv => unreachable, // see corresponding special case in `Zcu.PerThread.runCodegenInner`
             .plan9 => unreachable,
             inline else => |tag| {
                 dev.check(tag.devFeature());
@@ -772,40 +873,63 @@ pub const File = struct {
         }
     }
 
-    pub const UpdateLineNumberError = error{
-        OutOfMemory,
-        Overflow,
-        LinkFailure,
-    };
-
     /// On an incremental update, fixup the line number of all `Nav`s at the given `TrackedInst`, because
     /// its line number has changed. The ZIR instruction `ti_id` has tag `.declaration`.
     /// Never called when LLVM is codegenning the ZCU.
-    fn updateLineNumber(base: *File, pt: Zcu.PerThread, ti_id: InternPool.TrackedInst.Index) UpdateLineNumberError!void {
-        assert(base.comp.zcu.?.llvm_object == null);
+    fn updateLineNumber(base: *File, pt: Zcu.PerThread, ti_id: InternPool.TrackedInst.Index, line: u32) Error!void {
+        assert(pt.zcu.llvm_object == null);
         {
             const ti = ti_id.resolveFull(&pt.zcu.intern_pool).?;
             const file = pt.zcu.fileByIndex(ti.file);
-            const inst = file.zir.?.instructions.get(@intFromEnum(ti.inst));
-            assert(inst.tag == .declaration);
+            const inst = file.zir.?.instructions.get(@backingInt(ti.inst));
+            switch (inst.tag) {
+                .declaration => {},
+                .extended => switch (inst.data.extended.opcode) {
+                    .struct_decl,
+                    .union_decl,
+                    .enum_decl,
+                    .opaque_decl,
+                    .reify_enum,
+                    .reify_struct,
+                    .reify_union,
+                    => {},
+                    else => unreachable,
+                },
+                else => unreachable,
+            }
         }
-
         switch (base.tag) {
             .lld => unreachable,
-            .spirv => {},
-            .goff, .xcoff => {},
             .plan9 => unreachable,
+            .spirv => {},
+            .coff => {},
+            .macho2 => {},
             inline else => |tag| {
                 dev.check(tag.devFeature());
-                return @as(*tag.Type(), @fieldParentPtr("base", base)).updateLineNumber(pt, ti_id);
+                return @as(*tag.Type(), @fieldParentPtr("base", base)).updateLineNumber(pt, ti_id, line);
             },
         }
     }
 
-    pub fn releaseLock(self: *File) void {
-        if (self.lock) |*lock| {
-            lock.release();
-            self.lock = null;
+    fn lostTracking(base: *File, pt: Zcu.PerThread, ti_id: InternPool.TrackedInst.Index) Error!void {
+        assert(base.comp.zcu.?.llvm_object == null);
+        switch (base.tag) {
+            .lld => unreachable,
+            .plan9 => unreachable,
+            else => {},
+            inline .elf2 => |tag| {
+                dev.check(tag.devFeature());
+                return @as(*tag.Type(), @fieldParentPtr("base", base)).lostTracking(pt, ti_id);
+            },
+        }
+    }
+
+    pub fn releaseLock(base: *File) void {
+        const comp = base.comp;
+        const io = comp.io;
+        if (base.lock) |*lock| {
+            lock.release(io);
+            base.lock = null;
         }
     }
 
@@ -816,8 +940,9 @@ pub const File = struct {
     }
 
     pub fn destroy(base: *File) void {
+        const io = base.comp.io;
         base.releaseLock();
-        if (base.file) |f| f.close();
+        if (base.file) |f| f.close(io);
         switch (base.tag) {
             .plan9 => unreachable,
             inline else => |tag| {
@@ -827,16 +952,35 @@ pub const File = struct {
         }
     }
 
-    pub const FlushError = error{
-        /// Indicates an error will be present in `Compilation.link_diags`.
-        LinkFailure,
-        OutOfMemory,
-    };
+    fn idle(base: *File) Error!bool {
+        switch (base.tag) {
+            else => return false,
+            inline .elf2, .coff, .macho2 => |tag| {
+                dev.check(tag.devFeature());
+                return @as(*tag.Type(), @fieldParentPtr("base", base)).idle();
+            },
+        }
+    }
+
+    pub fn updateErrorData(base: *File, pt: Zcu.PerThread) Error!void {
+        if (base.comp.zcu.?.llvm_object != null) return;
+        switch (base.tag) {
+            else => {},
+            inline .elf2, .coff, .macho2 => |tag| {
+                dev.check(tag.devFeature());
+                return @as(*tag.Type(), @fieldParentPtr("base", base)).updateErrorData(pt);
+            },
+        }
+    }
 
     /// Commit pending changes and write headers. Takes into account final output mode.
     /// `arena` has the lifetime of the call to `Compilation.update`.
-    pub fn flush(base: *File, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Progress.Node) FlushError!void {
+    pub fn flush(base: *File, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Progress.Node) Error!void {
+        crash_report.LinkerOp.start(base);
+        defer crash_report.LinkerOp.stop(base);
+
         const comp = base.comp;
+        const io = comp.io;
         if (comp.clang_preprocessor_mode == .yes or comp.clang_preprocessor_mode == .pch) {
             dev.check(.clang_command);
             const emit = base.emit;
@@ -844,16 +988,19 @@ pub const File = struct {
             // Until then, we do `lld -r -o output.o input.o` even though the output is the same
             // as the input. For the preprocessing case (`zig cc -E -o foo`) we copy the file
             // to the final location. See also the corresponding TODO in Coff linking.
-            assert(comp.c_object_table.count() == 1);
-            const the_key = comp.c_object_table.keys()[0];
+            assert(comp.c_objects.items.len == 1);
+            const the_key = comp.c_objects.items[0];
             const cached_pp_file_path = the_key.status.success.object_path;
-            cached_pp_file_path.root_dir.handle.copyFile(cached_pp_file_path.sub_path, emit.root_dir.handle, emit.sub_path, .{}) catch |err| {
+            Io.Dir.copyFile(
+                cached_pp_file_path.root_dir.handle,
+                cached_pp_file_path.sub_path,
+                emit.root_dir.handle,
+                emit.sub_path,
+                io,
+                .{},
+            ) catch |err| {
                 const diags = &base.comp.link_diags;
-                return diags.fail("failed to copy '{f}' to '{f}': {s}", .{
-                    std.fmt.alt(@as(Path, cached_pp_file_path), .formatEscapeChar),
-                    std.fmt.alt(@as(Path, emit), .formatEscapeChar),
-                    @errorName(err),
-                });
+                return diags.fail("failed to copy {qf} to {qf}: {t}", .{ cached_pp_file_path, emit, err });
             };
             return;
         }
@@ -867,29 +1014,29 @@ pub const File = struct {
         }
     }
 
-    pub const UpdateExportsError = error{
-        OutOfMemory,
-        AnalysisFail,
-    };
-
-    /// This is called for every exported thing. `exports` is almost always
-    /// a list of size 1, meaning that `exported` is exported once. However, it is possible
-    /// to export the same thing with multiple different symbol names (aliases).
-    /// May be called before or after updateDecl for any given Decl.
+    /// This is called once per update, before `flush`.
+    ///
+    /// `export_indices` contains the index of every export from the ZCU which should be performed
+    /// on this update. "Removal" of exports is signaled implicitly by the export being in this
+    /// slice on one update but not the next.
+    ///
     /// Never called when LLVM is codegenning the ZCU.
     pub fn updateExports(
         base: *File,
         pt: Zcu.PerThread,
-        exported: Zcu.Exported,
         export_indices: []const Zcu.Export.Index,
-    ) UpdateExportsError!void {
-        assert(base.comp.zcu.?.llvm_object == null);
+    ) Error!void {
+        assert(pt.zcu.llvm_object == null);
+
+        crash_report.LinkerOp.start(base);
+        defer crash_report.LinkerOp.stop(base);
+
         switch (base.tag) {
             .lld => unreachable,
             .plan9 => unreachable,
             inline else => |tag| {
                 dev.check(tag.devFeature());
-                return @as(*tag.Type(), @fieldParentPtr("base", base)).updateExports(pt, exported, export_indices);
+                return @as(*tag.Type(), @fieldParentPtr("base", base)).updateExports(pt, export_indices);
             },
         }
     }
@@ -897,97 +1044,95 @@ pub const File = struct {
     pub const RelocInfo = struct {
         parent: Parent,
         offset: u64,
+        target: SymbolId,
         addend: u32,
 
         pub const Parent = union(enum) {
             none,
-            atom_index: u32,
+            atom_index: AtomId,
             debug_output: DebugInfoOutput,
         };
     };
 
-    /// Get allocated `Nav`'s address in virtual memory.
-    /// The linker is passed information about the containing atom, `parent_atom_index`, and offset within it's
-    /// memory buffer, `offset`, so that it can make a note of potential relocation sites, should the
-    /// `Nav`'s address was not yet resolved, or the containing atom gets moved in virtual memory.
-    /// May be called before or after updateFunc/updateNav therefore it is up to the linker to allocate
-    /// the block/atom.
     /// Never called when LLVM is codegenning the ZCU.
-    pub fn getNavVAddr(base: *File, pt: Zcu.PerThread, nav_index: InternPool.Nav.Index, reloc_info: RelocInfo) !u64 {
+    pub fn relocSymAddr(base: *File, reloc_info: RelocInfo) Error!void {
         assert(base.comp.zcu.?.llvm_object == null);
         switch (base.tag) {
             .lld => unreachable,
             .c => unreachable,
             .spirv => unreachable,
             .wasm => unreachable,
-            .goff, .xcoff => unreachable,
             .plan9 => unreachable,
+            .spork8 => unreachable,
             inline else => |tag| {
                 dev.check(tag.devFeature());
-                return @as(*tag.Type(), @fieldParentPtr("base", base)).getNavVAddr(pt, nav_index, reloc_info);
+                return @as(*tag.Type(), @fieldParentPtr("base", base)).relocSymAddr(reloc_info);
             },
         }
     }
 
     /// Never called when LLVM is codegenning the ZCU.
-    pub fn lowerUav(
+    pub fn uavSymbol(
         base: *File,
         pt: Zcu.PerThread,
-        decl_val: InternPool.Index,
-        decl_align: InternPool.Alignment,
-        src_loc: Zcu.LazySrcLoc,
-    ) !codegen.SymbolResult {
+        uav_val: InternPool.Index,
+        uav_align: InternPool.Alignment,
+    ) Error!SymbolId {
+        assert(pt.zcu.llvm_object == null);
+        switch (base.tag) {
+            .lld => unreachable,
+            .c => unreachable,
+            .spirv => unreachable,
+            .wasm => unreachable,
+            .plan9 => unreachable,
+            .spork8 => unreachable,
+            inline else => |tag| {
+                dev.check(tag.devFeature());
+                return @as(*tag.Type(), @fieldParentPtr("base", base)).uavSymbol(pt, uav_val, uav_align);
+            },
+        }
+    }
+
+    /// Never called when LLVM is codegenning the ZCU.
+    pub fn navSymbol(base: *File, nav: InternPool.Nav.Index) Error!SymbolId {
         assert(base.comp.zcu.?.llvm_object == null);
         switch (base.tag) {
             .lld => unreachable,
             .c => unreachable,
             .spirv => unreachable,
             .wasm => unreachable,
-            .goff, .xcoff => unreachable,
             .plan9 => unreachable,
+            .spork8 => unreachable,
             inline else => |tag| {
                 dev.check(tag.devFeature());
-                return @as(*tag.Type(), @fieldParentPtr("base", base)).lowerUav(pt, decl_val, decl_align, src_loc);
+                return @as(*tag.Type(), @fieldParentPtr("base", base)).navSymbol(nav);
             },
         }
     }
 
-    /// Never called when LLVM is codegenning the ZCU.
-    pub fn getUavVAddr(base: *File, decl_val: InternPool.Index, reloc_info: RelocInfo) !u64 {
-        assert(base.comp.zcu.?.llvm_object == null);
-        switch (base.tag) {
-            .lld => unreachable,
-            .c => unreachable,
-            .spirv => unreachable,
-            .wasm => unreachable,
-            .goff, .xcoff => unreachable,
-            .plan9 => unreachable,
-            inline else => |tag| {
-                dev.check(tag.devFeature());
-                return @as(*tag.Type(), @fieldParentPtr("base", base)).getUavVAddr(decl_val, reloc_info);
-            },
-        }
-    }
+    pub const DumpResult = enum {
+        unimplemented,
+        needs_extensions,
+        disabled,
+        enabled,
+    };
 
-    /// Never called when LLVM is codegenning the ZCU.
-    pub fn deleteExport(
-        base: *File,
-        exported: Zcu.Exported,
-        name: InternPool.NullTerminatedString,
-    ) void {
-        assert(base.comp.zcu.?.llvm_object == null);
+    pub fn dump(base: *File, w: *Io.Writer) !DumpResult {
+        if (!build_options.enable_debug_extensions) return .not_built;
         switch (base.tag) {
-            .lld => unreachable,
-            .plan9 => unreachable,
-
+            .elf,
+            .macho,
+            .c,
+            .wasm,
             .spirv,
-            .goff,
-            .xcoff,
-            => {},
-
+            .plan9,
+            .lld,
+            .spork8,
+            .quakec,
+            => return .unimplemented,
             inline else => |tag| {
                 dev.check(tag.devFeature());
-                return @as(*tag.Type(), @fieldParentPtr("base", base)).deleteExport(exported, name);
+                return @as(*tag.Type(), @fieldParentPtr("base", base)).dump(w);
             },
         }
     }
@@ -995,60 +1140,67 @@ pub const File = struct {
     /// Opens a path as an object file and parses it into the linker.
     fn openLoadObject(base: *File, path: Path) anyerror!void {
         if (base.tag == .lld) return;
+        const io = base.comp.io;
         const diags = &base.comp.link_diags;
-        const input = try openObjectInput(diags, path);
-        errdefer input.object.file.close();
+        const input = try openObjectInput(io, diags, path);
+        errdefer input.object.file.close(io);
         try loadInput(base, input);
     }
 
     /// Opens a path as a static library and parses it into the linker.
-    /// If `query` is non-null, allows GNU ld scripts.
-    fn openLoadArchive(base: *File, path: Path, opt_query: ?UnresolvedInput.Query) anyerror!void {
+    fn openLoadArchive(base: *File, path: Path, must_link: bool) anyerror!void {
         if (base.tag == .lld) return;
-        if (opt_query) |query| {
-            const archive = try openObject(path, query.must_link, query.hidden);
-            errdefer archive.file.close();
-            loadInput(base, .{ .archive = archive }) catch |err| switch (err) {
-                error.BadMagic, error.UnexpectedEndOfFile => {
-                    if (base.tag != .elf) return err;
-                    try loadGnuLdScript(base, path, query, archive.file);
-                    archive.file.close();
-                    return;
-                },
-                else => return err,
-            };
-        } else {
-            const archive = try openObject(path, false, false);
-            errdefer archive.file.close();
-            try loadInput(base, .{ .archive = archive });
-        }
+        const io = base.comp.io;
+        const archive = try openObject(io, path, must_link, false);
+        errdefer archive.file.close(io);
+        try loadInput(base, .{ .archive = archive });
     }
 
-    /// Opens a path as a shared library and parses it into the linker.
-    /// Handles GNU ld scripts.
-    fn openLoadDso(base: *File, path: Path, query: UnresolvedInput.Query) anyerror!void {
+    /// Opens a path as a static library and parses it into the linker. Allows GNU ld scripts.
+    fn openLoadArchiveQuery(base: *File, path: Path, query: UnresolvedInput.Query) anyerror!void {
         if (base.tag == .lld) return;
-        const dso = try openDso(path, query.needed, query.weak, query.reexport);
-        errdefer dso.file.close();
-        loadInput(base, .{ .dso = dso }) catch |err| switch (err) {
+        const io = base.comp.io;
+        const archive = try openObject(io, path, query.must_link, query.hidden);
+        errdefer archive.file.close(io);
+        loadInput(base, .{ .archive = archive }) catch |err| switch (err) {
             error.BadMagic, error.UnexpectedEndOfFile => {
-                if (base.tag != .elf) return err;
-                try loadGnuLdScript(base, path, query, dso.file);
-                dso.file.close();
+                if (base.tag != .elf and base.tag != .elf2) return err;
+                try loadGnuLdScript(base, path, query, archive.file);
+                archive.file.close(io);
                 return;
             },
             else => return err,
         };
     }
 
-    fn loadGnuLdScript(base: *File, path: Path, parent_query: UnresolvedInput.Query, file: fs.File) anyerror!void {
-        const diags = &base.comp.link_diags;
-        const gpa = base.comp.gpa;
-        const stat = try file.stat();
+    /// Opens a path as a shared library and parses it into the linker.
+    /// Handles GNU ld scripts.
+    fn openLoadDso(base: *File, path: Path, query: UnresolvedInput.Query) anyerror!void {
+        if (base.tag == .lld) return;
+        const io = base.comp.io;
+        const dso = try openDso(io, path, query.needed, query.weak, query.reexport);
+        errdefer dso.file.close(io);
+        loadInput(base, .{ .dso = dso }) catch |err| switch (err) {
+            error.BadMagic, error.UnexpectedEndOfFile => {
+                if (base.tag != .elf and base.tag != .elf2) return err;
+                try loadGnuLdScript(base, path, query, dso.file);
+                dso.file.close(io);
+                return;
+            },
+            else => return err,
+        };
+    }
+
+    fn loadGnuLdScript(base: *File, path: Path, parent_query: UnresolvedInput.Query, file: Io.File) anyerror!void {
+        const comp = base.comp;
+        const io = comp.io;
+        const diags = &comp.link_diags;
+        const gpa = comp.gpa;
+        const stat = try file.stat(io);
         const size = std.math.cast(u32, stat.size) orelse return error.FileTooBig;
         const buf = try gpa.alloc(u8, size);
         defer gpa.free(buf);
-        const n = try file.preadAll(buf, 0);
+        const n = try file.readPositionalAll(io, buf, 0);
         if (buf.len != n) return error.UnexpectedEndOfFile;
         var ld_script = try LdScript.parse(gpa, diags, path, buf);
         defer ld_script.deinit(gpa);
@@ -1065,11 +1217,15 @@ pub const File = struct {
                 @panic("TODO");
             } else {
                 if (fs.path.isAbsolute(arg.path)) {
-                    const new_path = Path.initCwd(try gpa.dupe(u8, arg.path));
+                    const new_path = Path.initCwd(path: {
+                        comp.mutex.lockUncancelable(io);
+                        defer comp.mutex.unlock(io);
+                        break :path try comp.arena.dupe(u8, arg.path);
+                    });
                     switch (Compilation.classifyFileExt(arg.path)) {
                         .shared_library => try openLoadDso(base, new_path, query),
                         .object => try openLoadObject(base, new_path),
-                        .static_library => try openLoadArchive(base, new_path, query),
+                        .static_library => try openLoadArchiveQuery(base, new_path, query),
                         else => diags.addParseError(path, "GNU ld script references file with unrecognized extension: {s}", .{arg.path}),
                     }
                 } else {
@@ -1080,45 +1236,133 @@ pub const File = struct {
     }
 
     pub fn loadInput(base: *File, input: Input) anyerror!void {
-        if (base.tag == .lld) return;
+        if (base.tag != .lld) {
+            assert(!base.post_prelink);
+        }
         switch (base.tag) {
-            inline .elf, .wasm => |tag| {
+            inline else => |tag| {
                 dev.check(tag.devFeature());
                 return @as(*tag.Type(), @fieldParentPtr("base", base)).loadInput(input);
             },
-            else => {},
+            .c, .spork8, .plan9, .lld => {},
+        }
+    }
+
+    fn loadDarwinSdkSettings(base: *File, sdk_settings_path: Path) Error!void {
+        const comp = base.comp;
+        const io = comp.io;
+        const arena = comp.arena;
+        const diags = &comp.link_diags;
+
+        const contents = sdk_settings_path.root_dir.handle.readFileAlloc(
+            io,
+            sdk_settings_path.sub_path,
+            arena,
+            .limited(1024 * 1024 * 256),
+        ) catch |err| switch (err) {
+            error.OutOfMemory, error.Canceled => |e| return e,
+            else => |e| return diags.failParse(sdk_settings_path, "failed to parse Darwin SDK settings: {t}", .{e}),
+        };
+
+        const parsed = std.json.parseFromSlice(std.json.Value, arena, contents, .{}) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            else => |e| return diags.failParse(sdk_settings_path, "failed to parse Darwin SDK settings: {t}", .{e}),
+        };
+        const parsed_object = switch (parsed.value) {
+            .object => |obj| obj,
+            else => return diags.failParse(sdk_settings_path, "failed to parse Darwin SDK settings: file is not a JSON object", .{}),
+        };
+
+        const version_json = parsed_object.get("Version") orelse return diags.failParse(
+            sdk_settings_path,
+            "failed to parse Darwin SDK settings: 'Version' missing",
+            .{},
+        );
+        const version_str: []const u8 = switch (version_json) {
+            .string => |str| str,
+            else => return diags.failParse(
+                sdk_settings_path,
+                "failed to parse Darwin SDK settings: 'Version' not a string",
+                .{},
+            ),
+        };
+        const version: DarwinSdkVersion = try .parse(diags, sdk_settings_path, version_str);
+        try base.setDarwinSdkVersion(version);
+    }
+
+    fn setDarwinSdkVersion(base: *File, version: DarwinSdkVersion) Error!void {
+        assert(!base.post_prelink);
+        switch (base.tag) {
+            inline .macho, .macho2 => |tag| {
+                dev.check(tag.devFeature());
+                return @as(*tag.Type(), @fieldParentPtr("base", base)).setDarwinSdkVersion(version);
+            },
+            else => unreachable,
         }
     }
 
     /// Called when all linker inputs have been sent via `loadInput`. After
     /// this, `loadInput` will not be called anymore.
-    pub fn prelink(base: *File) FlushError!void {
-        assert(!base.post_prelink);
-
-        // In this case, an object file is created by the LLVM backend, so
-        // there is no prelink phase. The Zig code is linked as a standard
-        // object along with the others.
-        if (base.zcu_object_basename != null) return;
+    pub fn prelink(base: *File) Error!void {
+        // The guard on this assertion is a temporary hack to make the LLVM backend with LLD work with
+        // `-fincremental`. This works only because `File.Lld` does nothing in prelink.
+        // Related: https://codeberg.org/ziglang/zig/issues/32081
+        if (base.tag != .lld) {
+            assert(!base.post_prelink);
+        }
 
         switch (base.tag) {
-            inline .wasm => |tag| {
+            inline .elf2, .coff, .macho2, .wasm, .c => |tag| {
                 dev.check(tag.devFeature());
-                return @as(*tag.Type(), @fieldParentPtr("base", base)).prelink(base.comp.link_prog_node);
+                try @as(*tag.Type(), @fieldParentPtr("base", base)).prelink(base.comp.link_prog_node);
             },
-            else => {},
+            else => base.comp.link_prog_node.completeOne(),
         }
+
+        base.post_prelink = true;
+    }
+
+    /// Legacy function for old linker code
+    pub fn copyRangeAll(base: *File, old_offset: u64, new_offset: u64, size: u64) !void {
+        const comp = base.comp;
+        const io = comp.io;
+        const file = base.file.?;
+        return copyRangeAll2(io, file, file, old_offset, new_offset, size);
+    }
+
+    /// Legacy function for old linker code
+    pub fn copyRangeAll2(io: Io, src_file: Io.File, dst_file: Io.File, old_offset: u64, new_offset: u64, size: u64) !void {
+        var write_buffer: [2048]u8 = undefined;
+        var file_reader = src_file.reader(io, &.{});
+        file_reader.pos = old_offset;
+        var file_writer = dst_file.writer(io, &write_buffer);
+        file_writer.pos = new_offset;
+        const size_u = std.math.cast(usize, size) orelse return error.Overflow;
+        const n = file_writer.interface.sendFileAll(&file_reader, .limited(size_u)) catch |err| switch (err) {
+            error.ReadFailed => switch (file_reader.err.?) {
+                error.ConnectionResetByPeer => return error.Unexpected, // not a socket
+                error.SocketUnconnected => return error.Unexpected, // not a socket
+                else => |e| return e,
+            },
+            error.WriteFailed => return file_writer.err.?,
+        };
+        assert(n == size_u);
+        file_writer.interface.flush() catch |err| switch (err) {
+            error.WriteFailed => return file_writer.err.?,
+        };
     }
 
     pub const Tag = enum {
         coff,
         elf,
+        elf2,
         macho,
+        macho2,
         c,
         wasm,
         spirv,
+        spork8,
         plan9,
-        goff,
-        xcoff,
         lld,
         quakec,
 
@@ -1126,37 +1370,38 @@ pub const File = struct {
             return switch (tag) {
                 .coff => Coff,
                 .elf => Elf,
+                .elf2 => Elf2,
                 .macho => MachO,
+                .macho2 => MachO2,
                 .c => C,
                 .wasm => Wasm,
-                .spirv => SpirV,
-                .goff => Goff,
-                .xcoff => Xcoff,
+                .spirv => Spirv,
                 .lld => Lld,
+                .plan9 => comptime unreachable,
+                .spork8 => Spork8,
                 .quakec => QuakeC,
-                .plan9,
-                => comptime unreachable,
             };
         }
 
-        fn fromObjectFormat(ofmt: std.Target.ObjectFormat) Tag {
+        fn fromObjectFormat(ofmt: std.Target.ObjectFormat, use_new_linker: bool) Tag {
             return switch (ofmt) {
                 .coff => .coff,
-                .elf => .elf,
-                .macho => .macho,
+                .elf => if (use_new_linker) .elf2 else .elf,
+                .macho => if (use_new_linker) .macho2 else .macho,
                 .wasm => .wasm,
                 .plan9 => .plan9,
                 .c => .c,
                 .spirv => .spirv,
-                .goff => .goff,
-                .xcoff => .xcoff,
                 .hex => @panic("TODO implement hex object format"),
-                .raw => @panic("TODO implement raw object format"),
+                // This may seem surprising at first, but with a little massaging, the spork8 linker
+                // could and probably should be generalized into a "raw linker" which is used to output
+                // bare machine code for any architecture for which a corresponding backend exists.
+                .raw => .spork8,
                 .quakec => .quakec,
             };
         }
 
-        pub fn devFeature(tag: Tag) dev.Feature {
+        fn devFeature(tag: Tag) dev.Feature {
             return @field(dev.Feature, @tagName(tag) ++ "_linker");
         }
     };
@@ -1168,22 +1413,26 @@ pub const File = struct {
         ty: InternPool.Index,
     };
 
-    pub fn determineMode(
-        output_mode: std.builtin.OutputMode,
-        link_mode: std.builtin.LinkMode,
-    ) fs.File.Mode {
+    pub fn determinePermissions(
+        output_mode: std.lang.OutputMode,
+        link_mode: std.lang.LinkMode,
+    ) Io.File.Permissions {
         // On common systems with a 0o022 umask, 0o777 will still result in a file created
         // with 0o755 permissions, but it works appropriately if the system is configured
         // more leniently. As another data point, C's fopen seems to open files with the
         // 666 mode.
-        const executable_mode = if (builtin.target.os.tag == .windows) 0 else 0o777;
+        const executable_mode: Io.File.Permissions = if (builtin.target.os.tag == .windows or std.posix.mode_t == u0)
+            .default_file
+        else
+            .fromMode(0o777);
+
         switch (output_mode) {
             .Lib => return switch (link_mode) {
                 .dynamic => executable_mode,
-                .static => fs.File.default_mode,
+                .static => .default_file,
             },
             .Exe => return executable_mode,
-            .Obj => return fs.File.default_mode,
+            .Obj => return .default_file,
         }
     }
 
@@ -1220,7 +1469,7 @@ pub const File = struct {
         nav_index: InternPool.Nav.Index,
         comptime format: []const u8,
         args: anytype,
-    ) error{ CodegenFail, OutOfMemory } {
+    ) Zcu.CodegenFailError {
         @branchHint(.cold);
         return base.comp.zcu.?.codegenFail(nav_index, format, args);
     }
@@ -1228,13 +1477,15 @@ pub const File = struct {
     pub const Lld = @import("link/Lld.zig");
     pub const C = @import("link/C.zig");
     pub const Coff = @import("link/Coff.zig");
+    pub const Spork8 = @import("link/Spork8.zig");
     pub const Elf = @import("link/Elf.zig");
+    pub const Elf2 = @import("link/Elf2.zig");
     pub const MachO = @import("link/MachO.zig");
-    pub const SpirV = @import("link/SpirV.zig");
+    pub const MachO2 = @import("link/MachO2.zig");
+    pub const Spirv = @import("link/Spirv.zig");
     pub const Wasm = @import("link/Wasm.zig");
-    pub const Goff = @import("link/Goff.zig");
-    pub const Xcoff = @import("link/Xcoff.zig");
     pub const Dwarf = @import("link/Dwarf.zig");
+    pub const Dwarf2 = @import("link/Dwarf2.zig");
     pub const QuakeC = @import("link/QuakeC.zig");
 };
 
@@ -1249,83 +1500,57 @@ pub const PrelinkTask = union(enum) {
     /// Tells the linker to load an object file by path.
     load_object: Path,
     /// Tells the linker to load a static library by path.
-    load_archive: Path,
+    load_archive: struct {
+        path: Path,
+        must_link: bool,
+    },
     /// Tells the linker to load a shared library, possibly one that is a
     /// GNU ld script.
     load_dso: Path,
-    /// Tells the linker to load an input which could be an object file,
-    /// archive, or shared library.
-    load_input: Input,
+    load_tbd: Path,
+    load_darwin_sdk_settings: Path,
 };
 pub const ZcuTask = union(enum) {
+    /// Sent once per update, as the very first `ZcuTask` in the update. Indicates that all per-file
+    /// state (e.g. `Zcu.alive_files`) is populated so can now be safely accessed by the linker.
+    files_ready,
     /// Write the constant value for a Decl to the output file.
     link_nav: InternPool.Nav.Index,
     /// Write the machine code for a function to the output file.
-    link_func: LinkFunc,
-    link_type: InternPool.Index,
-    update_line_number: InternPool.TrackedInst.Index,
-    pub fn deinit(task: ZcuTask, zcu: *const Zcu) void {
-        switch (task) {
-            .link_nav,
-            .link_type,
-            .update_line_number,
-            => {},
-            .link_func => |link_func| {
-                switch (link_func.mir.status.load(.acquire)) {
-                    .pending => unreachable, // cannot deinit until MIR done
-                    .failed => {}, // MIR not populated so doesn't need freeing
-                    .ready => link_func.mir.value.deinit(zcu),
-                }
-                zcu.gpa.destroy(link_func.mir);
-            },
-        }
-    }
-    pub const LinkFunc = struct {
-        /// This will either be a non-generic `func_decl` or a `func_instance`.
-        func: InternPool.Index,
-        /// This pointer is allocated into `gpa` and must be freed when the `ZcuTask` is processed.
-        /// The pointer is shared with the codegen worker, which will populate the MIR inside once
-        /// it has been generated. It's important that the `link_func` is queued at the same time as
-        /// the codegen job to ensure that the linker receives functions in a deterministic order,
-        /// allowing reproducible builds.
-        mir: *SharedMir,
-        /// This is not actually used by `doZcuTask`. Instead, `Queue` uses this value as a heuristic
-        /// to avoid queueing too much AIR/MIR for codegen/link at a time. Essentially, we cap the
-        /// total number of AIR bytes which are being processed at once, preventing unbounded memory
-        /// usage when AIR is produced faster than it is processed.
-        air_bytes: u32,
-
-        pub const SharedMir = struct {
-            /// This is initially `.pending`. When `value` is populated, the codegen thread will set
-            /// this to `.ready`, and alert the queue if needed. It could also end up `.failed`.
-            /// The action of storing a value (other than `.pending`) to this atomic transfers
-            /// ownership of memory assoicated with `value` to this `ZcuTask`.
-            status: std.atomic.Value(enum(u8) {
-                /// We are waiting on codegen to generate MIR (or die trying).
-                pending,
-                /// `value` is not populated and will not be populated. Just drop the task from the queue and move on.
-                failed,
-                /// `value` is populated with the MIR from the backend in use, which is not LLVM.
-                ready,
-            }),
-            /// This is `undefined` until `ready` is set to `true`. Once populated, this MIR belongs
-            /// to the `ZcuTask`, and must be `deinit`ed when it is processed. Allocated into `gpa`.
-            value: codegen.AnyMir,
-        };
-    };
+    link_func: Zcu.CodegenTaskPool.Index,
+    /// This struct/union/enum type has finished type resolution (successfully or otherwise), so the
+    /// linker can now lower debug information for this type (and any structural types which depend
+    /// on it, such as `?T`, `struct { T }`, `[2]T`, etc).
+    debug_update_container_type: struct {
+        ty: InternPool.Index,
+        success: bool,
+    },
+    debug_update_line_number: struct {
+        inst: InternPool.TrackedInst.Index,
+        line: u32,
+    },
+    lost_tracking: InternPool.TrackedInst.Index,
 };
 
 pub fn doPrelinkTask(comp: *Compilation, task: PrelinkTask) void {
+    const io = comp.io;
     const diags = &comp.link_diags;
     const base = comp.bin_file orelse {
         comp.link_prog_node.completeOne();
         return;
     };
 
+    // The guard on this assertion is a temporary hack to make the LLVM backend with LLD work with
+    // `-fincremental`. This works only because `File.Lld` does nothing in prelink.
+    // Related: https://codeberg.org/ziglang/zig/issues/32081
+    if (base.tag != .lld) {
+        assert(!base.post_prelink);
+    }
+
     var timer = comp.startTimer();
-    defer if (timer.finish()) |ns| {
-        comp.mutex.lock();
-        defer comp.mutex.unlock();
+    defer if (timer.finish(io)) |ns| {
+        comp.mutex.lockUncancelable(io);
+        defer comp.mutex.unlock(io);
         comp.time_report.?.stats.cpu_ns_link += ns;
     };
 
@@ -1335,13 +1560,13 @@ pub fn doPrelinkTask(comp: *Compilation, task: PrelinkTask) void {
             defer prog_node.end();
             for (comp.link_inputs) |input| {
                 base.loadInput(input) catch |err| switch (err) {
-                    error.LinkFailure => return, // error reported via diags
+                    error.AlreadyReported => return, // error reported via diags
                     else => |e| switch (input) {
-                        .dso => |dso| diags.addParseError(dso.path, "failed to parse shared library: {s}", .{@errorName(e)}),
-                        .object => |obj| diags.addParseError(obj.path, "failed to parse object: {s}", .{@errorName(e)}),
-                        .archive => |obj| diags.addParseError(obj.path, "failed to parse archive: {s}", .{@errorName(e)}),
-                        .res => |res| diags.addParseError(res.path, "failed to parse Windows resource: {s}", .{@errorName(e)}),
-                        .dso_exact => diags.addError("failed to handle dso_exact: {s}", .{@errorName(e)}),
+                        .dso => |dso| diags.addParseError(dso.path, "failed to parse shared library: {t}", .{e}),
+                        .tbd => |tbd| diags.addParseError(tbd.path, "failed to parse tbd: {t}", .{e}),
+                        .object => |obj| diags.addParseError(obj.path, "failed to parse object: {t}", .{e}),
+                        .archive => |obj| diags.addParseError(obj.path, "failed to parse archive: {t}", .{e}),
+                        .res => |res| diags.addParseError(res.path, "failed to parse Windows resource: {t}", .{e}),
                     },
                 };
                 prog_node.completeOne();
@@ -1353,40 +1578,79 @@ pub fn doPrelinkTask(comp: *Compilation, task: PrelinkTask) void {
 
             const target = &comp.root_mod.resolved_target.result;
             const flags = target_util.libcFullLinkFlags(target);
-            const crt_dir = comp.libc_installation.?.crt_dir.?;
+            const libc_installation = comp.libc_installation.?;
+            const crt_dir = libc_installation.crt_dir.?;
             const sep = std.fs.path.sep_str;
             for (flags) |flag| {
                 assert(mem.startsWith(u8, flag, "-l"));
                 const lib_name = flag["-l".len..];
                 switch (comp.config.link_mode) {
-                    .dynamic => {
-                        const dso_path = Path.initCwd(
-                            std.fmt.allocPrint(comp.arena, "{s}" ++ sep ++ "{s}{s}{s}", .{
-                                crt_dir, target.libPrefix(), lib_name, target.dynamicLibSuffix(),
-                            }) catch return diags.setAllocFailure(),
-                        );
-                        base.openLoadDso(dso_path, .{
+                    .dynamic => loaded: {
+                        if (target.os.tag.isDarwin()) {
+                            // Prefer .tbd over .dylib.
+                            const tbd_path: Path = .initCwd(std.fmt.allocPrint(
+                                comp.arena,
+                                "{s}" ++ sep ++ "{s}{s}.tbd",
+                                .{ crt_dir, target.libPrefix(), lib_name },
+                            ) catch return diags.setAllocFailure());
+                            if (tbd_path.root_dir.handle.openFile(io, tbd_path.sub_path, .{})) |file| {
+                                errdefer file.close(io);
+                                base.loadInput(.{ .tbd = .{
+                                    .path = tbd_path,
+                                    .file = file,
+                                    .needed = false,
+                                    .weak = false,
+                                    .reexport = false,
+                                } }) catch |err| switch (err) {
+                                    error.AlreadyReported => return,
+                                    error.Canceled => io.recancel(),
+                                    else => |e| diags.addParseError(tbd_path, "failed to parse tbd: {t}", .{e}),
+                                };
+                                break :loaded;
+                            } else |err| switch (err) {
+                                error.FileNotFound => {},
+                                error.Canceled => io.recancel(),
+                                else => |e| diags.addParseError(tbd_path, "failed to parse tbd: {t}", .{e}),
+                            }
+                        }
+
+                        // Try dynamic library.
+                        const dso_path: Path = .initCwd(std.fmt.allocPrint(
+                            comp.arena,
+                            "{s}" ++ sep ++ "{s}{s}{s}",
+                            .{ crt_dir, target.libPrefix(), lib_name, target.dynamicLibSuffix() },
+                        ) catch return diags.setAllocFailure());
+                        if (base.openLoadDso(dso_path, .{
                             .preferred_mode = .dynamic,
                             .search_strategy = .paths_first,
-                        }) catch |err| switch (err) {
-                            error.FileNotFound => {
-                                // Also try static.
-                                const archive_path = Path.initCwd(
-                                    std.fmt.allocPrint(comp.arena, "{s}" ++ sep ++ "{s}{s}{s}", .{
-                                        crt_dir, target.libPrefix(), lib_name, target.staticLibSuffix(),
-                                    }) catch return diags.setAllocFailure(),
-                                );
-                                base.openLoadArchive(archive_path, .{
-                                    .preferred_mode = .dynamic,
-                                    .search_strategy = .paths_first,
-                                }) catch |archive_err| switch (archive_err) {
-                                    error.LinkFailure => return, // error reported via diags
-                                    else => |e| diags.addParseError(dso_path, "failed to parse archive {f}: {s}", .{ archive_path, @errorName(e) }),
-                                };
-                            },
-                            error.LinkFailure => return, // error reported via diags
+                        })) {
+                            break :loaded;
+                        } else |err| switch (err) {
+                            error.FileNotFound => {},
+                            error.AlreadyReported => return,
+                            error.Canceled => io.recancel(),
                             else => |e| diags.addParseError(dso_path, "failed to parse shared library: {s}", .{@errorName(e)}),
-                        };
+                        }
+
+                        // Also try static.
+                        const archive_path = Path.initCwd(
+                            std.fmt.allocPrint(comp.arena, "{s}" ++ sep ++ "{s}{s}{s}", .{
+                                crt_dir, target.libPrefix(), lib_name, target.staticLibSuffix(),
+                            }) catch return diags.setAllocFailure(),
+                        );
+                        if (base.openLoadArchiveQuery(archive_path, .{
+                            .preferred_mode = .dynamic,
+                            .search_strategy = .paths_first,
+                        })) {
+                            break :loaded;
+                        } else |archive_err| switch (archive_err) {
+                            error.FileNotFound => {},
+                            error.AlreadyReported => return,
+                            error.Canceled => io.recancel(),
+                            else => |e| diags.addParseError(archive_path, "failed to parse archive: {s}", .{@errorName(e)}),
+                        }
+
+                        diags.addError("failed to find library '{s}'", .{lib_name});
                     },
                     .static => {
                         const path = Path.initCwd(
@@ -1395,14 +1659,75 @@ pub fn doPrelinkTask(comp: *Compilation, task: PrelinkTask) void {
                             }) catch return diags.setAllocFailure(),
                         );
                         // glibc sometimes makes even archive files GNU ld scripts.
-                        base.openLoadArchive(path, .{
+                        base.openLoadArchiveQuery(path, .{
                             .preferred_mode = .static,
                             .search_strategy = .no_fallback,
                         }) catch |err| switch (err) {
-                            error.LinkFailure => return, // error reported via diags
+                            error.AlreadyReported => return, // error reported via diags
                             else => |e| diags.addParseError(path, "failed to parse archive: {s}", .{@errorName(e)}),
                         };
                     },
+                }
+            }
+
+            if (target.os.tag.isDarwin()) {
+                const sdk_settings_path: Path = .initCwd(std.fmt.allocPrint(
+                    comp.arena,
+                    "{s}" ++ sep ++ "SDKSettings.json",
+                    .{libc_installation.darwin_sdk_dir.?},
+                ) catch return diags.setAllocFailure());
+                base.loadDarwinSdkSettings(sdk_settings_path) catch |err| switch (err) {
+                    error.OutOfMemory => return diags.setAllocFailure(),
+                    error.Canceled => return io.recancel(),
+                    error.AlreadyReported => return,
+                };
+            }
+
+            if (target.os.tag == .windows and target.abi == .msvc) {
+                const inputs: []const struct {
+                    dir: enum { crt, msvc_lib, kernel32_lib },
+                    name: []const u8,
+                } = switch (comp.config.link_mode) {
+                    .dynamic => &.{
+                        .{ .dir = .msvc_lib, .name = "msvcrt.lib" },
+                        .{ .dir = .msvc_lib, .name = "vcruntime.lib" },
+                        .{ .dir = .msvc_lib, .name = "legacy_stdio_definitions.lib" },
+                        .{ .dir = .crt, .name = "ucrt.lib" },
+                        .{ .dir = .kernel32_lib, .name = "kernel32.lib" },
+                        .{ .dir = .kernel32_lib, .name = "ntdll.lib" },
+                    },
+                    .static => &.{
+                        .{ .dir = .msvc_lib, .name = "libcmt.lib" },
+                        .{ .dir = .msvc_lib, .name = "libvcruntime.lib" },
+                        .{ .dir = .msvc_lib, .name = "legacy_stdio_definitions.lib" },
+                        .{ .dir = .crt, .name = "libucrt.lib" },
+                        .{ .dir = .kernel32_lib, .name = "kernel32.lib" },
+                        .{ .dir = .kernel32_lib, .name = "ntdll.lib" },
+                    },
+                };
+
+                for (inputs) |lib| {
+                    const path = Path.initCwd(
+                        std.fmt.allocPrint(comp.arena, "{s}" ++ sep ++ "{s}", .{
+                            switch (lib.dir) {
+                                .crt => crt_dir,
+                                .msvc_lib => libc_installation.msvc_lib_dir.?,
+                                .kernel32_lib => libc_installation.kernel32_lib_dir.?,
+                            },
+                            lib.name,
+                        }) catch return diags.setAllocFailure(),
+                    );
+                    if (std.mem.endsWith(u8, lib.name, "lib")) {
+                        base.openLoadArchive(path, false) catch |err| switch (err) {
+                            error.LinkFailure => return, // error reported via diags
+                            else => |e| diags.addParseError(path, "failed to parse archive: {s}", .{@errorName(e)}),
+                        };
+                    } else {
+                        base.openLoadObject(path) catch |err| switch (err) {
+                            error.LinkFailure => return, // error reported via diags
+                            else => |e| diags.addParseError(path, "failed to parse object: {s}", .{@errorName(e)}),
+                        };
+                    }
                 }
             }
         },
@@ -1410,16 +1735,16 @@ pub fn doPrelinkTask(comp: *Compilation, task: PrelinkTask) void {
             const prog_node = comp.link_prog_node.start("Parse Object", 0);
             defer prog_node.end();
             base.openLoadObject(path) catch |err| switch (err) {
-                error.LinkFailure => return, // error reported via diags
+                error.AlreadyReported => return, // error reported via diags
                 else => |e| diags.addParseError(path, "failed to parse object: {s}", .{@errorName(e)}),
             };
         },
-        .load_archive => |path| {
+        .load_archive => |load_archive| {
             const prog_node = comp.link_prog_node.start("Parse Archive", 0);
             defer prog_node.end();
-            base.openLoadArchive(path, null) catch |err| switch (err) {
-                error.LinkFailure => return, // error reported via link_diags
-                else => |e| diags.addParseError(path, "failed to parse archive: {s}", .{@errorName(e)}),
+            base.openLoadArchive(load_archive.path, load_archive.must_link) catch |err| switch (err) {
+                error.AlreadyReported => return, // error reported via link_diags
+                else => |e| diags.addParseError(load_archive.path, "failed to parse archive: {s}", .{@errorName(e)}),
             };
         },
         .load_dso => |path| {
@@ -1429,37 +1754,66 @@ pub fn doPrelinkTask(comp: *Compilation, task: PrelinkTask) void {
                 .preferred_mode = .dynamic,
                 .search_strategy = .paths_first,
             }) catch |err| switch (err) {
-                error.LinkFailure => return, // error reported via link_diags
+                error.AlreadyReported => return, // error reported via link_diags
                 else => |e| diags.addParseError(path, "failed to parse shared library: {s}", .{@errorName(e)}),
             };
         },
-        .load_input => |input| {
-            const prog_node = comp.link_prog_node.start("Parse Input", 0);
+        .load_tbd => |path| {
+            const prog_node = comp.link_prog_node.start("Parse Shared Library Stub", 0);
             defer prog_node.end();
-            base.loadInput(input) catch |err| switch (err) {
-                error.LinkFailure => return, // error reported via link_diags
-                else => |e| {
-                    if (input.path()) |path| {
-                        diags.addParseError(path, "failed to parse linker input: {s}", .{@errorName(e)});
-                    } else {
-                        diags.addError("failed to {s}: {s}", .{ input.taskName(), @errorName(e) });
-                    }
-                },
+            if (path.root_dir.handle.openFile(io, path.sub_path, .{})) |file| {
+                errdefer file.close(io);
+                base.loadInput(.{ .tbd = .{
+                    .path = path,
+                    .file = file,
+                    .needed = false,
+                    .weak = false,
+                    .reexport = false,
+                } }) catch |err| switch (err) {
+                    error.AlreadyReported => return,
+                    error.Canceled => io.recancel(),
+                    else => |e| diags.addParseError(path, "failed to parse tbd: {t}", .{e}),
+                };
+            } else |err| switch (err) {
+                error.FileNotFound => {},
+                error.Canceled => io.recancel(),
+                else => |e| diags.addParseError(path, "failed to parse tbd: {t}", .{e}),
+            }
+        },
+        .load_darwin_sdk_settings => |path| {
+            const prog_node = comp.link_prog_node.start("Parse SDK Settings", 0);
+            defer prog_node.end();
+            base.loadDarwinSdkSettings(path) catch |err| switch (err) {
+                error.OutOfMemory => return diags.setAllocFailure(),
+                error.Canceled => return io.recancel(),
+                error.AlreadyReported => return,
             };
         },
     }
 }
-pub fn doZcuTask(comp: *Compilation, tid: usize, task: ZcuTask) void {
+pub fn doZcuTask(comp: *Compilation, tid: Zcu.PerThread.Id, task: ZcuTask) void {
+    const io = comp.io;
     const diags = &comp.link_diags;
     const zcu = comp.zcu.?;
     const ip = &zcu.intern_pool;
-    const pt: Zcu.PerThread = .activate(zcu, @enumFromInt(tid));
-    defer pt.deactivate();
+    const active = zcu.activate(tid);
+    defer active.deactivate();
+    const pt = active.pt;
 
     var timer = comp.startTimer();
 
-    switch (task) {
-        .link_nav => |nav_index| {
+    const maybe_nav: ?InternPool.Nav.Index = switch (task) {
+        .files_ready => {
+            if (zcu.llvm_object != null) return;
+            const lf = comp.bin_file orelse return;
+            lf.zcuFilesReady(zcu) catch |err| switch (err) {
+                error.Canceled => io.recancel(),
+                error.AlreadyReported => return,
+                error.OutOfMemory => return diags.setAllocFailure(),
+            };
+            return;
+        },
+        .link_nav => |nav_index| nav: {
             const fqn_slice = ip.getNav(nav_index).fqn.toSlice(ip);
             const nav_prog_node = comp.link_prog_node.start(fqn_slice, 0);
             defer nav_prog_node.end();
@@ -1469,82 +1823,90 @@ pub fn doZcuTask(comp: *Compilation, tid: usize, task: ZcuTask) void {
                 };
             } else if (comp.bin_file) |lf| {
                 lf.updateNav(pt, nav_index) catch |err| switch (err) {
+                    error.Canceled => io.recancel(),
+                    error.AlreadyReported => return,
                     error.OutOfMemory => diags.setAllocFailure(),
-                    error.CodegenFail => zcu.assertCodegenFailed(nav_index),
-                    error.Overflow, error.RelocationNotByteAligned => {
-                        switch (zcu.codegenFail(nav_index, "unable to codegen: {s}", .{@errorName(err)})) {
-                            error.CodegenFail => return,
-                            error.OutOfMemory => return diags.setAllocFailure(),
-                        }
-                        // Not a retryable failure.
-                    },
                 };
             }
+            break :nav nav_index;
         },
-        .link_func => |func| {
-            const nav = zcu.funcInfo(func.func).owner_nav;
+        .link_func => |codegen_task| nav: {
+            timer.pause(io);
+            const func, var mir = codegen_task.wait(&zcu.codegen_task_pool, zcu) catch |err| switch (err) {
+                error.Canceled, error.AlreadyReported => {
+                    comp.link_prog_node.completeOne();
+                    return;
+                },
+            };
+            defer mir.deinit(zcu);
+            timer.@"resume"(io);
+
+            const nav = zcu.funcInfo(func).owner_nav;
             const fqn_slice = ip.getNav(nav).fqn.toSlice(ip);
+
             const nav_prog_node = comp.link_prog_node.start(fqn_slice, 0);
             defer nav_prog_node.end();
-            switch (func.mir.status.load(.acquire)) {
-                .pending => unreachable,
-                .ready => {},
-                .failed => return,
-            }
+
             assert(zcu.llvm_object == null); // LLVM codegen doesn't produce MIR
-            const mir = &func.mir.value;
             if (comp.bin_file) |lf| {
-                lf.updateFunc(pt, func.func, mir) catch |err| switch (err) {
+                lf.updateFunc(pt, func, &mir) catch |err| switch (err) {
+                    error.Canceled => io.recancel(),
+                    error.AlreadyReported => return,
                     error.OutOfMemory => return diags.setAllocFailure(),
-                    error.CodegenFail => return zcu.assertCodegenFailed(nav),
-                    error.Overflow, error.RelocationNotByteAligned => {
-                        switch (zcu.codegenFail(nav, "unable to codegen: {s}", .{@errorName(err)})) {
-                            error.OutOfMemory => return diags.setAllocFailure(),
-                            error.CodegenFail => return,
-                        }
-                    },
                 };
             }
+            break :nav ip.indexToKey(func).func.owner_nav;
         },
-        .link_type => |ty| {
-            const name = Type.fromInterned(ty).containerTypeName(ip).toSlice(ip);
-            const nav_prog_node = comp.link_prog_node.start(name, 0);
-            defer nav_prog_node.end();
-            if (zcu.llvm_object == null) {
-                if (comp.bin_file) |lf| {
-                    lf.updateContainerType(pt, ty) catch |err| switch (err) {
-                        error.OutOfMemory => diags.setAllocFailure(),
-                        error.TypeFailureReported => assert(zcu.failed_types.contains(ty)),
-                    };
-                }
-            }
+        .debug_update_container_type => |container_update| nav: {
+            const fqn = Type.fromInterned(container_update.ty).containerTypeName(ip).fqn.toSlice(ip);
+            const ty_prog_node = comp.link_prog_node.start(fqn, 0);
+            defer ty_prog_node.end();
+            (if (zcu.llvm_object) |llvm_object|
+                llvm_object.updateContainerType(pt, container_update.ty, container_update.success)
+            else if (comp.bin_file) |lf|
+                lf.updateContainerType(pt, container_update.ty, container_update.success)) catch |err| switch (err) {
+                error.OutOfMemory => diags.setAllocFailure(),
+                error.Canceled => io.recancel(),
+                error.AlreadyReported => {},
+            };
+            break :nav null;
         },
-        .update_line_number => |ti| {
+        .debug_update_line_number => |line_update| nav: {
             const nav_prog_node = comp.link_prog_node.start("Update line number", 0);
             defer nav_prog_node.end();
             if (pt.zcu.llvm_object == null) {
                 if (comp.bin_file) |lf| {
-                    lf.updateLineNumber(pt, ti) catch |err| switch (err) {
+                    lf.updateLineNumber(pt, line_update.inst, line_update.line) catch |err| switch (err) {
                         error.OutOfMemory => diags.setAllocFailure(),
-                        else => |e| log.err("update line number failed: {s}", .{@errorName(e)}),
+                        else => |e| log.err("update line number failed: {t}", .{e}),
                     };
                 }
             }
+            break :nav null;
         },
-    }
+        .lost_tracking => |ti| nav: {
+            const nav_prog_node = comp.link_prog_node.start("Lost tracking", 0);
+            defer nav_prog_node.end();
+            if (pt.zcu.llvm_object == null) {
+                if (comp.bin_file) |lf| {
+                    lf.lostTracking(pt, ti) catch |err| switch (err) {
+                        error.OutOfMemory => diags.setAllocFailure(),
+                        else => |e| log.err("lost tracking failed: {t}", .{e}),
+                    };
+                }
+            }
+            break :nav null;
+        },
+    };
 
-    if (timer.finish()) |ns_link| report_time: {
-        const zir_decl: ?InternPool.TrackedInst.Index = switch (task) {
-            .link_type, .update_line_number => null,
-            .link_nav => |nav| ip.getNav(nav).srcInst(ip),
-            .link_func => |f| ip.getNav(ip.indexToKey(f.func).func.owner_nav).srcInst(ip),
-        };
-        comp.mutex.lock();
-        defer comp.mutex.unlock();
+    if (timer.finish(io)) |ns_link| report_time: {
+        comp.mutex.lockUncancelable(io);
+        defer comp.mutex.unlock(io);
         const tr = &zcu.comp.time_report.?;
         tr.stats.cpu_ns_link += ns_link;
-        if (zir_decl) |inst| {
-            const gop = tr.decl_link_ns.getOrPut(zcu.gpa, inst) catch |err| switch (err) {
+        if (maybe_nav) |nav| {
+            const zir_decl = ip.getNav(nav).srcInst(ip);
+            const gop = tr.decl_link_ns.getOrPut(zcu.gpa, zir_decl) catch |err| switch (err) {
                 error.OutOfMemory => {
                     zcu.comp.setAllocFailure();
                     break :report_time;
@@ -1554,6 +1916,9 @@ pub fn doZcuTask(comp: *Compilation, tid: usize, task: ZcuTask) void {
             gop.value_ptr.* += ns_link;
         }
     }
+}
+pub fn doIdleTask(comp: *Compilation) Error!bool {
+    return if (comp.bin_file) |lf| lf.idle() else false;
 }
 /// After the main pipeline is done, but before flush, the compilation may need to link one final
 /// `Nav` into the binary: the `builtin.test_functions` value. Since the link thread isn't running
@@ -1568,17 +1933,19 @@ pub fn linkTestFunctionsNav(pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) 
         };
     } else if (comp.bin_file) |lf| {
         lf.updateNav(pt, nav_index) catch |err| switch (err) {
+            error.Canceled => comp.io.recancel(),
+            error.AlreadyReported => return,
             error.OutOfMemory => diags.setAllocFailure(),
-            error.CodegenFail => zcu.assertCodegenFailed(nav_index),
-            error.Overflow, error.RelocationNotByteAligned => {
-                switch (zcu.codegenFail(nav_index, "unable to codegen: {s}", .{@errorName(err)})) {
-                    error.CodegenFail => return,
-                    error.OutOfMemory => return diags.setAllocFailure(),
-                }
-                // Not a retryable failure.
-            },
         };
     }
+}
+pub fn updateErrorData(pt: Zcu.PerThread) void {
+    const comp = pt.zcu.comp;
+    if (comp.bin_file) |lf| lf.updateErrorData(pt) catch |err| switch (err) {
+        error.OutOfMemory => comp.link_diags.setAllocFailure(),
+        error.Canceled => comp.io.recancel(),
+        error.AlreadyReported => {},
+    };
 }
 
 /// Provided by the CLI, processed into `LinkInput` instances at the start of
@@ -1595,17 +1962,24 @@ pub const UnresolvedInput = union(enum) {
     path_query: PathQuery,
     /// Strings that come from GNU ld scripts. Is it a filename? Is it a path?
     /// Who knows! Fuck around and find out.
-    ambiguous_name: NameQuery,
-    /// Put exactly this string in the dynamic section, no rpath.
-    dso_exact: Input.DsoExact,
+    ambiguous_name: AmbiguousNameQuery,
+    framework_query: FrameworkQuery,
 
     pub const NameQuery = struct {
         name: []const u8,
         query: Query,
+        // Corresponds to GNU ld `-l :path/to/filename`, meaning that `name` is a path relative to
+        // the library search path rather than just a library name.
+        name_done: bool,
     };
 
     pub const PathQuery = struct {
         path: Path,
+        query: Query,
+    };
+
+    pub const AmbiguousNameQuery = struct {
+        name: []const u8,
         query: Query,
     };
 
@@ -1616,16 +1990,22 @@ pub const UnresolvedInput = union(enum) {
         must_link: bool = false,
         hidden: bool = false,
         allow_so_scripts: bool = false,
-        preferred_mode: std.builtin.LinkMode,
+        preferred_mode: std.lang.LinkMode,
         search_strategy: SearchStrategy,
 
-        fn fallbackMode(q: Query) std.builtin.LinkMode {
+        fn fallbackMode(q: Query) std.lang.LinkMode {
             assert(q.search_strategy != .no_fallback);
             return switch (q.preferred_mode) {
                 .dynamic => .static,
                 .static => .dynamic,
             };
         }
+    };
+
+    pub const FrameworkQuery = struct {
+        name: []const u8,
+        needed: bool,
+        weak: bool,
     };
 
     pub const SearchStrategy = enum {
@@ -1642,57 +2022,58 @@ pub const Input = union(enum) {
     /// May not be a GNU ld script. Those are resolved when converting from
     /// `UnresolvedInput` to `Input` values.
     dso: Dso,
-    dso_exact: DsoExact,
+    /// Only possible when targeting Darwin.
+    tbd: Tbd,
 
     pub const Object = struct {
         path: Path,
-        file: fs.File,
+        file: Io.File,
         must_link: bool,
         hidden: bool,
     };
 
     pub const Res = struct {
         path: Path,
-        file: fs.File,
+        file: Io.File,
     };
 
     pub const Dso = struct {
         path: Path,
-        file: fs.File,
+        file: Io.File,
+        needed: bool,
+        weak: bool,
+        reexport: bool,
+        fallback_soname: FallbackSoname,
+
+        pub const FallbackSoname = enum { basename, full_path };
+    };
+
+    pub const Tbd = struct {
+        path: Path,
+        file: Io.File,
         needed: bool,
         weak: bool,
         reexport: bool,
     };
 
-    pub const DsoExact = struct {
-        /// Includes the ":" prefix. This is intended to be put into the DSO
-        /// section verbatim with no corresponding rpaths.
-        name: []const u8,
-    };
-
-    /// Returns `null` in the case of `dso_exact`.
-    pub fn path(input: Input) ?Path {
+    pub fn path(input: Input) Path {
         return switch (input) {
             .object, .archive => |obj| obj.path,
-            inline .res, .dso => |x| x.path,
-            .dso_exact => null,
+            inline .res, .dso, .tbd => |x| x.path,
         };
     }
 
-    /// Returns `null` in the case of `dso_exact`.
-    pub fn pathAndFile(input: Input) ?struct { Path, fs.File } {
+    pub fn pathAndFile(input: Input) struct { Path, Io.File } {
         return switch (input) {
             .object, .archive => |obj| .{ obj.path, obj.file },
-            inline .res, .dso => |x| .{ x.path, x.file },
-            .dso_exact => null,
+            inline .res, .dso, .tbd => |x| .{ x.path, x.file },
         };
     }
 
     pub fn taskName(input: Input) []const u8 {
         return switch (input) {
             .object, .archive => |obj| obj.path.basename(),
-            inline .res, .dso => |x| x.path.basename(),
-            .dso_exact => "dso_exact",
+            inline .res, .dso, .tbd => |x| x.path.basename(),
         };
     }
 };
@@ -1702,21 +2083,37 @@ pub fn hashInputs(man: *Cache.Manifest, link_inputs: []const Input) !void {
         man.hash.add(@as(@typeInfo(Input).@"union".tag_type.?, link_input));
         switch (link_input) {
             .object, .archive => |obj| {
-                _ = try man.addOpenedFile(obj.path, obj.file, null);
+                _ = try man.addInputPath(obj.path, .{
+                    .handle = .{ .file = obj.file },
+                    .request_handle = true,
+                });
                 man.hash.add(obj.must_link);
                 man.hash.add(obj.hidden);
             },
             .res => |res| {
-                _ = try man.addOpenedFile(res.path, res.file, null);
+                _ = try man.addInputPath(res.path, .{
+                    .handle = .{ .file = res.file },
+                    .request_handle = true,
+                });
             },
             .dso => |dso| {
-                _ = try man.addOpenedFile(dso.path, dso.file, null);
+                _ = try man.addInputPath(dso.path, .{
+                    .handle = .{ .file = dso.file },
+                    .request_handle = true,
+                });
                 man.hash.add(dso.needed);
                 man.hash.add(dso.weak);
                 man.hash.add(dso.reexport);
+                man.hash.add(dso.fallback_soname);
             },
-            .dso_exact => |dso_exact| {
-                man.hash.addBytes(dso_exact.name);
+            .tbd => |tbd| {
+                _ = try man.addInputPath(tbd.path, .{
+                    .handle = .{ .file = tbd.file },
+                    .request_handle = true,
+                });
+                man.hash.add(tbd.needed);
+                man.hash.add(tbd.weak);
+                man.hash.add(tbd.reexport);
             },
         }
     }
@@ -1725,26 +2122,38 @@ pub fn hashInputs(man: *Cache.Manifest, link_inputs: []const Input) !void {
 pub fn resolveInputs(
     gpa: Allocator,
     arena: Allocator,
+    io: Io,
     target: *const std.Target,
     /// This function mutates this array but does not take ownership.
     /// Allocated with `gpa`.
-    unresolved_inputs: *std.ArrayListUnmanaged(UnresolvedInput),
+    unresolved_inputs: *std.ArrayList(UnresolvedInput),
     /// Allocated with `gpa`.
-    resolved_inputs: *std.ArrayListUnmanaged(Input),
+    resolved_inputs: *std.ArrayList(Input),
     lib_directories: []const Cache.Directory,
+    framework_directories: []const Cache.Directory,
     color: std.zig.Color,
 ) Allocator.Error!void {
-    var checked_paths: std.ArrayListUnmanaged(u8) = .empty;
+    var checked_paths: std.ArrayList(u8) = .empty;
     defer checked_paths.deinit(gpa);
 
-    var ld_script_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    var ld_script_bytes: std.ArrayList(u8) = .empty;
     defer ld_script_bytes.deinit(gpa);
 
-    var failed_libs: std.ArrayListUnmanaged(struct {
+    var archive_dedup: ArchiveDedupMap = .empty;
+    defer archive_dedup.deinit(gpa);
+
+    // Allocated with `arena`.
+    var failed_libs: std.ArrayList(struct {
         name: []const u8,
         strategy: UnresolvedInput.SearchStrategy,
         checked_paths: []const u8,
-        preferred_mode: std.builtin.LinkMode,
+        preferred_mode: std.lang.LinkMode,
+    }) = .empty;
+
+    // Allocated with `arena`.
+    var failed_frameworks: std.ArrayList(struct {
+        name: []const u8,
+        checked_paths: []const u8,
     }) = .empty;
 
     // Convert external system libs into a stack so that items can be
@@ -1763,7 +2172,7 @@ pub fn resolveInputs(
             .name_query => |name_query| {
                 const query = name_query.query;
 
-                // Checked in the first pass above while looking for libc libraries.
+                // Checked in the first pass in `main.zig` while looking for libc libraries.
                 assert(!fs.path.isAbsolute(name_query.name));
 
                 checked_paths.clearRetainingCapacity();
@@ -1774,10 +2183,12 @@ pub fn resolveInputs(
                         for (lib_directories) |lib_directory| switch (try resolveLibInput(
                             gpa,
                             arena,
+                            io,
                             unresolved_inputs,
                             resolved_inputs,
                             &checked_paths,
                             &ld_script_bytes,
+                            &archive_dedup,
                             lib_directory,
                             name_query,
                             target,
@@ -1800,10 +2211,12 @@ pub fn resolveInputs(
                         for (lib_directories) |lib_directory| switch (try resolveLibInput(
                             gpa,
                             arena,
+                            io,
                             unresolved_inputs,
                             resolved_inputs,
                             &checked_paths,
                             &ld_script_bytes,
+                            &archive_dedup,
                             lib_directory,
                             name_query,
                             target,
@@ -1827,10 +2240,12 @@ pub fn resolveInputs(
                             switch (try resolveLibInput(
                                 gpa,
                                 arena,
+                                io,
                                 unresolved_inputs,
                                 resolved_inputs,
                                 &checked_paths,
                                 &ld_script_bytes,
+                                &archive_dedup,
                                 lib_directory,
                                 name_query,
                                 target,
@@ -1845,10 +2260,12 @@ pub fn resolveInputs(
                             switch (try resolveLibInput(
                                 gpa,
                                 arena,
+                                io,
                                 unresolved_inputs,
                                 resolved_inputs,
                                 &checked_paths,
                                 &ld_script_bytes,
+                                &archive_dedup,
                                 lib_directory,
                                 name_query,
                                 target,
@@ -1876,9 +2293,11 @@ pub fn resolveInputs(
                 if (try resolvePathInput(
                     gpa,
                     arena,
+                    io,
                     unresolved_inputs,
                     resolved_inputs,
                     &ld_script_bytes,
+                    &archive_dedup,
                     target,
                     .{
                         .path = Path.initCwd(an.name),
@@ -1893,9 +2312,11 @@ pub fn resolveInputs(
                                 switch ((try resolvePathInput(
                                     gpa,
                                     arena,
+                                    io,
                                     unresolved_inputs,
                                     resolved_inputs,
                                     &ld_script_bytes,
+                                    &archive_dedup,
                                     target,
                                     .{
                                         .path = .{
@@ -1920,9 +2341,11 @@ pub fn resolveInputs(
                 if (try resolvePathInput(
                     gpa,
                     arena,
+                    io,
                     unresolved_inputs,
                     resolved_inputs,
                     &ld_script_bytes,
+                    &archive_dedup,
                     target,
                     pq,
                     color,
@@ -1934,19 +2357,45 @@ pub fn resolveInputs(
                 }
                 continue;
             },
-            .dso_exact => |dso_exact| {
-                try resolved_inputs.append(gpa, .{ .dso_exact = dso_exact });
-                continue;
+            .framework_query => |framework_query| {
+                checked_paths.clearRetainingCapacity();
+                for (framework_directories) |framework_directory| {
+                    switch (try resolveFrameworkInput(
+                        gpa,
+                        arena,
+                        io,
+                        resolved_inputs,
+                        &checked_paths,
+                        &ld_script_bytes,
+                        &archive_dedup,
+                        framework_directory,
+                        framework_query,
+                    )) {
+                        .ok => continue :syslib,
+                        .no_match => {},
+                    }
+                }
+                try failed_frameworks.append(arena, .{
+                    .name = framework_query.name,
+                    .checked_paths = try arena.dupe(u8, checked_paths.items),
+                });
+                continue :syslib;
             },
         }
-        @compileError("unreachable");
+        comptime unreachable;
     }
 
-    if (failed_libs.items.len > 0) {
+    if (failed_libs.items.len > 0 or failed_frameworks.items.len > 0) {
         for (failed_libs.items) |f| {
             const searched_paths = if (f.checked_paths.len == 0) " none" else f.checked_paths;
-            std.log.err("unable to find {s} system library '{s}' using strategy '{s}'. searched paths:{s}", .{
-                @tagName(f.preferred_mode), f.name, @tagName(f.strategy), searched_paths,
+            std.log.err("unable to find {t} system library {q} using strategy {t}. searched paths:{s}", .{
+                f.preferred_mode, f.name, f.strategy, searched_paths,
+            });
+        }
+        for (failed_frameworks.items) |f| {
+            const searched_paths = if (f.checked_paths.len == 0) " none" else f.checked_paths;
+            std.log.err("unable to find system framework {q}. searched paths:{s}", .{
+                f.name, searched_paths,
             });
         }
         std.process.exit(1);
@@ -1959,54 +2408,67 @@ const fatal = std.process.fatal;
 fn resolveLibInput(
     gpa: Allocator,
     arena: Allocator,
+    io: Io,
     /// Allocated via `gpa`.
-    unresolved_inputs: *std.ArrayListUnmanaged(UnresolvedInput),
+    unresolved_inputs: *std.ArrayList(UnresolvedInput),
     /// Allocated via `gpa`.
-    resolved_inputs: *std.ArrayListUnmanaged(Input),
+    resolved_inputs: *std.ArrayList(Input),
     /// Allocated via `gpa`.
-    checked_paths: *std.ArrayListUnmanaged(u8),
+    checked_paths: *std.ArrayList(u8),
     /// Allocated via `gpa`.
-    ld_script_bytes: *std.ArrayListUnmanaged(u8),
+    ld_script_bytes: *std.ArrayList(u8),
+    /// Allocated via `gpa`.
+    archive_dedup: *ArchiveDedupMap,
     lib_directory: Directory,
     name_query: UnresolvedInput.NameQuery,
     target: *const std.Target,
-    link_mode: std.builtin.LinkMode,
+    link_mode: std.lang.LinkMode,
     color: std.zig.Color,
 ) Allocator.Error!ResolveLibInputResult {
     try resolved_inputs.ensureUnusedCapacity(gpa, 1);
+    try archive_dedup.ensureUnusedCapacity(gpa, 1);
 
     const lib_name = name_query.name;
 
-    if (target.os.tag.isDarwin() and link_mode == .dynamic) tbd: {
+    if (target.os.tag.isDarwin() and link_mode == .dynamic and !name_query.name_done) tbd: {
         // Prefer .tbd over .dylib.
         const test_path: Path = .{
             .root_dir = lib_directory,
             .sub_path = try std.fmt.allocPrint(arena, "lib{s}.tbd", .{lib_name}),
         };
-        try checked_paths.writer(gpa).print("\n  {f}", .{test_path});
-        var file = test_path.root_dir.handle.openFile(test_path.sub_path, .{}) catch |err| switch (err) {
+        try checked_paths.print(gpa, "\n  {f}", .{test_path});
+        var file = test_path.root_dir.handle.openFile(io, test_path.sub_path, .{}) catch |err| switch (err) {
             error.FileNotFound => break :tbd,
-            else => |e| fatal("unable to search for tbd library '{f}': {s}", .{ test_path, @errorName(e) }),
+            else => |e| fatal("searching for tbd library {qf}: {t}", .{ test_path, e }),
         };
-        errdefer file.close();
-        return finishResolveLibInput(resolved_inputs, test_path, file, link_mode, name_query.query);
+        errdefer file.close(io);
+        resolved_inputs.appendAssumeCapacity(.{ .tbd = .{
+            .path = test_path,
+            .file = file,
+            .needed = name_query.query.needed,
+            .weak = name_query.query.weak,
+            .reexport = name_query.query.reexport,
+        } });
+        return .ok;
     }
 
     {
         const test_path: Path = .{
             .root_dir = lib_directory,
-            .sub_path = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{
-                target.libPrefix(), lib_name, switch (link_mode) {
+            .sub_path = if (name_query.name_done) lib_name else try std.fmt.allocPrint(arena, "{s}{s}{s}", .{
+                target.libPrefix(),
+                lib_name,
+                switch (link_mode) {
                     .static => target.staticLibSuffix(),
                     .dynamic => target.dynamicLibSuffix(),
                 },
             }),
         };
-        try checked_paths.writer(gpa).print("\n  {f}", .{test_path});
-        switch (try resolvePathInputLib(gpa, arena, unresolved_inputs, resolved_inputs, ld_script_bytes, target, .{
+        try checked_paths.print(gpa, "\n  {f}", .{test_path});
+        switch (try resolvePathInputLib(gpa, arena, io, unresolved_inputs, resolved_inputs, ld_script_bytes, archive_dedup, target, .{
             .path = test_path,
             .query = name_query.query,
-        }, link_mode, color)) {
+        }, link_mode, color, .basename)) {
             .no_match => {},
             .ok => return .ok,
         }
@@ -2014,86 +2476,340 @@ fn resolveLibInput(
 
     // In the case of Darwin, the main check will be .dylib, so here we
     // additionally check for .so files.
-    if (target.os.tag.isDarwin() and link_mode == .dynamic) so: {
+    if (target.os.tag.isDarwin() and link_mode == .dynamic and !name_query.name_done) so: {
         const test_path: Path = .{
             .root_dir = lib_directory,
             .sub_path = try std.fmt.allocPrint(arena, "lib{s}.so", .{lib_name}),
         };
-        try checked_paths.writer(gpa).print("\n  {f}", .{test_path});
-        var file = test_path.root_dir.handle.openFile(test_path.sub_path, .{}) catch |err| switch (err) {
+        try checked_paths.print(gpa, "\n  {f}", .{test_path});
+        var file = test_path.root_dir.handle.openFile(io, test_path.sub_path, .{}) catch |err| switch (err) {
             error.FileNotFound => break :so,
-            else => |e| fatal("unable to search for so library '{f}': {s}", .{
-                test_path, @errorName(e),
-            }),
+            else => |e| fatal("unable to search for so library {qf}: {t}", .{ test_path, e }),
         };
-        errdefer file.close();
-        return finishResolveLibInput(resolved_inputs, test_path, file, link_mode, name_query.query);
+        errdefer file.close(io);
+        resolved_inputs.appendAssumeCapacity(.{ .dso = .{
+            .path = test_path,
+            .file = file,
+            .needed = name_query.query.needed,
+            .weak = name_query.query.weak,
+            .reexport = name_query.query.reexport,
+            .fallback_soname = .basename,
+        } });
+        return .ok;
     }
 
     // In the case of MinGW, the main check will be .lib but we also need to
     // look for `libfoo.a`.
-    if (target.isMinGW() and link_mode == .static) mingw: {
+    if (target.isMinGW() and link_mode == .static and !name_query.name_done) mingw: {
         const test_path: Path = .{
             .root_dir = lib_directory,
             .sub_path = try std.fmt.allocPrint(arena, "lib{s}.a", .{lib_name}),
         };
-        try checked_paths.writer(gpa).print("\n  {f}", .{test_path});
-        var file = test_path.root_dir.handle.openFile(test_path.sub_path, .{}) catch |err| switch (err) {
+        try checked_paths.print(gpa, "\n  {f}", .{test_path});
+        var file = test_path.root_dir.handle.openFile(io, test_path.sub_path, .{}) catch |err| switch (err) {
             error.FileNotFound => break :mingw,
-            else => |e| fatal("unable to search for static library '{f}': {s}", .{ test_path, @errorName(e) }),
+            else => |e| fatal("unable to search for static library {qf}: {t}", .{ test_path, e }),
         };
-        errdefer file.close();
-        return finishResolveLibInput(resolved_inputs, test_path, file, link_mode, name_query.query);
+        errdefer file.close(io);
+        addResolvedStaticLibInput(io, resolved_inputs, archive_dedup, .{
+            .path = test_path,
+            .file = file,
+            .must_link = name_query.query.must_link,
+            .hidden = name_query.query.hidden,
+        });
+        return .ok;
+    }
+
+    // In the case of OpenBSD, dynamic libraries are always versioned, without
+    // unversioned symlinks. OpenBSD patches LLD to select the highest-versioned
+    // shared library, and this code is intended to match that upstream behavior.
+    if (target.isOpenBSDLibC() and link_mode == .dynamic and !name_query.name_done) versioned: {
+        const prefix = try std.fmt.allocPrint(arena, "lib{s}.so.", .{lib_name});
+
+        var dir = lib_directory.handle.openDir(io, ".", .{ .iterate = true }) catch |err| switch (err) {
+            error.NotDir, error.FileNotFound => break :versioned,
+            else => |e| fatal("unable to search for shared library \"{f}.*\": {t}", .{
+                std.zig.fmtString(prefix), e,
+            }),
+        };
+        defer dir.close(io);
+
+        var best_match_major: u32 = 0;
+        var best_match_minor: u32 = 0;
+        var best_match: ?[]const u8 = null;
+
+        var iter = dir.iterate();
+        while (iter.next(io) catch |err| {
+            fatal("scanning library directory: {t}", .{err});
+        }) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
+
+            const rest = entry.name[prefix.len..];
+            var sit = std.mem.splitScalar(u8, rest, '.');
+            const major_str = sit.next() orelse continue;
+            const minor_str = sit.next() orelse continue;
+            if (sit.next() != null) continue;
+            const major = std.fmt.parseInt(u32, major_str, 10) catch continue;
+            const minor = std.fmt.parseInt(u32, minor_str, 10) catch continue;
+
+            if (major > best_match_major or (major == best_match_major and minor >= best_match_minor)) {
+                best_match_major = major;
+                best_match_minor = minor;
+                best_match = try arena.dupe(u8, entry.name);
+            }
+        }
+
+        if (best_match) |found| {
+            const test_path: Path = .{
+                .root_dir = lib_directory,
+                .sub_path = found,
+            };
+            try checked_paths.print(gpa, "\n  {f}", .{test_path});
+            switch (try resolvePathInputLib(gpa, arena, io, unresolved_inputs, resolved_inputs, ld_script_bytes, archive_dedup, target, .{
+                .path = test_path,
+                .query = name_query.query,
+            }, link_mode, color, .basename)) {
+                .no_match => {},
+                .ok => return .ok,
+            }
+        }
     }
 
     return .no_match;
 }
 
-fn finishResolveLibInput(
-    resolved_inputs: *std.ArrayListUnmanaged(Input),
-    path: Path,
-    file: std.fs.File,
-    link_mode: std.builtin.LinkMode,
-    query: UnresolvedInput.Query,
-) ResolveLibInputResult {
-    switch (link_mode) {
-        .static => resolved_inputs.appendAssumeCapacity(.{ .archive = .{
-            .path = path,
+fn resolveFrameworkInput(
+    gpa: Allocator,
+    arena: Allocator,
+    io: Io,
+    /// Allocated via `gpa`.
+    resolved_inputs: *std.ArrayList(Input),
+    /// Allocated via `gpa`.
+    checked_paths: *std.ArrayList(u8),
+    /// Allocated via `gpa`.
+    ld_script_bytes: *std.ArrayList(u8),
+    /// Allocated via `gpa`.
+    archive_dedup: *ArchiveDedupMap,
+    framework_directory: Directory,
+    framework_query: UnresolvedInput.FrameworkQuery,
+) Allocator.Error!ResolveLibInputResult {
+    try resolved_inputs.ensureUnusedCapacity(gpa, 1);
+    try archive_dedup.ensureUnusedCapacity(gpa, 1);
+
+    const sep = std.fs.path.sep_str;
+
+    tbd: {
+        const test_path: Path = .{
+            .root_dir = framework_directory,
+            .sub_path = try std.fmt.allocPrint(
+                arena,
+                "{s}.framework" ++ sep ++ "{s}.tbd",
+                .{ framework_query.name, framework_query.name },
+            ),
+        };
+        try checked_paths.print(gpa, "\n  {f}", .{test_path});
+        var file = test_path.root_dir.handle.openFile(io, test_path.sub_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => break :tbd,
+            else => |e| fatal("unable to search for tbd library {qf}: {t}", .{ test_path, e }),
+        };
+        errdefer file.close(io);
+        resolved_inputs.appendAssumeCapacity(.{ .tbd = .{
+            .path = test_path,
             .file = file,
-            .must_link = query.must_link,
-            .hidden = query.hidden,
-        } }),
-        .dynamic => resolved_inputs.appendAssumeCapacity(.{ .dso = .{
-            .path = path,
-            .file = file,
-            .needed = query.needed,
-            .weak = query.weak,
-            .reexport = query.reexport,
-        } }),
+            .needed = framework_query.needed,
+            .weak = framework_query.weak,
+            .reexport = false,
+        } });
+        return .ok;
     }
-    return .ok;
+
+    dylib: {
+        const test_path: Path = .{
+            .root_dir = framework_directory,
+            .sub_path = try std.fmt.allocPrint(
+                arena,
+                "{s}.framework" ++ sep ++ "{s}.dylib",
+                .{ framework_query.name, framework_query.name },
+            ),
+        };
+        try checked_paths.print(gpa, "\n  {f}", .{test_path});
+        var file = test_path.root_dir.handle.openFile(io, test_path.sub_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => break :dylib,
+            else => |e| fatal("unable to search for dynamic library {qf}: {t}", .{ test_path, e }),
+        };
+        errdefer file.close(io);
+        resolved_inputs.appendAssumeCapacity(.{ .dso = .{
+            .path = test_path,
+            .file = file,
+            .needed = framework_query.needed,
+            .weak = framework_query.weak,
+            .reexport = false,
+            .fallback_soname = .basename,
+        } });
+        return .ok;
+    }
+
+    ambiguous: {
+        const test_path: Path = .{
+            .root_dir = framework_directory,
+            .sub_path = try std.fmt.allocPrint(
+                arena,
+                "{s}.framework" ++ sep ++ "{s}",
+                .{ framework_query.name, framework_query.name },
+            ),
+        };
+        try checked_paths.print(gpa, "\n  {f}", .{test_path});
+        var file = test_path.root_dir.handle.openFile(io, test_path.sub_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => break :ambiguous,
+            else => |e| fatal("unable to search for framework library {qf}: {t}", .{ test_path, e }),
+        };
+        errdefer file.close(io);
+
+        const macho_magics: []const [4]u8 = &.{
+            @bitCast(std.macho.MH_MAGIC),
+            @bitCast(std.macho.MH_CIGAM),
+            @bitCast(std.macho.MH_MAGIC_64),
+            @bitCast(std.macho.MH_CIGAM_64),
+            @bitCast(std.macho.FAT_MAGIC),
+            @bitCast(std.macho.FAT_CIGAM),
+            @bitCast(std.macho.FAT_MAGIC_64),
+            @bitCast(std.macho.FAT_CIGAM_64),
+        };
+        try ld_script_bytes.resize(gpa, @max(4, std.macho.ARMAG.len));
+        const n = file.readPositionalAll(io, ld_script_bytes.items, 0) catch |err|
+            fatal("failed to read {qf}: {t}", .{ test_path, err });
+        const buf = ld_script_bytes.items[0..n];
+
+        for (macho_magics) |*macho_magic| {
+            if (mem.startsWith(u8, buf, macho_magic)) {
+                // Appears to be a Mach-O file, so a dylib.
+                resolved_inputs.appendAssumeCapacity(.{ .dso = .{
+                    .path = test_path,
+                    .file = file,
+                    .needed = framework_query.needed,
+                    .weak = framework_query.weak,
+                    .reexport = false,
+                    .fallback_soname = .basename,
+                } });
+                return .ok;
+            }
+        }
+
+        if (mem.startsWith(u8, buf, std.macho.ARMAG)) {
+            // Appears to be an archive file.
+            addResolvedStaticLibInput(io, resolved_inputs, archive_dedup, .{
+                .path = test_path,
+                .file = file,
+                .must_link = false,
+                .hidden = false,
+            });
+            return .ok;
+        }
+
+        // It doesn't look like a dylib or archive, so assume it's a tbd.
+        resolved_inputs.appendAssumeCapacity(.{ .tbd = .{
+            .path = test_path,
+            .file = file,
+            .needed = framework_query.needed,
+            .weak = framework_query.weak,
+            .reexport = false,
+        } });
+        return .ok;
+    }
+
+    return .no_match;
+}
+
+/// Deduplicates static archive link inputs based on their path. This is done for efficiency, so
+/// that linker implementations do not need to open and scan the archive just to determine that they
+/// need not extract any objects. At the time of writing, it also helps avoid "multiple definitions
+/// of symbol" errors in incomplete linker implementations.
+///
+/// Key is index into `resolved_inputs` of an `Input.archive`.
+///
+/// Accessed through `ArchiveDedupAdapter`.
+///
+const ArchiveDedupMap = std.array_hash_map.Custom(u32, void, void, true);
+/// Adapter for accessing `ArchiveDedupMap` with an effective key type of `Path`.
+const ArchiveDedupAdapter = struct {
+    resolved_inputs: []const Input,
+    pub fn hash(ctx: ArchiveDedupAdapter, path: Path) u32 {
+        _ = ctx;
+        return Path.TableAdapter.hash(.{}, path);
+    }
+    pub fn eql(ctx: ArchiveDedupAdapter, a_path: Path, b_input_index: u32, _: usize) bool {
+        const b_path = ctx.resolved_inputs[b_input_index].archive.path;
+        return a_path.eql(b_path);
+    }
+};
+
+fn addResolvedStaticLibInput(
+    io: Io,
+    resolved_inputs: *std.ArrayList(Input),
+    archive_dedup: *ArchiveDedupMap,
+    archive: Input.Object,
+) void {
+    const ctx: ArchiveDedupAdapter = .{ .resolved_inputs = resolved_inputs.items };
+    const gop = archive_dedup.getOrPutAssumeCapacityAdapted(archive.path, ctx);
+    if (gop.found_existing) {
+        // Ignore duplicate archive input
+        archive.file.close(io);
+    } else {
+        gop.key_ptr.* = @intCast(resolved_inputs.items.len);
+        resolved_inputs.appendAssumeCapacity(.{ .archive = archive });
+    }
 }
 
 fn resolvePathInput(
     gpa: Allocator,
     arena: Allocator,
+    io: Io,
     /// Allocated with `gpa`.
-    unresolved_inputs: *std.ArrayListUnmanaged(UnresolvedInput),
+    unresolved_inputs: *std.ArrayList(UnresolvedInput),
     /// Allocated with `gpa`.
-    resolved_inputs: *std.ArrayListUnmanaged(Input),
+    resolved_inputs: *std.ArrayList(Input),
     /// Allocated via `gpa`.
-    ld_script_bytes: *std.ArrayListUnmanaged(u8),
+    ld_script_bytes: *std.ArrayList(u8),
+    /// Allocated via `gpa`.
+    archive_dedup: *ArchiveDedupMap,
     target: *const std.Target,
     pq: UnresolvedInput.PathQuery,
     color: std.zig.Color,
 ) Allocator.Error!?ResolveLibInputResult {
     switch (Compilation.classifyFileExt(pq.path.sub_path)) {
-        .static_library => return try resolvePathInputLib(gpa, arena, unresolved_inputs, resolved_inputs, ld_script_bytes, target, pq, .static, color),
-        .shared_library => return try resolvePathInputLib(gpa, arena, unresolved_inputs, resolved_inputs, ld_script_bytes, target, pq, .dynamic, color),
+        .static_library => return try resolvePathInputLib(
+            gpa,
+            arena,
+            io,
+            unresolved_inputs,
+            resolved_inputs,
+            ld_script_bytes,
+            archive_dedup,
+            target,
+            pq,
+            .static,
+            color,
+            .full_path,
+        ),
+        .shared_library => return try resolvePathInputLib(
+            gpa,
+            arena,
+            io,
+            unresolved_inputs,
+            resolved_inputs,
+            ld_script_bytes,
+            archive_dedup,
+            target,
+            pq,
+            .dynamic,
+            color,
+            .full_path,
+        ),
         .object => {
-            var file = pq.path.root_dir.handle.openFile(pq.path.sub_path, .{}) catch |err|
-                fatal("failed to open object {f}: {s}", .{ pq.path, @errorName(err) });
-            errdefer file.close();
+            var file = pq.path.root_dir.handle.openFile(io, pq.path.sub_path, .{}) catch |err|
+                fatal("failed to open object {f}: {t}", .{ pq.path, err });
+            errdefer file.close(io);
             try resolved_inputs.append(gpa, .{ .object = .{
                 .path = pq.path,
                 .file = file,
@@ -2103,9 +2819,9 @@ fn resolvePathInput(
             return null;
         },
         .res => {
-            var file = pq.path.root_dir.handle.openFile(pq.path.sub_path, .{}) catch |err|
-                fatal("failed to open windows resource {f}: {s}", .{ pq.path, @errorName(err) });
-            errdefer file.close();
+            var file = pq.path.root_dir.handle.openFile(io, pq.path.sub_path, .{}) catch |err|
+                fatal("failed to open windows resource {f}: {t}", .{ pq.path, err });
+            errdefer file.close(io);
             try resolved_inputs.append(gpa, .{ .res = .{
                 .path = pq.path,
                 .file = file,
@@ -2119,57 +2835,73 @@ fn resolvePathInput(
 fn resolvePathInputLib(
     gpa: Allocator,
     arena: Allocator,
+    io: Io,
     /// Allocated with `gpa`.
-    unresolved_inputs: *std.ArrayListUnmanaged(UnresolvedInput),
+    unresolved_inputs: *std.ArrayList(UnresolvedInput),
     /// Allocated with `gpa`.
-    resolved_inputs: *std.ArrayListUnmanaged(Input),
+    resolved_inputs: *std.ArrayList(Input),
     /// Allocated via `gpa`.
-    ld_script_bytes: *std.ArrayListUnmanaged(u8),
+    ld_script_bytes: *std.ArrayList(u8),
+    /// Allocated via `gpa`.
+    archive_dedup: *ArchiveDedupMap,
     target: *const std.Target,
     pq: UnresolvedInput.PathQuery,
-    link_mode: std.builtin.LinkMode,
+    link_mode: std.lang.LinkMode,
     color: std.zig.Color,
+    fallback_soname: Input.Dso.FallbackSoname,
 ) Allocator.Error!ResolveLibInputResult {
     try resolved_inputs.ensureUnusedCapacity(gpa, 1);
+    try archive_dedup.ensureUnusedCapacity(gpa, 1);
 
     const test_path: Path = pq.path;
+
+    var file = test_path.root_dir.handle.openFile(io, test_path.sub_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return .no_match,
+        else => |e| fatal("unable to search for {t} library {qf}: {t}", .{
+            link_mode, std.fmt.alt(test_path, .formatEscapeChar), e,
+        }),
+    };
+    errdefer file.close(io);
+
     // In the case of shared libraries, they might actually be "linker scripts"
     // that contain references to other libraries.
-    if (pq.query.allow_so_scripts and target.ofmt == .elf and switch (Compilation.classifyFileExt(test_path.sub_path)) {
-        .static_library, .shared_library => true,
-        else => false,
-    }) {
-        var file = test_path.root_dir.handle.openFile(test_path.sub_path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return .no_match,
-            else => |e| fatal("unable to search for {s} library '{f}': {s}", .{
-                @tagName(link_mode), std.fmt.alt(test_path, .formatEscapeChar), @errorName(e),
-            }),
-        };
-        errdefer file.close();
-        try ld_script_bytes.resize(gpa, @max(std.elf.MAGIC.len, std.elf.ARMAG.len));
-        const n = file.preadAll(ld_script_bytes.items, 0) catch |err| fatal("failed to read '{f}': {s}", .{
-            std.fmt.alt(test_path, .formatEscapeChar), @errorName(err),
-        });
-        const buf = ld_script_bytes.items[0..n];
-        if (mem.startsWith(u8, buf, std.elf.MAGIC) or mem.startsWith(u8, buf, std.elf.ARMAG)) {
-            // Appears to be an ELF or archive file.
-            return finishResolveLibInput(resolved_inputs, test_path, file, link_mode, pq.query);
+    ld_script: {
+        if (!pq.query.allow_so_scripts) break :ld_script;
+        if (target.ofmt != .elf) break :ld_script;
+        switch (Compilation.classifyFileExt(test_path.sub_path)) {
+            .static_library, .shared_library => {},
+            else => break :ld_script,
         }
-        const stat = file.stat() catch |err|
-            fatal("failed to stat {f}: {s}", .{ test_path, @errorName(err) });
+        try ld_script_bytes.resize(gpa, @max(std.elf.MAGIC.len, std.elf.ARMAG.len));
+        const n = file.readPositionalAll(io, ld_script_bytes.items, 0) catch |err|
+            fatal("failed to read {qf}: {t}", .{ test_path, err });
+        const buf = ld_script_bytes.items[0..n];
+        if (mem.startsWith(u8, buf, std.elf.MAGIC) or
+            mem.startsWith(u8, buf, std.elf.ARMAG) or
+            mem.startsWith(u8, buf, std.elf.ARMAG_THIN))
+        {
+            // Appears to be an ELF or archive file.
+            break :ld_script;
+        }
+        const stat = file.stat(io) catch |err|
+            fatal("failed to stat {f}: {t}", .{ test_path, err });
         const size = std.math.cast(u32, stat.size) orelse
             fatal("{f}: linker script too big", .{test_path});
         try ld_script_bytes.resize(gpa, size);
         const buf2 = ld_script_bytes.items[n..];
-        const n2 = file.preadAll(buf2, n) catch |err|
-            fatal("failed to read {f}: {s}", .{ test_path, @errorName(err) });
+        const n2 = file.readPositionalAll(io, buf2, n) catch |err|
+            fatal("failed to read {f}: {t}", .{ test_path, err });
         if (n2 != buf2.len) fatal("failed to read {f}: unexpected end of file", .{test_path});
-        var diags = Diags.init(gpa);
+
+        // This `Io` is only used for a mutex, and we know we aren't doing anything async/concurrent.
+        var threaded: Io.Threaded = .init_single_threaded;
+        defer threaded.deinit();
+        var diags: Diags = .init(gpa, threaded.io());
         defer diags.deinit();
+
         const ld_script_result = LdScript.parse(gpa, &diags, test_path, ld_script_bytes.items);
         if (diags.hasErrors()) {
-            var wip_errors: std.zig.ErrorBundle.Wip = undefined;
-            try wip_errors.init(gpa);
+            var wip_errors: std.zig.ErrorBundle.Wip = try .init(gpa);
             defer wip_errors.deinit();
 
             try diags.addMessagesToBundle(&wip_errors, null);
@@ -2177,13 +2909,12 @@ fn resolvePathInputLib(
             var error_bundle = try wip_errors.toOwnedBundle("");
             defer error_bundle.deinit(gpa);
 
-            error_bundle.renderToStdErr(color.renderOptions());
-
+            error_bundle.renderToStderr(io, .{}, color) catch {};
             std.process.exit(1);
         }
 
         var ld_script = ld_script_result catch |err|
-            fatal("{f}: failed to parse linker script: {s}", .{ test_path, @errorName(err) });
+            fatal("{f}: failed to parse linker script: {t}", .{ test_path, err });
         defer ld_script.deinit(gpa);
 
         try unresolved_inputs.ensureUnusedCapacity(gpa, ld_script.args.len);
@@ -2200,6 +2931,7 @@ fn resolvePathInputLib(
                 unresolved_inputs.appendAssumeCapacity(.{ .name_query = .{
                     .name = try arena.dupe(u8, arg.path["-l".len..]),
                     .query = query,
+                    .name_done = false,
                 } });
             } else {
                 unresolved_inputs.appendAssumeCapacity(.{ .ambiguous_name = .{
@@ -2208,23 +2940,32 @@ fn resolvePathInputLib(
                 } });
             }
         }
-        file.close();
+        file.close(io);
         return .ok;
     }
 
-    var file = test_path.root_dir.handle.openFile(test_path.sub_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return .no_match,
-        else => |e| fatal("unable to search for {s} library {f}: {s}", .{
-            @tagName(link_mode), test_path, @errorName(e),
+    switch (link_mode) {
+        .dynamic => resolved_inputs.appendAssumeCapacity(.{ .dso = .{
+            .path = test_path,
+            .file = file,
+            .needed = pq.query.needed,
+            .weak = pq.query.weak,
+            .reexport = pq.query.reexport,
+            .fallback_soname = fallback_soname,
+        } }),
+        .static => addResolvedStaticLibInput(io, resolved_inputs, archive_dedup, .{
+            .path = test_path,
+            .file = file,
+            .must_link = pq.query.must_link,
+            .hidden = pq.query.hidden,
         }),
-    };
-    errdefer file.close();
-    return finishResolveLibInput(resolved_inputs, test_path, file, link_mode, pq.query);
+    }
+    return .ok;
 }
 
-pub fn openObject(path: Path, must_link: bool, hidden: bool) !Input.Object {
-    var file = try path.root_dir.handle.openFile(path.sub_path, .{});
-    errdefer file.close();
+pub fn openObject(io: Io, path: Path, must_link: bool, hidden: bool) !Input.Object {
+    var file = try path.root_dir.handle.openFile(io, path.sub_path, .{});
+    errdefer file.close(io);
     return .{
         .path = path,
         .file = file,
@@ -2233,32 +2974,33 @@ pub fn openObject(path: Path, must_link: bool, hidden: bool) !Input.Object {
     };
 }
 
-pub fn openDso(path: Path, needed: bool, weak: bool, reexport: bool) !Input.Dso {
-    var file = try path.root_dir.handle.openFile(path.sub_path, .{});
-    errdefer file.close();
+pub fn openDso(io: Io, path: Path, needed: bool, weak: bool, reexport: bool) !Input.Dso {
+    var file = try path.root_dir.handle.openFile(io, path.sub_path, .{});
+    errdefer file.close(io);
     return .{
         .path = path,
         .file = file,
         .needed = needed,
         .weak = weak,
         .reexport = reexport,
+        .fallback_soname = .full_path,
     };
 }
 
-pub fn openObjectInput(diags: *Diags, path: Path) error{LinkFailure}!Input {
-    return .{ .object = openObject(path, false, false) catch |err| {
+pub fn openObjectInput(io: Io, diags: *Diags, path: Path) error{AlreadyReported}!Input {
+    return .{ .object = openObject(io, path, false, false) catch |err| {
         return diags.failParse(path, "failed to open {f}: {s}", .{ path, @errorName(err) });
     } };
 }
 
-pub fn openArchiveInput(diags: *Diags, path: Path, must_link: bool, hidden: bool) error{LinkFailure}!Input {
-    return .{ .archive = openObject(path, must_link, hidden) catch |err| {
+pub fn openArchiveInput(io: Io, diags: *Diags, path: Path, must_link: bool, hidden: bool) error{AlreadyReported}!Input {
+    return .{ .archive = openObject(io, path, must_link, hidden) catch |err| {
         return diags.failParse(path, "failed to open {f}: {s}", .{ path, @errorName(err) });
     } };
 }
 
-pub fn openDsoInput(diags: *Diags, path: Path, needed: bool, weak: bool, reexport: bool) error{LinkFailure}!Input {
-    return .{ .dso = openDso(path, needed, weak, reexport) catch |err| {
+pub fn openDsoInput(io: Io, diags: *Diags, path: Path, needed: bool, weak: bool, reexport: bool) error{AlreadyReported}!Input {
+    return .{ .dso = openDso(io, path, needed, weak, reexport) catch |err| {
         return diags.failParse(path, "failed to open {f}: {s}", .{ path, @errorName(err) });
     } };
 }
@@ -2273,7 +3015,7 @@ pub fn anyObjectInputs(inputs: []const Input) bool {
 pub fn countObjectInputs(inputs: []const Input) usize {
     var count: usize = 0;
     for (inputs) |input| switch (input) {
-        .dso, .dso_exact => continue,
+        .dso, .tbd => continue,
         .res, .object, .archive => count += 1,
     };
     return count;
@@ -2283,7 +3025,80 @@ pub fn countObjectInputs(inputs: []const Input) usize {
 pub fn firstObjectInput(inputs: []const Input) ?Input.Object {
     for (inputs) |input| switch (input) {
         .object, .archive => |obj| return obj,
-        .res, .dso, .dso_exact => continue,
+        .res, .dso, .tbd => continue,
     };
     return null;
 }
+
+pub const DarwinSdkVersion = packed struct(u32) {
+    patch: u8,
+    minor: u8,
+    major: u16,
+
+    fn parse(
+        diags: *Diags,
+        /// Passed to `Diags.failParse` on error.
+        sdk_settings_path: Path,
+        version_str: []const u8,
+    ) error{AlreadyReported}!DarwinSdkVersion {
+        var it = std.mem.splitScalar(u8, version_str, '.');
+
+        const major = try parseComponent(
+            .major,
+            diags,
+            sdk_settings_path,
+            version_str,
+            it.first(),
+        );
+        const minor = if (it.next()) |component_str| try parseComponent(
+            .minor,
+            diags,
+            sdk_settings_path,
+            version_str,
+            component_str,
+        ) else return diags.failParse(
+            sdk_settings_path,
+            "failed to parse Darwin SDK version {q}: missing minor version",
+            .{version_str},
+        );
+        const patch = if (it.next()) |component_str| try parseComponent(
+            .patch,
+            diags,
+            sdk_settings_path,
+            version_str,
+            component_str,
+        ) else 0; // Apple sometimes omit the patch version
+
+        if (it.next() != null) return diags.failParse(
+            sdk_settings_path,
+            "failed to parse Darwin SDK version {q}: too many version components",
+            .{version_str},
+        );
+
+        return .{ .major = major, .minor = minor, .patch = patch };
+    }
+
+    fn parseComponent(
+        comptime component: enum { major, minor, patch },
+        diags: *Diags,
+        /// Passed to `Diags.failParse` on error.
+        sdk_settings_path: Path,
+        /// Only used for error messages.
+        version_str: []const u8,
+        component_str: []const u8,
+    ) error{AlreadyReported}!@FieldType(DarwinSdkVersion, @tagName(component)) {
+        const Int = @FieldType(DarwinSdkVersion, @tagName(component));
+        return std.fmt.parseInt(Int, component_str, 10) catch |err| switch (err) {
+            error.Overflow => return diags.failParse(
+                sdk_settings_path,
+                "failed to parse Darwin SDK version {q}: {t} version {q} too large",
+                .{ version_str, component, component_str },
+            ),
+            error.InvalidCharacter => return diags.failParse(
+                sdk_settings_path,
+                "failed to parse Darwin SDK version {q}: invalid {t} version {q}",
+                .{ version_str, component, component_str },
+            ),
+        };
+    }
+};

@@ -1,12 +1,14 @@
-#target=x86_64-linux-selfhosted
-#target=wasm32-wasi-selfhosted
-#update=initial version
-#file=main.zig
+#exe {
+-Mroot=main.zig
+#}
+
+#write main.zig {
 const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
 fn Printer(message: []const u8) type {
     return struct {
         fn print() !void {
-            try std.fs.File.stdout().writeAll(message);
+            try std.Io.File.stdout().writeStreamingAll(io, message);
         }
     };
 }
@@ -14,15 +16,21 @@ pub fn main() !void {
     try Printer("foo\n").print();
     try Printer("bar\n").print();
 }
-#expect_stdout="foo\nbar\n"
-#update=change line number
-#file=main.zig
+#}
+#update
+#check stdout {
+foo
+bar
+#}
+
+#write main.zig {
 const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
 
 fn Printer(message: []const u8) type {
     return struct {
         fn print() !void {
-            try std.fs.File.stdout().writeAll(message);
+            try std.Io.File.stdout().writeStreamingAll(io, message);
         }
     };
 }
@@ -30,4 +38,10 @@ pub fn main() !void {
     try Printer("foo\n").print();
     try Printer("bar\n").print();
 }
-#expect_stdout="foo\nbar\n"
+#}
+#update {
+change line number#}
+#check stdout {
+foo
+bar
+#}

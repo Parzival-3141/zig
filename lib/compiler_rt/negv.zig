@@ -3,14 +3,13 @@
 //! - negvXi4_generic for unoptimized version
 const std = @import("std");
 const builtin = @import("builtin");
-const common = @import("common.zig");
-
-pub const panic = common.panic;
+const compiler_rt = @import("../compiler_rt.zig");
+const symbol = compiler_rt.symbol;
 
 comptime {
-    @export(&__negvsi2, .{ .name = "__negvsi2", .linkage = common.linkage, .visibility = common.visibility });
-    @export(&__negvdi2, .{ .name = "__negvdi2", .linkage = common.linkage, .visibility = common.visibility });
-    @export(&__negvti2, .{ .name = "__negvti2", .linkage = common.linkage, .visibility = common.visibility });
+    symbol(&__negvsi2, "__negvsi2");
+    symbol(&__negvdi2, "__negvdi2");
+    symbol(&__negvti2, "__negvti2");
 }
 
 pub fn __negvsi2(a: i32) callconv(.c) i32 {
@@ -34,8 +33,7 @@ inline fn negvXi(comptime ST: type, a: ST) ST {
     };
     const N: UT = @bitSizeOf(ST);
     const min: ST = @as(ST, @bitCast((@as(UT, 1) << (N - 1))));
-    if (a == min)
-        @panic("compiler_rt negv: overflow");
+    if (a == min) @panic("integer overflow");
     return -a;
 }
 

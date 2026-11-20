@@ -20,8 +20,7 @@ export fn entry() usize {
 }
 
 // error
-// backend=stage2
-// target=native
 //
-// :13:15: error: duplicate switch value
+// :13:15: error: duplicate switch value '.Two'
 // :10:15: note: previous value here
+// :1:16: note: enum declared here

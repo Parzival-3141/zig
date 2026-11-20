@@ -1,6 +1,9 @@
-const std = @import("std");
 const builtin = @import("builtin");
-const fs = std.fs;
+const spirv_spec = @import("spirv_spec");
+
+const std = @import("std");
+const Io = std.Io;
+const Dir = std.Io.Dir;
 const mem = std.mem;
 const json = std.json;
 const assert = std.debug.assert;
@@ -45,6 +48,69 @@ const ArchTarget = struct {
     extra_features: []const Feature = &.{},
     omit_cpus: []const []const u8 = &.{},
     branch_quota: ?usize = null,
+};
+
+const spirv_omitted_capabilities = [_][]const u8{
+    "shader", // implied by Vulkan/OpenGL targets
+    "kernel", // implied by OpenCL/AMDHSA targets
+    "addresses", // implied by OpenCL/AMDHSA targets
+    "physical_storage_buffer_addresses", // implied by spirv64-vulkan
+    "linkage", // automatically emitted when externs need linkage decorations
+};
+const spirv_omitted_extensions = [_][]const u8{
+    "SPV_KHR_physical_storage_buffer", // paired with physical_storage_buffer_addresses
+};
+
+const spirv_extra_features: []const Feature = blk: {
+    @setEvalBranchQuota(15_000);
+    var features: []const Feature = &.{};
+
+    cap: for (
+        @typeInfo(spirv_spec.Capability).@"enum".field_names,
+        @typeInfo(spirv_spec.Capability).@"enum".field_values,
+    ) |name, value| {
+        for (spirv_omitted_capabilities) |omitted| {
+            if (std.mem.eql(u8, omitted, name)) continue :cap;
+        }
+        features = features ++ &[_]Feature{.{
+            .zig_name = name,
+            .desc = "Enable " ++ name ++ " capability",
+            .deps = &struct {
+                const extensions = spirv_spec.Capability.dependencies(@fromBackingInt(@intCast(value)));
+                const deps: [extensions.len][]const u8 = inner: {
+                    var out: [extensions.len][]const u8 = undefined;
+                    for (extensions, 0..) |ext, i| out[i] = @tagName(ext);
+                    break :inner out;
+                };
+            }.deps,
+        }};
+    }
+
+    ext: for (@typeInfo(spirv_spec.Extension).@"enum".field_names) |name| {
+        for (spirv_omitted_extensions) |omitted| {
+            if (std.mem.eql(u8, omitted, name)) continue :ext;
+        }
+        features = features ++ &[_]Feature{.{
+            .zig_name = name,
+            .desc = "Enable " ++ name ++ " extension",
+            .deps = if (std.mem.eql(u8, name, "v1_6"))
+                &.{"v1_5"}
+            else if (std.mem.eql(u8, name, "v1_5"))
+                &.{"v1_4"}
+            else if (std.mem.eql(u8, name, "v1_4"))
+                &.{"v1_3"}
+            else if (std.mem.eql(u8, name, "v1_3"))
+                &.{"v1_2"}
+            else if (std.mem.eql(u8, name, "v1_2"))
+                &.{"v1_1"}
+            else if (std.mem.eql(u8, name, "v1_1"))
+                &.{"v1_0"}
+            else
+                &.{},
+        }};
+    }
+
+    break :blk features;
 };
 
 const targets = [_]ArchTarget{
@@ -202,6 +268,10 @@ const targets = [_]ArchTarget{
                 .flatten = true,
             },
             .{
+                .llvm_name = "ampere1c",
+                .flatten = true,
+            },
+            .{
                 .llvm_name = "apple-a7",
                 .flatten = true,
             },
@@ -243,6 +313,26 @@ const targets = [_]ArchTarget{
             },
             .{
                 .llvm_name = "apple-m4",
+                .flatten = true,
+            },
+            .{
+                .llvm_name = "apple-m5",
+                .flatten = true,
+            },
+            .{
+                .llvm_name = "c1-nano",
+                .flatten = true,
+            },
+            .{
+                .llvm_name = "c1-premium",
+                .flatten = true,
+            },
+            .{
+                .llvm_name = "c1-pro",
+                .flatten = true,
+            },
+            .{
+                .llvm_name = "c1-ultra",
                 .flatten = true,
             },
             .{
@@ -394,11 +484,89 @@ const targets = [_]ArchTarget{
         },
     },
     .{
+        .zig_name = "alpha",
+        .llvm = null,
+        .extra_features = &.{
+            .{
+                .zig_name = "bwx",
+                .desc = "Enable byte/word extensions",
+                .deps = &.{},
+            },
+            .{
+                .zig_name = "cix",
+                .desc = "Enable counting extensions",
+                .deps = &.{},
+            },
+            .{
+                .zig_name = "fix",
+                .desc = "Enable FPR-to-GPR move and square root extensions",
+                .deps = &.{},
+            },
+            .{
+                .zig_name = "max",
+                .desc = "Enable motion video extensions",
+                .deps = &.{},
+            },
+        },
+        .extra_cpus = &.{
+            .{
+                .llvm_name = null,
+                .zig_name = "ev4",
+                .features = &.{},
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "ev45",
+                .features = &.{},
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "ev5",
+                .features = &.{},
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "ev56",
+                .features = &.{
+                    "bwx",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "pca56",
+                .features = &.{
+                    "bwx",
+                    "max",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "ev6",
+                .features = &.{
+                    "bwx",
+                    "fix",
+                    "max",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "ev67",
+                .features = &.{
+                    "bwx",
+                    "cix",
+                    "fix",
+                    "max",
+                },
+            },
+        },
+    },
+    .{
         .zig_name = "amdgcn",
         .llvm = .{
             .name = "AMDGPU",
             .td_name = "AMDGPU",
         },
+        .branch_quota = 2000,
         .feature_overrides = &.{
             .{
                 .llvm_name = "DumpCode",
@@ -783,6 +951,10 @@ const targets = [_]ArchTarget{
                 .zig_name = "v9_6a",
             },
             .{
+                .llvm_name = "armv9.7-a",
+                .zig_name = "v9_7a",
+            },
+            .{
                 .llvm_name = "armv9-a",
                 .zig_name = "v9a",
             },
@@ -902,6 +1074,10 @@ const targets = [_]ArchTarget{
                 .llvm_name = "v9.6a",
                 .zig_name = "has_v9_6a",
             },
+            .{
+                .llvm_name = "v9.7a",
+                .zig_name = "has_v9_7a",
+            },
         },
         .extra_cpus = &.{
             .{
@@ -973,6 +1149,189 @@ const targets = [_]ArchTarget{
         },
     },
     .{
+        .zig_name = "hppa",
+        .llvm = null,
+        .extra_features = &.{
+            .{
+                .zig_name = "64bit",
+                .desc = "Enable 64-bit PA-RISC 2.0",
+                .deps = &.{"v2_0"},
+            },
+            .{
+                .zig_name = "max_1",
+                .desc = "Enable MAX-1 multimedia acceleration extensions",
+                .deps = &.{},
+            },
+            .{
+                .zig_name = "max_2",
+                .desc = "Enable MAX-2 multimedia acceleration extensions",
+                .deps = &.{"max_1"},
+            },
+            .{
+                .zig_name = "v1_1",
+                .desc = "Enable ISA v1.1",
+                .deps = &.{},
+            },
+            .{
+                .zig_name = "v2_0",
+                .desc = "Enable ISA v2.0",
+                .deps = &.{ "max_2", "v1_1" },
+            },
+        },
+        .extra_cpus = &.{
+            .{
+                .llvm_name = null,
+                .zig_name = "ts_1",
+                .features = &.{},
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "ns_1",
+                .features = &.{},
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "ns_2",
+                .features = &.{},
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "pcx",
+                .features = &.{},
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "pa_7000",
+                .features = &.{
+                    "v1_1",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "pa_7100",
+                .features = &.{
+                    "v1_1",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "pa_7150",
+                .features = &.{
+                    "v1_1",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "pa_7100lc",
+                .features = &.{
+                    "max_1",
+                    "v1_1",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "pa_7200",
+                .features = &.{
+                    "v1_1",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "pa_7300lc",
+                .features = &.{
+                    "max_1",
+                    "v1_1",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "pa_8000",
+                .features = &.{
+                    "64bit",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "pa_8200",
+                .features = &.{
+                    "64bit",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "pa_8500",
+                .features = &.{
+                    "64bit",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "pa_8600",
+                .features = &.{
+                    "64bit",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "pa_8700",
+                .features = &.{
+                    "64bit",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "pa_8800",
+                .features = &.{
+                    "64bit",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "pa_8900",
+                .features = &.{
+                    "64bit",
+                },
+            },
+        },
+    },
+    .{
+        .zig_name = "kvx",
+        .llvm = null,
+        .extra_features = &.{
+            .{
+                .zig_name = "v3_1",
+                .desc = "Enable ISA v3.1",
+                .deps = &.{},
+            },
+            .{
+                .zig_name = "v3_2",
+                .desc = "Enable ISA v3.2",
+                .deps = &.{},
+            },
+            .{
+                .zig_name = "v4_1",
+                .desc = "Enable ISA v4.1",
+                .deps = &.{"v3_2"},
+            },
+        },
+        .extra_cpus = &.{
+            .{
+                .llvm_name = null,
+                .zig_name = "coolidge_v1",
+                .features = &.{
+                    "v3_1",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "coolidge_v2",
+                .features = &.{
+                    "v3_2",
+                },
+            },
+        },
+    },
+    .{
         .zig_name = "lanai",
         .llvm = .{
             .name = "Lanai",
@@ -984,6 +1343,63 @@ const targets = [_]ArchTarget{
         .llvm = .{
             .name = "LoongArch",
             .td_name = "LoongArch",
+        },
+        .extra_cpus = &.{
+            .{
+                .llvm_name = null,
+                .zig_name = "generic_la64",
+                .features = &.{
+                    "64bit",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "la32v1_0",
+                .features = &.{
+                    "32bit",
+                    "32s",
+                    "d",
+                    "ual",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "la32rv1_0",
+                .features = &.{
+                    "32bit",
+                    "ual",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "la64v1_0",
+                .features = &.{
+                    "64bit",
+                    "lsx",
+                    "ual",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "la64v1_1",
+                .features = &.{
+                    "64bit",
+                    "div32",
+                    "frecipe",
+                    "lam_bh",
+                    "lamcas",
+                    "ld_seq_sa",
+                    "lsx",
+                    "scq",
+                    "ual",
+                },
+            },
+        },
+        .omit_cpus = &.{
+            "generic",
+            "generic-la64",
+            "loongarch32",
+            "loongarch64",
         },
     },
     .{
@@ -1006,6 +1422,29 @@ const targets = [_]ArchTarget{
             .name = "Mips",
             .td_name = "Mips",
         },
+        .extra_features = &.{
+            .{
+                .zig_name = "notraps",
+                .desc = "Disable trap instructions",
+                .deps = &.{},
+            },
+        },
+        .extra_cpus = &.{
+            .{
+                .llvm_name = null,
+                .zig_name = "r3000a",
+                .features = &.{
+                    "mips1",
+                    "soft_float",
+                    "notraps",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "allegrex",
+                .features = &.{ "mips2", "single_float", "notraps" },
+            },
+        },
     },
     .{
         .zig_name = "nvptx",
@@ -1019,6 +1458,28 @@ const targets = [_]ArchTarget{
         .llvm = .{
             .name = "PowerPC",
             .td_name = "PPC",
+        },
+        .feature_overrides = &.{
+            .{
+                .llvm_name = "aix",
+                .omit = true,
+            },
+            .{
+                .llvm_name = "aix-shared-lib-tls-model-opt",
+                .omit = true,
+            },
+            .{
+                .llvm_name = "aix-small-local-dynamic-tls",
+                .omit = true,
+            },
+            .{
+                .llvm_name = "aix-small-local-exec-tls",
+                .omit = true,
+            },
+            .{
+                .llvm_name = "modern-aix-as",
+                .omit = true,
+            },
         },
         .omit_cpus = &.{
             "ppc32",
@@ -1054,83 +1515,7 @@ const targets = [_]ArchTarget{
             .td_name = "SPIRV",
         },
         .branch_quota = 2000,
-        .extra_features = &.{
-            .{
-                .zig_name = "v1_0",
-                .desc = "Enable version 1.0",
-                .deps = &.{},
-            },
-            .{
-                .zig_name = "v1_1",
-                .desc = "Enable version 1.1",
-                .deps = &.{"v1_0"},
-            },
-            .{
-                .zig_name = "v1_2",
-                .desc = "Enable version 1.2",
-                .deps = &.{"v1_1"},
-            },
-            .{
-                .zig_name = "v1_3",
-                .desc = "Enable version 1.3",
-                .deps = &.{"v1_2"},
-            },
-            .{
-                .zig_name = "v1_4",
-                .desc = "Enable version 1.4",
-                .deps = &.{"v1_3"},
-            },
-            .{
-                .zig_name = "v1_5",
-                .desc = "Enable version 1.5",
-                .deps = &.{"v1_4"},
-            },
-            .{
-                .zig_name = "v1_6",
-                .desc = "Enable version 1.6",
-                .deps = &.{"v1_5"},
-            },
-            .{
-                .zig_name = "int64",
-                .desc = "Enable Int64 capability",
-                .deps = &.{"v1_0"},
-            },
-            .{
-                .zig_name = "float16",
-                .desc = "Enable Float16 capability",
-                .deps = &.{"v1_0"},
-            },
-            .{
-                .zig_name = "float64",
-                .desc = "Enable Float64 capability",
-                .deps = &.{"v1_0"},
-            },
-            .{
-                .zig_name = "storage_push_constant16",
-                .desc = "Enable SPV_KHR_16bit_storage extension and the StoragePushConstant16 capability",
-                .deps = &.{"v1_3"},
-            },
-            .{
-                .zig_name = "arbitrary_precision_integers",
-                .desc = "Enable SPV_INTEL_arbitrary_precision_integers extension and the ArbitraryPrecisionIntegersINTEL capability",
-                .deps = &.{"v1_5"},
-            },
-            .{
-                .zig_name = "generic_pointer",
-                .desc = "Enable GenericPointer capability",
-                .deps = &.{"v1_0"},
-            },
-            .{
-                .zig_name = "vector16",
-                .desc = "Enable Vector16 capability",
-                .deps = &.{"v1_0"},
-            },
-            .{
-                .zig_name = "variable_pointers",
-                .desc = "Enable SPV_KHR_physical_storage_buffer extension and the PhysicalStorageBufferAddresses capability",
-                .deps = &.{"v1_0"},
-            },
-        },
+        .extra_features = spirv_extra_features,
         .extra_cpus = &.{
             .{
                 .llvm_name = null,
@@ -1167,6 +1552,103 @@ const targets = [_]ArchTarget{
                 .llvm_name = null,
                 .zig_name = "baseline_rv64",
                 .features = &.{ "64bit", "a", "c", "d", "f", "i", "m" },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "spacemit_a100",
+                .features = &.{
+                    "64bit",
+                    "a",
+                    "b",
+                    "c",
+                    "dlen_factor_2",
+                    "i",
+                    "m",
+                    "optimized_nf2_segment_load_store",
+                    "optimized_nf3_segment_load_store",
+                    "optimized_nf4_segment_load_store",
+                    "smepmp",
+                    "smnpm",
+                    "smstateen",
+                    "ssccptr",
+                    "sscofpmf",
+                    "sscounterenw",
+                    "ssnpm",
+                    "sspm",
+                    "sstc",
+                    "sstvala",
+                    "sstvecd",
+                    "ssu64xl",
+                    "supm",
+                    "svade",
+                    "svbare",
+                    "svinval",
+                    "svnapot",
+                    "svpbmt",
+                    "unaligned_scalar_mem",
+                    "v",
+                    "vxrm_pipeline_flush",
+                    "za64rs",
+                    "zawrs",
+                    "zbc",
+                    "zbkc",
+                    "zcb",
+                    "zcmop",
+                    "zfa",
+                    "zfh",
+                    "zic64b",
+                    "zicbom",
+                    "zicbop",
+                    "zicboz",
+                    "ziccamoa",
+                    "ziccif",
+                    "zicclsm",
+                    "ziccrse",
+                    "zicntr",
+                    "zicond",
+                    "zifencei",
+                    "zihintntl",
+                    "zihintpause",
+                    "zihpm",
+                    "zimop",
+                    "zkt",
+                    "zvbb",
+                    "zvfbfwma",
+                    "zvfh",
+                    "zvkng",
+                    "zvknha",
+                    "zvksc",
+                    "zvksg",
+                    "zvl1024b",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "spacemit_x100",
+                .features = &.{
+                    "dlen_factor_2",
+                    "optimized_nf2_segment_load_store",
+                    "optimized_nf3_segment_load_store",
+                    "optimized_nf4_segment_load_store",
+                    "rva23s64",
+                    "smepmp",
+                    "smnpm",
+                    "smstateen",
+                    "sspm",
+                    "unaligned_scalar_mem",
+                    "vxrm_pipeline_flush",
+                    "xsmtvdot",
+                    "zbc",
+                    "zbkc",
+                    "zfh",
+                    "zvfbfwma",
+                    "zvfh",
+                    "zvkng",
+                    "zvknha",
+                    "zvksc",
+                    "zvksg",
+                    "zvl256b",
+                },
             },
         },
     },
@@ -1226,6 +1708,18 @@ const targets = [_]ArchTarget{
         .feature_overrides = &.{
             .{
                 .llvm_name = "64bit-mode",
+                .omit = true,
+            },
+            .{
+                .llvm_name = "avx10.1-512",
+                .omit = true,
+            },
+            .{
+                .llvm_name = "avx10.2-512",
+                .omit = true,
+            },
+            .{
+                .llvm_name = "evex512",
                 .omit = true,
             },
             .{
@@ -1489,6 +1983,13 @@ const targets = [_]ArchTarget{
                 .deps = &.{},
             },
         },
+        .extra_cpus = &.{
+            .{
+                .llvm_name = null,
+                .zig_name = "i86",
+                .features = &.{"16bit_mode"},
+            },
+        },
         .omit_cpus = &.{
             // LLVM defines a bunch of dumb aliases with foreach loops in X86.td.
             "pentium_mmx",
@@ -1540,12 +2041,11 @@ const targets = [_]ArchTarget{
     },
 };
 
-pub fn main() anyerror!void {
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const io = init.io;
 
-    var args = try std.process.argsWithAllocator(arena);
+    var args = try init.minimal.args.iterateAllocator(arena);
     const args0 = args.next().?;
 
     const llvm_tblgen_exe = args.next() orelse
@@ -1578,52 +2078,43 @@ pub fn main() anyerror!void {
     // there shouldn't be any more argument after the optional filter
     if (args.skip()) usageAndExit(args0, 1);
 
-    var zig_src_dir = try fs.cwd().openDir(zig_src_root, .{});
-    defer zig_src_dir.close();
+    var zig_src_dir = try Dir.cwd().openDir(io, zig_src_root, .{});
+    defer zig_src_dir.close(io);
 
-    const root_progress = std.Progress.start(.{ .estimated_total_items = targets.len });
+    const root_progress = std.Progress.start(io, .{ .estimated_total_items = targets.len });
     defer root_progress.end();
 
-    if (builtin.single_threaded) {
-        for (targets) |target| {
-            if (filter) |zig_name| if (!std.mem.eql(u8, target.zig_name, zig_name)) continue;
-            try processOneTarget(.{
-                .llvm_tblgen_exe = llvm_tblgen_exe,
-                .llvm_src_root = llvm_src_root,
-                .zig_src_dir = zig_src_dir,
-                .root_progress = root_progress,
-                .target = target,
-            });
-        }
-    } else {
-        var pool: std.Thread.Pool = undefined;
-        try pool.init(.{ .allocator = arena, .n_jobs = targets.len });
-        defer pool.deinit();
+    var group: Io.Group = .init;
+    defer group.cancel(io);
 
-        for (targets) |target| {
-            if (filter) |zig_name| if (!std.mem.eql(u8, target.zig_name, zig_name)) continue;
-            const job = Job{
-                .llvm_tblgen_exe = llvm_tblgen_exe,
-                .llvm_src_root = llvm_src_root,
-                .zig_src_dir = zig_src_dir,
-                .root_progress = root_progress,
-                .target = target,
-            };
-            try pool.spawn(processOneTarget, .{job});
+    for (targets) |target| {
+        if (filter) |zig_name| {
+            if (!std.mem.eql(u8, target.zig_name, zig_name)) continue;
         }
+        group.async(io, processOneTarget, .{ io, .{
+            .llvm_tblgen_exe = llvm_tblgen_exe,
+            .llvm_src_root = llvm_src_root,
+            .zig_src_dir = zig_src_dir,
+            .root_progress = root_progress,
+            .target = target,
+        } });
     }
+
+    try group.await(io);
 }
 
 const Job = struct {
     llvm_tblgen_exe: []const u8,
     llvm_src_root: []const u8,
-    zig_src_dir: std.fs.Dir,
+    zig_src_dir: Dir,
     root_progress: std.Progress.Node,
     target: ArchTarget,
 };
 
-fn processOneTarget(job: Job) void {
-    errdefer |err| std.debug.panic("panic: {s}", .{@errorName(err)});
+fn processOneTarget(io: Io, job: Job) void {
+    processOneTargetInner(io, job) catch |err| std.debug.panic("panic: {s}", .{@errorName(err)});
+}
+fn processOneTargetInner(io: Io, job: Job) !void {
     const target = job.target;
 
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -1654,10 +2145,8 @@ fn processOneTarget(job: Job) void {
             }),
         };
 
-        const child_result = try std.process.Child.run(.{
-            .allocator = arena,
+        const child_result = try std.process.run(arena, io, .{
             .argv = &child_args,
-            .max_output_bytes = 500 * 1024 * 1024,
         });
         tblgen_progress.end();
         if (child_result.stderr.len != 0) {
@@ -1665,11 +2154,19 @@ fn processOneTarget(job: Job) void {
         }
 
         const json_text = switch (child_result.term) {
-            .Exited => |code| if (code == 0) child_result.stdout else {
+            .exited => |code| if (code == 0) child_result.stdout else {
                 std.debug.print("llvm-tblgen exited with code {d}\n", .{code});
                 std.process.exit(1);
             },
-            else => {
+            .signal => |sig| {
+                std.debug.print("llvm-tblgen terminated with signal {t}\n", .{sig});
+                std.process.exit(1);
+            },
+            .stopped => |sig| {
+                std.debug.print("llvm-tblgen stopped with signal {t}\n", .{sig});
+                std.process.exit(1);
+            },
+            .unknown => {
                 std.debug.print("llvm-tblgen crashed\n", .{});
                 std.process.exit(1);
             },
@@ -1685,10 +2182,11 @@ fn processOneTarget(job: Job) void {
         const collate_progress = progress_node.start("collating LLVM data", 0);
 
         // So far, LLVM only has a few aliases for the same CPU.
-        var cpu_aliases = std.StringHashMap(std.SegmentedList(struct {
+        const Alias = struct {
             llvm: []const u8,
             zig: []const u8,
-        }, 4)).init(arena);
+        };
+        var cpu_aliases = std.StringHashMap(std.ArrayList(*Alias)).init(arena);
 
         {
             var it = root_map.iterator();
@@ -1704,12 +2202,16 @@ fn processOneTarget(job: Job) void {
 
                     const gop = try cpu_aliases.getOrPut(try llvmNameToZigName(arena, llvm_name));
 
-                    if (!gop.found_existing) gop.value_ptr.* = .{};
+                    if (!gop.found_existing) {
+                        gop.value_ptr.* = .empty;
+                    }
 
-                    try gop.value_ptr.append(arena, .{
+                    const alias = try arena.create(Alias);
+                    alias.* = .{
                         .llvm = llvm_alias,
                         .zig = try llvmNameToZigName(arena, llvm_alias),
-                    });
+                    };
+                    try gop.value_ptr.append(arena, alias);
                 }
             }
         }
@@ -1866,9 +2368,7 @@ fn processOneTarget(job: Job) void {
                     });
 
                     if (cpu_aliases.get(zig_name)) |aliases| {
-                        var alias_it = aliases.constIterator(0);
-
-                        alias_it: while (alias_it.next()) |alias| {
+                        alias_it: for (aliases.items) |alias| {
                             for (target.omit_cpus) |omit_cpu_name| {
                                 if (mem.eql(u8, omit_cpu_name, alias.llvm)) continue :alias_it;
                             }
@@ -1899,15 +2399,15 @@ fn processOneTarget(job: Job) void {
 
     const render_progress = progress_node.start("rendering Zig code", 0);
 
-    var target_dir = try job.zig_src_dir.openDir("lib/std/Target", .{});
-    defer target_dir.close();
+    var target_dir = try job.zig_src_dir.openDir(io, "lib/std/Target", .{});
+    defer target_dir.close(io);
 
     const zig_code_basename = try std.fmt.allocPrint(arena, "{s}.zig", .{target.zig_name});
-    var zig_code_file = try target_dir.createFile(zig_code_basename, .{});
-    defer zig_code_file.close();
+    var zig_code_file = try target_dir.createFile(io, zig_code_basename, .{});
+    defer zig_code_file.close(io);
 
     var zig_code_file_buffer: [4096]u8 = undefined;
-    var zig_code_file_writer = zig_code_file.writer(&zig_code_file_buffer);
+    var zig_code_file_writer = zig_code_file.writer(io, &zig_code_file_buffer);
     const w = &zig_code_file_writer.interface;
 
     try w.writeAll(
@@ -1921,7 +2421,7 @@ fn processOneTarget(job: Job) void {
     );
 
     for (all_features.items, 0..) |feature, i| {
-        try w.print("\n    {f},", .{std.zig.fmtId(feature.zig_name)});
+        try w.print("\n    {f},", .{std.zig.fmtIdPU(feature.zig_name)});
 
         if (i == all_features.items.len - 1) try w.writeAll("\n");
     }
@@ -1941,7 +2441,7 @@ fn processOneTarget(job: Job) void {
         try w.print("    @setEvalBranchQuota({d});\n", .{branch_quota});
     }
     try w.writeAll(
-        \\    const len = @typeInfo(Feature).@"enum".fields.len;
+        \\    const len = @typeInfo(Feature).@"enum".field_names.len;
         \\    std.debug.assert(len <= CpuFeature.Set.needed_bit_count);
         \\    var result: [len]CpuFeature = undefined;
         \\
@@ -2010,7 +2510,7 @@ fn processOneTarget(job: Job) void {
         \\    const ti = @typeInfo(Feature);
         \\    for (&result, 0..) |*elem, i| {
         \\        elem.index = i;
-        \\        elem.name = ti.@"enum".fields[i].name;
+        \\        elem.name = ti.@"enum".field_names[i];
         \\    }
         \\    break :blk result;
         \\};
@@ -2083,8 +2583,9 @@ fn processOneTarget(job: Job) void {
 }
 
 fn usageAndExit(arg0: []const u8, code: u8) noreturn {
-    const stderr = std.debug.lockStderrWriter(&.{});
-    stderr.print(
+    const stderr = std.debug.lockStderr(&.{});
+    const w = &stderr.file_writer.interface;
+    w.print(
         \\Usage: {s} /path/to/llvm-tblgen /path/git/llvm-project /path/git/zig [zig_name filter]
         \\
         \\Updates lib/std/target/<target>.zig from llvm/lib/Target/<Target>/<Target>.td .

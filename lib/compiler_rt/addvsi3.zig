@@ -1,17 +1,16 @@
-const addv = @import("addo.zig");
-const common = @import("./common.zig");
+const compiler_rt = @import("../compiler_rt.zig");
+const symbol = compiler_rt.symbol;
 const testing = @import("std").testing;
 
-pub const panic = common.panic;
-
 comptime {
-    @export(&__addvsi3, .{ .name = "__addvsi3", .linkage = common.linkage, .visibility = common.visibility });
+    symbol(&__addvsi3, "__addvsi3");
 }
 
 pub fn __addvsi3(a: i32, b: i32) callconv(.c) i32 {
-    var overflow: c_int = 0;
-    const sum = addv.__addosi4(a, b, &overflow);
-    if (overflow != 0) @panic("compiler-rt: integer overflow");
+    const sum = a +% b;
+    // Overflow occurred iff both operands have the same sign, and the sign of the sum does
+    // not match it. In other words, iff the sum sign is not the sign of either operand.
+    if (((sum ^ a) & (sum ^ b)) < 0) @panic("integer overflow");
     return sum;
 }
 

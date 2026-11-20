@@ -1,17 +1,16 @@
-const subv = @import("subo.zig");
-const common = @import("./common.zig");
+const compiler_rt = @import("../compiler_rt.zig");
+const symbol = compiler_rt.symbol;
 const testing = @import("std").testing;
 
-pub const panic = common.panic;
-
 comptime {
-    @export(&__subvsi3, .{ .name = "__subvsi3", .linkage = common.linkage, .visibility = common.visibility });
+    symbol(&__subvsi3, "__subvsi3");
 }
 
 pub fn __subvsi3(a: i32, b: i32) callconv(.c) i32 {
-    var overflow: c_int = 0;
-    const sum = subv.__subosi4(a, b, &overflow);
-    if (overflow != 0) @panic("compiler-rt: integer overflow");
+    const sum = a -% b;
+    // Overflow occurred iff the operands have opposite signs, and the sign of the
+    // sum is the opposite of the lhs sign.
+    if (((a ^ b) & (sum ^ a)) < 0) @panic("integer overflow");
     return sum;
 }
 

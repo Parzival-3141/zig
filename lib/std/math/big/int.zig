@@ -17,6 +17,27 @@ const Endian = std.builtin.Endian;
 const Signedness = std.builtin.Signedness;
 const native_endian = builtin.cpu.arch.endian();
 
+// Comptime-computed constants for supported bases (2 - 36)
+// all values are set to 0 for bases 0 - 1, to make it possible to
+// access a constant for a given base b using `constants.value[b]`
+const Constants = struct {
+    // big_bases[b] is the biggest power of b that fit in a single Limb
+    // i.e. big_bases[b] = b^k < 2^@bitSizeOf(Limb) and b^(k+1) >= 2^@bitSizeOf(Limb)
+    big_bases: [37]Limb,
+    // digits_per_limb[b] is the value of k used in the previous field
+    digits_per_limb: [37]u8,
+};
+const constants: Constants = blk: {
+    @setEvalBranchQuota(2000);
+    var digits_per_limb: [37]u8 = @splat(0);
+    var bases: [37]Limb = @splat(0);
+    for (2..37) |base| {
+        digits_per_limb[base] = @intCast(math.log(Limb, base, math.maxInt(Limb)));
+        bases[base] = std.math.pow(Limb, base, digits_per_limb[base]);
+    }
+    break :blk Constants{ .big_bases = bases, .digits_per_limb = digits_per_limb };
+};
+
 /// Returns the number of limbs needed to store `scalar`, which must be a
 /// primitive integer or float value.
 /// Note: A comptime-known upper bound of this value that may be used
@@ -40,6 +61,11 @@ pub fn calcLimbLen(scalar: anytype) usize {
         .comptime_float => return calcLimbLen(@as(f128, scalar)),
         else => @compileError("expected float or int, got " ++ @typeName(@TypeOf(scalar))),
     }
+}
+
+/// Same as `calcToStringLimbsBufferLen`, without the useless base check.
+pub fn calcLog10LimbsBufferLen(a_len: usize) usize {
+    return a_len + 2 + a_len + calcDivLimbsBufferLen(a_len, 1);
 }
 
 pub fn calcToStringLimbsBufferLen(a_len: usize, base: u8) usize {
@@ -96,7 +122,7 @@ pub fn calcNonZeroTwosCompLimbCount(bit_count: usize) usize {
 /// Special cases `bit_count == 0` to return 1. Zero-bit integers can only store the value zero
 /// and this big integer implementation stores zero using one limb.
 pub fn calcTwosCompLimbCount(bit_count: usize) usize {
-    return @max(std.math.divCeil(usize, bit_count, @bitSizeOf(Limb)) catch unreachable, 1);
+    return @max(@divCeil(bit_count, @bitSizeOf(Limb)), 1);
 }
 
 /// a + b * c + *carry, sets carry to the overflow bits
@@ -329,23 +355,15 @@ pub const Mutable = struct {
     /// not allowed (e.g. 0x43 should simply be 43).  Underscores in the input string are
     /// ignored and can be used as digit separators.
     ///
-    /// Asserts there is enough memory for the value in `self.limbs`. An upper bound on number of limbs can
+    /// There must be enough memory for the value in `self.limbs`. An upper bound on number of limbs can
     /// be determined with `calcSetStringLimbCount`.
     /// Asserts the base is in the range [2, 36].
     ///
     /// Returns an error if the value has invalid digits for the requested base.
-    ///
-    /// `limbs_buffer` is used for temporary storage. The size required can be found with
-    /// `calcSetStringLimbsBufferLen`.
-    ///
-    /// If `allocator` is provided, it will be used for temporary storage to improve
-    /// multiplication performance. `error.OutOfMemory` is handled with a fallback algorithm.
     pub fn setString(
         self: *Mutable,
         base: u8,
         value: []const u8,
-        limbs_buffer: []Limb,
-        allocator: ?Allocator,
     ) error{InvalidCharacter}!void {
         assert(base >= 2);
         assert(base <= 36);
@@ -357,18 +375,41 @@ pub const Mutable = struct {
             i += 1;
         }
 
-        const ap_base: Const = .{ .limbs = &[_]Limb{base}, .positive = true };
-        self.set(0);
+        @memset(self.limbs, 0);
+        self.len = 1;
 
+        var limb: Limb = 0;
+        var j: usize = 0;
         for (value[i..]) |ch| {
             if (ch == '_') {
                 continue;
             }
             const d = try std.fmt.charToDigit(ch, base);
-            const ap_d: Const = .{ .limbs = &[_]Limb{d}, .positive = true };
+            limb *= base;
+            limb += d;
+            j += 1;
 
-            self.mul(self.toConst(), ap_base, limbs_buffer, allocator);
-            self.add(self.toConst(), ap_d);
+            if (j == constants.digits_per_limb[base]) {
+                const len = @min(self.len + 1, self.limbs.len);
+                // r = a * b = a + a * (b - 1)
+                // we assert when self.limbs is not large enough to store the number
+                assert(!llmulLimb(.add, self.limbs[0..len], self.limbs[0..len], constants.big_bases[base] - 1));
+                assert(lladdcarry(self.limbs[0..len], self.limbs[0..len], &[1]Limb{limb}) == 0);
+
+                if (self.limbs.len > self.len and self.limbs[self.len] != 0)
+                    self.len += 1;
+                j = 0;
+                limb = 0;
+            }
+        }
+        if (j > 0) {
+            const len = @min(self.len + 1, self.limbs.len);
+            // we assert when self.limbs is not large enough to store the number
+            assert(!llmulLimb(.add, self.limbs[0..len], self.limbs[0..len], math.pow(Limb, base, j) - 1));
+            assert(lladdcarry(self.limbs[0..len], self.limbs[0..len], &[1]Limb{limb}) == 0);
+
+            if (self.limbs.len > self.len and self.limbs[self.len] != 0)
+                self.len += 1;
         }
         self.positive = positive;
     }
@@ -587,12 +628,12 @@ pub const Mutable = struct {
 
         // Slice of the upper bits if they exist, these will be ignored and allows us to use addCarry to determine
         // if an overflow occurred.
-        const x = Const{
+        const x: Const = .{
             .positive = a.positive,
             .limbs = a.limbs[0..@min(req_limbs, a.limbs.len)],
         };
 
-        const y = Const{
+        const y: Const = .{
             .positive = b.positive,
             .limbs = b.limbs[0..@min(req_limbs, b.limbs.len)],
         };
@@ -606,9 +647,8 @@ pub const Mutable = struct {
             //   Note: after this we still might need to wrap.
             const msl = @max(a.limbs.len, b.limbs.len);
             if (msl < req_limbs) {
+                r.len = msl + 1;
                 r.limbs[msl] = 1;
-                r.len = req_limbs;
-                @memset(r.limbs[msl + 1 .. req_limbs], 0);
             } else {
                 carry_truncated = true;
             }
@@ -632,12 +672,12 @@ pub const Mutable = struct {
 
         // Slice of the upper bits if they exist, these will be ignored and allows us to use addCarry to determine
         // if an overflow occurred.
-        const x = Const{
+        const x: Const = .{
             .positive = a.positive,
             .limbs = a.limbs[0..@min(req_limbs, a.limbs.len)],
         };
 
-        const y = Const{
+        const y: Const = .{
             .positive = b.positive,
             .limbs = b.limbs[0..@min(req_limbs, b.limbs.len)],
         };
@@ -649,12 +689,12 @@ pub const Mutable = struct {
             //   Note: In this case, might _also_ need to saturate.
             const msl = @max(a.limbs.len, b.limbs.len);
             if (msl < req_limbs) {
+                r.len = msl + 1;
                 r.limbs[msl] = 1;
-                r.len = req_limbs;
                 // Note: Saturation may still be required if msl == req_limbs - 1
             } else {
                 // Overflowed req_limbs, definitely saturate.
-                r.setTwosCompIntLimit(if (r.positive) .max else .min, signedness, bit_count);
+                return r.setTwosCompIntLimit(if (r.positive) .max else .min, signedness, bit_count);
             }
         }
 
@@ -883,7 +923,12 @@ pub const Mutable = struct {
     /// Asserts the result fits in `r`. Upper bound on the number of limbs needed by
     /// r is `calcTwosCompLimbCount(bit_count)`.
     pub fn bitReverse(r: *Mutable, a: Const, signedness: Signedness, bit_count: usize) void {
-        if (bit_count == 0) return;
+        if (bit_count == 0) {
+            r.limbs[0] = 0;
+            r.len = 1;
+            r.positive = true;
+            return;
+        }
 
         r.copy(a);
 
@@ -945,7 +990,12 @@ pub const Mutable = struct {
     /// Asserts the result fits in `r`. Upper bound on the number of limbs needed by
     /// r is `calcTwosCompLimbCount(8*byte_count)`.
     pub fn byteSwap(r: *Mutable, a: Const, signedness: Signedness, byte_count: usize) void {
-        if (byte_count == 0) return;
+        if (byte_count == 0) {
+            r.limbs[0] = 0;
+            r.len = 1;
+            r.positive = true;
+            return;
+        }
 
         r.copy(a);
         const limbs_required = calcTwosCompLimbCount(8 * byte_count);
@@ -1173,6 +1223,62 @@ pub const Mutable = struct {
 
     /// q = a / b (rem r)
     ///
+    /// a / b are ceiled (rounded towards +inf).
+    /// q may alias with a or b.
+    ///
+    /// Asserts there is enough memory to store q and r.
+    /// The upper bound for r limb count is `b.limbs.len`.
+    /// The upper bound for q limb count is given by `a.limbs`.
+    ///
+    /// `limbs_buffer` is used for temporary storage. The amount required is given by `calcDivLimbsBufferLen`.
+    pub fn divCeil(
+        q: *Mutable,
+        r: *Mutable,
+        a: Const,
+        b: Const,
+        limbs_buffer: []Limb,
+    ) void {
+        const sep = a.limbs.len + 2;
+        var x = a.toMutable(limbs_buffer[0..sep]);
+        var y = b.toMutable(limbs_buffer[sep..]);
+
+        // div performs truncating division (@divTrunc) which rounds towards negative
+        // infinity if the result is positive and towards positive infinity if the result is
+        // negative.
+        div(q, r, &x, &y);
+
+        // @rem gives the remainder after @divTrunc, and is defined by:
+        // x * @divTrunc(x, y) + @rem(x, y) = x
+        // For all integers x, y with y != 0.
+        // In the following comments, a, b will be integers with a >= 0, b > 0, and we will take
+        // modCeil to be the remainder after @divCeil, defined by:
+        // x * @divCeil(x, y) + modCeil(x, y) = x
+        // For all integers x, y with y != 0.
+
+        if (a.positive != b.positive or r.eqlZero()) {
+            // In this case either the result is negative or the remainder is 0.
+            // If the result is negative then the default truncating division already rounds
+            // towards positive infinity, so no adjustment is needed.
+            // If the remainder is 0 then the division is exact and no adjustment is needed.
+        } else {
+            // Same sign.
+            // We have:
+            // modCeil(a, b) != 0
+            // => @divCeil(a, b) = @divTrunc(a, b) + 1
+            // And:
+            // b * @divTrunc(a, b) + @rem(a, b) = a
+            // b * @divCeil(a, b) + modCeil(a, b) = a
+            // => b * @divTrunc(a, b) + b + modCeil(a, b) = a
+            // => modCeil(a, b) = @rem(a, b) - b
+            //
+            // This works for both positive and negative b because b keeps its sign.
+            q.addScalar(q.toConst(), 1);
+            r.sub(r.toConst(), y.toConst());
+        }
+    }
+
+    /// q = a / b (rem r)
+    ///
     /// a / b are truncated (rounded towards -inf).
     /// q may alias with a or b.
     ///
@@ -1323,7 +1429,7 @@ pub const Mutable = struct {
     /// r is `calcTwosCompLimbCount(bit_count)`.
     pub fn bitNotWrap(r: *Mutable, a: Const, signedness: Signedness, bit_count: usize) void {
         r.copy(a.negate());
-        const negative_one = Const{ .limbs = &.{1}, .positive = false };
+        const negative_one: Const = .{ .limbs = &.{1}, .positive = false };
         _ = r.addWrap(r.toConst(), negative_one, signedness, bit_count);
     }
 
@@ -1658,8 +1764,8 @@ pub const Mutable = struct {
         // Handle trailing zero-words of divisor/dividend. These are not handled in the following
         // algorithms.
         // Note, there must be a non-zero limb for either.
-        // const x_trailing = std.mem.indexOfScalar(Limb, x.limbs[0..x.len], 0).?;
-        // const y_trailing = std.mem.indexOfScalar(Limb, y.limbs[0..y.len], 0).?;
+        // const x_trailing = std.mem.findScalar(Limb, x.limbs[0..x.len], 0).?;
+        // const y_trailing = std.mem.findScalar(Limb, y.limbs[0..y.len], 0).?;
 
         const x_trailing = for (x.limbs[0..x.len], 0..) |xi, i| {
             if (xi != 0) break i;
@@ -1689,13 +1795,13 @@ pub const Mutable = struct {
             r.positive = r_positive;
         } else {
             // Shrink x, y such that the trailing zero limbs shared between are removed.
-            var x0 = Mutable{
+            var x0: Mutable = .{
                 .limbs = x.limbs[xy_trailing..],
                 .len = x.len - xy_trailing,
                 .positive = true,
             };
 
-            var y0 = Mutable{
+            var y0: Mutable = .{
                 .limbs = y.limbs[xy_trailing..],
                 .len = y.len - xy_trailing,
                 .positive = true,
@@ -1758,7 +1864,7 @@ pub const Mutable = struct {
             // x >= y * b^(n - t) can be replaced by x/b^(n - t) >= y.
 
             // 'divide' x by b^(n - t)
-            var tmp = Mutable{
+            var tmp: Mutable = .{
                 .limbs = x.limbs[shift..],
                 .len = x.len - shift,
                 .positive = true,
@@ -1997,7 +2103,7 @@ pub const Mutable = struct {
             var limb = switch (signedness) {
                 .unsigned => mem.readVarPackedInt(Limb, buffer, bit_index + bit_offset, bit_count - bit_index, endian, .unsigned),
                 .signed => b: {
-                    const SLimb = std.meta.Int(.signed, @bitSizeOf(Limb));
+                    const SLimb = @Int(.signed, @bitSizeOf(Limb));
                     const limb = mem.readVarPackedInt(SLimb, buffer, bit_index + bit_offset, bit_count - bit_index, endian, .signed);
                     break :b @as(Limb, @bitCast(limb));
                 },
@@ -2028,11 +2134,15 @@ pub const Mutable = struct {
         r.len = llnormalize(r.limbs[0..length]);
     }
 
-    pub fn format(self: Mutable, w: *std.io.Writer) std.io.Writer.Error!void {
+    pub fn format(self: Mutable, w: *std.Io.Writer) std.Io.Writer.Error!void {
         return formatNumber(self, w, .{});
     }
 
-    pub fn formatNumber(self: Const, w: *std.io.Writer, n: std.fmt.Number) std.io.Writer.Error!void {
+    /// If the absolute value of integer is greater than or equal to `pow(2, 64 * @sizeOf(usize) * 8)`,
+    /// this function will fail to print the string, printing "(BigInt)" instead of a number.
+    /// This is because the rendering algorithm requires reversing a string, which requires O(N) memory.
+    /// See `Const.toString` and `Const.toStringAlloc` for a way to print big integers without failure.
+    pub fn formatNumber(self: Mutable, w: *std.Io.Writer, n: std.fmt.Number) std.Io.Writer.Error!void {
         return self.toConst().formatNumber(w, n);
     }
 };
@@ -2053,7 +2163,7 @@ pub const Const = struct {
     pub fn toManaged(self: Const, allocator: Allocator) Allocator.Error!Managed {
         const limbs = try allocator.alloc(Limb, @max(Managed.default_capacity, self.limbs.len));
         @memcpy(limbs[0..self.limbs.len], self.limbs);
-        return Managed{
+        return .{
             .allocator = allocator,
             .limbs = limbs,
             .metadata = if (self.positive)
@@ -2077,7 +2187,7 @@ pub const Const = struct {
         for (self.limbs[0..self.limbs.len]) |limb| {
             std.debug.print("{x} ", .{limb});
         }
-        std.debug.print("len={} positive={}\n", .{ self.len, self.positive });
+        std.debug.print("len={} positive={}\n", .{ self.limbs.len, self.positive });
     }
 
     pub fn abs(self: Const) Const {
@@ -2230,7 +2340,7 @@ pub const Const = struct {
                 // Make sure -0 is handled correctly.
                 if (self.eqlZero()) return 0;
 
-                const Unsigned = std.meta.Int(.unsigned, info.bits);
+                const Unsigned = @Int(.unsigned, info.bits);
 
                 if (!self.fitsInTwosComp(info.signedness, info.bits)) {
                     return error.TargetTooSmall;
@@ -2321,11 +2431,15 @@ pub const Const = struct {
         return .{ normalized_res.reconstruct(if (self.positive) .positive else .negative), exactness };
     }
 
+    pub fn format(self: Const, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        return self.formatNumber(w, .{});
+    }
+
     /// If the absolute value of integer is greater than or equal to `pow(2, 64 * @sizeOf(usize) * 8)`,
     /// this function will fail to print the string, printing "(BigInt)" instead of a number.
     /// This is because the rendering algorithm requires reversing a string, which requires O(N) memory.
     /// See `toString` and `toStringAlloc` for a way to print big integers without failure.
-    pub fn formatNumber(self: Const, w: *std.io.Writer, number: std.fmt.Number) std.io.Writer.Error!void {
+    pub fn formatNumber(self: Const, w: *std.Io.Writer, number: std.fmt.Number) std.Io.Writer.Error!void {
         const available_len = 64;
         if (self.limbs.len > available_len)
             return w.writeAll("(BigInt)");
@@ -2333,7 +2447,7 @@ pub const Const = struct {
         var limbs: [calcToStringLimbsBufferLen(available_len, 10)]Limb = undefined;
 
         const biggest: Const = .{
-            .limbs = &([1]Limb{comptime math.maxInt(Limb)} ** available_len),
+            .limbs = &@as([available_len]Limb, @splat(comptime math.maxInt(Limb))),
             .positive = false,
         };
         var buf: [biggest.sizeInBaseUpperBound(2)]u8 = undefined;
@@ -2626,6 +2740,60 @@ pub const Const = struct {
         }
         return @min(result, bits);
     }
+
+    /// Calculate the base 2 logarithm, rounded down.
+    pub fn log2(a: Const) Limb {
+        assert(a.positive);
+        assert(!a.eqlZero());
+        return a.bitCountAbs() - 1;
+    }
+
+    /// Calculate the base 10 logarithm, rounded down.
+    ///
+    /// The allocator is used to allocate a temporary buffer.
+    pub fn log10Alloc(a: Const, allocator: Allocator) Allocator.Error!Limb {
+        const limbs_buffer = try allocator.alloc(Limb, calcLog10LimbsBufferLen(a.limbs.len));
+        defer allocator.free(limbs_buffer);
+
+        return a.log10(limbs_buffer);
+    }
+
+    /// Calculate the base 10 logarithm, rounded down.
+    ///
+    /// `limbs_buffer` is used for temporary storage. The amount required is given by `calcLog10LimbsBufferLen`.
+    pub fn log10(a: Const, limbs_buffer: []Limb) Limb {
+        assert(a.positive);
+        assert(!a.eqlZero());
+        const limb_base_as_bigint: Const = .{ .limbs = &.{constants.big_bases[10]}, .positive = true };
+
+        var q: Mutable = .{
+            .limbs = limbs_buffer[0 .. a.limbs.len + 2],
+            .positive = true,
+            .len = a.limbs.len,
+        };
+        @memcpy(q.limbs[0..a.limbs.len], a.limbs);
+
+        var remainder: Mutable = .{
+            .limbs = limbs_buffer[q.limbs.len..][0..a.limbs.len],
+            .positive = true,
+            .len = 1,
+        };
+
+        const division_buf = limbs_buffer[q.limbs.len + remainder.limbs.len ..];
+
+        var num_digits: Limb = 0;
+        while (q.len >= 2) {
+            q.divTrunc(&remainder, q.toConst(), limb_base_as_bigint, division_buf);
+            num_digits += constants.digits_per_limb[10];
+        }
+        var remaining_limb = q.limbs[0];
+        while (remaining_limb != 0) {
+            remaining_limb /= 10;
+            num_digits += 1;
+        }
+
+        return num_digits - 1;
+    }
 };
 
 /// An arbitrary-precision big integer along with an allocator which manages the memory.
@@ -2689,7 +2857,7 @@ pub const Managed = struct {
     /// default capacity will be used instead.
     /// The integer value after initializing is `0`.
     pub fn initCapacity(allocator: Allocator, capacity: usize) !Managed {
-        return Managed{
+        return .{
             .allocator = allocator,
             .metadata = 1,
             .limbs = block: {
@@ -2755,7 +2923,7 @@ pub const Managed = struct {
     }
 
     pub fn cloneWithDifferentAllocator(other: Managed, allocator: Allocator) !Managed {
-        return Managed{
+        return .{
             .allocator = allocator,
             .metadata = other.metadata,
             .limbs = block: {
@@ -2876,10 +3044,8 @@ pub const Managed = struct {
     pub fn setString(self: *Managed, base: u8, value: []const u8) !void {
         if (base < 2 or base > 36) return error.InvalidBase;
         try self.ensureCapacity(calcSetStringLimbCount(base, value.len));
-        const limbs_buffer = try self.allocator.alloc(Limb, calcSetStringLimbsBufferLen(base, value.len));
-        defer self.allocator.free(limbs_buffer);
         var m = self.toMutable();
-        try m.setString(base, value, limbs_buffer, self.allocator);
+        try m.setString(base, value);
         self.setMetadata(m.positive, m.len);
     }
 
@@ -2906,7 +3072,7 @@ pub const Managed = struct {
     }
 
     /// To allow `std.fmt.format` to work with `Managed`.
-    pub fn format(self: Managed, w: *std.io.Writer) std.io.Writer.Error!void {
+    pub fn format(self: Managed, w: *std.Io.Writer) std.Io.Writer.Error!void {
         return formatNumber(self, w, .{});
     }
 
@@ -2914,7 +3080,7 @@ pub const Managed = struct {
     /// this function will fail to print the string, printing "(BigInt)" instead of a number.
     /// This is because the rendering algorithm requires reversing a string, which requires O(N) memory.
     /// See `toString` and `toStringAlloc` for a way to print big integers without failure.
-    pub fn formatNumber(self: Managed, w: *std.io.Writer, n: std.fmt.Number) std.io.Writer.Error!void {
+    pub fn formatNumber(self: Managed, w: *std.Io.Writer, n: std.fmt.Number) std.Io.Writer.Error!void {
         return self.toConst().formatNumber(w, n);
     }
 
@@ -2971,7 +3137,9 @@ pub const Managed = struct {
     ///
     /// Returns an error if memory could not be allocated.
     pub fn addScalar(r: *Managed, a: *const Managed, scalar: anytype) Allocator.Error!void {
-        try r.ensureAddScalarCapacity(a.toConst(), scalar);
+        const needed = @max(a.len(), calcLimbLen(scalar)) + 1;
+        const aliased = limbsAliasDistinct(r, a);
+        try r.ensureAliasAwareCapacity(needed, aliased);
         var m = r.toMutable();
         m.addScalar(a.toConst(), scalar);
         r.setMetadata(m.positive, m.len);
@@ -2983,7 +3151,9 @@ pub const Managed = struct {
     ///
     /// Returns an error if memory could not be allocated.
     pub fn add(r: *Managed, a: *const Managed, b: *const Managed) Allocator.Error!void {
-        try r.ensureAddCapacity(a.toConst(), b.toConst());
+        const needed = @max(a.len(), b.len()) + 1;
+        const aliased = limbsAliasDistinct(r, a) or limbsAliasDistinct(r, b);
+        try r.ensureAliasAwareCapacity(needed, aliased);
         var m = r.toMutable();
         m.add(a.toConst(), b.toConst());
         r.setMetadata(m.positive, m.len);
@@ -3001,7 +3171,9 @@ pub const Managed = struct {
         signedness: Signedness,
         bit_count: usize,
     ) Allocator.Error!bool {
-        try r.ensureTwosCompCapacity(bit_count);
+        const aliased = limbsAliasDistinct(r, a) or limbsAliasDistinct(r, b);
+        const needed = calcTwosCompLimbCount(bit_count);
+        try r.ensureAliasAwareCapacity(needed, aliased);
         var m = r.toMutable();
         const wrapped = m.addWrap(a.toConst(), b.toConst(), signedness, bit_count);
         r.setMetadata(m.positive, m.len);
@@ -3014,7 +3186,9 @@ pub const Managed = struct {
     ///
     /// Returns an error if memory could not be allocated.
     pub fn addSat(r: *Managed, a: *const Managed, b: *const Managed, signedness: Signedness, bit_count: usize) Allocator.Error!void {
-        try r.ensureTwosCompCapacity(bit_count);
+        const aliased = limbsAliasDistinct(r, a) or limbsAliasDistinct(r, b);
+        const needed = calcTwosCompLimbCount(bit_count);
+        try r.ensureAliasAwareCapacity(needed, aliased);
         var m = r.toMutable();
         m.addSat(a.toConst(), b.toConst(), signedness, bit_count);
         r.setMetadata(m.positive, m.len);
@@ -3026,7 +3200,9 @@ pub const Managed = struct {
     ///
     /// Returns an error if memory could not be allocated.
     pub fn sub(r: *Managed, a: *const Managed, b: *const Managed) !void {
-        try r.ensureCapacity(@max(a.len(), b.len()) + 1);
+        const aliased = limbsAliasDistinct(r, a) or limbsAliasDistinct(r, b);
+        const needed = @max(a.len(), b.len()) + 1;
+        try r.ensureAliasAwareCapacity(needed, aliased);
         var m = r.toMutable();
         m.sub(a.toConst(), b.toConst());
         r.setMetadata(m.positive, m.len);
@@ -3044,7 +3220,9 @@ pub const Managed = struct {
         signedness: Signedness,
         bit_count: usize,
     ) Allocator.Error!bool {
-        try r.ensureTwosCompCapacity(bit_count);
+        const aliased = limbsAliasDistinct(r, a) or limbsAliasDistinct(r, b);
+        const needed = calcTwosCompLimbCount(bit_count);
+        try r.ensureAliasAwareCapacity(needed, aliased);
         var m = r.toMutable();
         const wrapped = m.subWrap(a.toConst(), b.toConst(), signedness, bit_count);
         r.setMetadata(m.positive, m.len);
@@ -3063,7 +3241,9 @@ pub const Managed = struct {
         signedness: Signedness,
         bit_count: usize,
     ) Allocator.Error!void {
-        try r.ensureTwosCompCapacity(bit_count);
+        const aliased = limbsAliasDistinct(r, a) or limbsAliasDistinct(r, b);
+        const needed = calcTwosCompLimbCount(bit_count);
+        try r.ensureAliasAwareCapacity(needed, aliased);
         var m = r.toMutable();
         m.subSat(a.toConst(), b.toConst(), signedness, bit_count);
         r.setMetadata(m.positive, m.len);
@@ -3082,7 +3262,9 @@ pub const Managed = struct {
             alias_count += 1;
         if (rma.limbs.ptr == b.limbs.ptr)
             alias_count += 1;
-        try rma.ensureMulCapacity(a.toConst(), b.toConst());
+        const needed = a.len() + b.len() + 1;
+        const capacity_alias = limbsAliasDistinct(rma, a) or limbsAliasDistinct(rma, b);
+        try rma.ensureAliasAwareCapacity(needed, capacity_alias);
         var m = rma.toMutable();
         if (alias_count == 0) {
             m.mulNoAlias(a.toConst(), b.toConst(), rma.allocator);
@@ -3114,8 +3296,9 @@ pub const Managed = struct {
             alias_count += 1;
         if (rma.limbs.ptr == b.limbs.ptr)
             alias_count += 1;
-
-        try rma.ensureTwosCompCapacity(bit_count);
+        const needed = calcTwosCompLimbCount(bit_count);
+        const capacity_alias = limbsAliasDistinct(rma, a) or limbsAliasDistinct(rma, b);
+        try rma.ensureAliasAwareCapacity(needed, capacity_alias);
         var m = rma.toMutable();
         if (alias_count == 0) {
             m.mulWrapNoAlias(a.toConst(), b.toConst(), signedness, bit_count, rma.allocator);
@@ -3132,16 +3315,40 @@ pub const Managed = struct {
         try r.ensureCapacity(calcTwosCompLimbCount(bit_count));
     }
 
-    pub fn ensureAddScalarCapacity(r: *Managed, a: Const, scalar: anytype) !void {
-        try r.ensureCapacity(@max(a.limbs.len, calcLimbLen(scalar)) + 1);
+    /// True if two distinct `Managed` parameters share the same limbs buffer.
+    ///
+    /// We specifically exclude the case where `@intFromPtr(a) == @intFromPtr(b)` (same object).
+    /// When both pointers refer to the same `Managed` instance, `ensureCapacity` can reallocate
+    /// the buffer (if needed) without creating dangling pointers for that object.
+    fn limbsAliasDistinct(a: *const Managed, b: *const Managed) bool {
+        return @intFromPtr(a) != @intFromPtr(b) and a.limbs.ptr == b.limbs.ptr;
     }
 
-    pub fn ensureAddCapacity(r: *Managed, a: Const, b: Const) !void {
-        try r.ensureCapacity(@max(a.limbs.len, b.limbs.len) + 1);
+    /// When `aliased` is false (including when both pointers refer to the same object),
+    /// `ensureCapacity` may reallocate; callers who rely on distinct `Managed` instances
+    /// aliasing must ensure capacity before aliasing.
+    /// See https://github.com/ziglang/zig/issues/6167
+    fn ensureAliasAwareCapacity(r: *Managed, needed: usize, aliased: bool) !void {
+        if (aliased) {
+            assert(needed <= r.limbs.len);
+        } else {
+            try r.ensureCapacity(needed);
+        }
     }
 
-    pub fn ensureMulCapacity(rma: *Managed, a: Const, b: Const) !void {
-        try rma.ensureCapacity(a.limbs.len + b.limbs.len + 1);
+    /// Use this function before doing `addScalar` if some of your parameters alias each other
+    pub fn ensureAddScalarCapacity(r: *Managed, a: *const Managed, scalar: anytype) !void {
+        try r.ensureCapacity(@max(a.len(), calcLimbLen(scalar)) + 1);
+    }
+
+    /// Use this function before doing `add` if some of your parameters alias each other
+    pub fn ensureAddCapacity(r: *Managed, a: *const Managed, b: *const Managed) !void {
+        try r.ensureCapacity(@max(a.len(), b.len()) + 1);
+    }
+
+    /// Use this function before doing `mul` if some of your parameters alias each other
+    pub fn ensureMulCapacity(rma: *Managed, a: *const Managed, b: *const Managed) !void {
+        try rma.ensureCapacity(a.len() + b.len() + 1);
     }
 
     /// q = a / b (rem r)
@@ -3150,8 +3357,10 @@ pub const Managed = struct {
     ///
     /// Returns an error if memory could not be allocated.
     pub fn divFloor(q: *Managed, r: *Managed, a: *const Managed, b: *const Managed) !void {
-        try q.ensureCapacity(a.len());
-        try r.ensureCapacity(b.len());
+        const q_alias = limbsAliasDistinct(q, a) or limbsAliasDistinct(q, b);
+        const r_alias = limbsAliasDistinct(r, a) or limbsAliasDistinct(r, b);
+        try q.ensureAliasAwareCapacity(a.len(), q_alias);
+        try r.ensureAliasAwareCapacity(b.len(), r_alias);
         var mq = q.toMutable();
         var mr = r.toMutable();
         const limbs_buffer = try q.allocator.alloc(Limb, calcDivLimbsBufferLen(a.len(), b.len()));
@@ -3163,12 +3372,33 @@ pub const Managed = struct {
 
     /// q = a / b (rem r)
     ///
+    /// a / b are ceiled (rounded towards positive infinity).
+    ///
+    /// Returns an error if memory could not be allocated.
+    pub fn divCeil(q: *Managed, r: *Managed, a: *const Managed, b: *const Managed) !void {
+        const q_alias = limbsAliasDistinct(q, a) or limbsAliasDistinct(q, b);
+        const r_alias = limbsAliasDistinct(r, a) or limbsAliasDistinct(r, b);
+        try q.ensureAliasAwareCapacity(a.len(), q_alias);
+        try r.ensureAliasAwareCapacity(b.len(), r_alias);
+        var mq = q.toMutable();
+        var mr = r.toMutable();
+        const limbs_buffer = try q.allocator.alloc(Limb, calcDivLimbsBufferLen(a.len(), b.len()));
+        defer q.allocator.free(limbs_buffer);
+        mq.divCeil(&mr, a.toConst(), b.toConst(), limbs_buffer);
+        q.setMetadata(mq.positive, mq.len);
+        r.setMetadata(mr.positive, mr.len);
+    }
+
+    /// q = a / b (rem r)
+    ///
     /// a / b are truncated (rounded towards -inf).
     ///
     /// Returns an error if memory could not be allocated.
     pub fn divTrunc(q: *Managed, r: *Managed, a: *const Managed, b: *const Managed) !void {
-        try q.ensureCapacity(a.len());
-        try r.ensureCapacity(b.len());
+        const q_alias = limbsAliasDistinct(q, a) or limbsAliasDistinct(q, b);
+        const r_alias = limbsAliasDistinct(r, a) or limbsAliasDistinct(r, b);
+        try q.ensureAliasAwareCapacity(a.len(), q_alias);
+        try r.ensureAliasAwareCapacity(b.len(), r_alias);
         var mq = q.toMutable();
         var mr = r.toMutable();
         const limbs_buffer = try q.allocator.alloc(Limb, calcDivLimbsBufferLen(a.len(), b.len()));
@@ -3181,7 +3411,9 @@ pub const Managed = struct {
     /// r = a << shift, in other words, r = a * 2^shift
     /// r and a may alias.
     pub fn shiftLeft(r: *Managed, a: *const Managed, shift: usize) !void {
-        try r.ensureCapacity(a.len() + (shift / limb_bits) + 1);
+        const aliased = limbsAliasDistinct(r, a);
+        const needed = a.len() + (shift / limb_bits) + 1;
+        try r.ensureAliasAwareCapacity(needed, aliased);
         var m = r.toMutable();
         m.shiftLeft(a.toConst(), shift);
         r.setMetadata(m.positive, m.len);
@@ -3190,7 +3422,9 @@ pub const Managed = struct {
     /// r = a <<| shift with 2s-complement saturating semantics.
     /// r and a may alias.
     pub fn shiftLeftSat(r: *Managed, a: *const Managed, shift: usize, signedness: Signedness, bit_count: usize) !void {
-        try r.ensureTwosCompCapacity(bit_count);
+        const aliased = limbsAliasDistinct(r, a);
+        const needed = calcTwosCompLimbCount(bit_count);
+        try r.ensureAliasAwareCapacity(needed, aliased);
         var m = r.toMutable();
         m.shiftLeftSat(a.toConst(), shift, signedness, bit_count);
         r.setMetadata(m.positive, m.len);
@@ -3212,7 +3446,9 @@ pub const Managed = struct {
             return;
         }
 
-        try r.ensureCapacity(a.len() - (shift / limb_bits));
+        const aliased = limbsAliasDistinct(r, a);
+        const needed = a.len() - (shift / limb_bits);
+        try r.ensureAliasAwareCapacity(needed, aliased);
         var m = r.toMutable();
         m.shiftRight(a.toConst(), shift);
         r.setMetadata(m.positive, m.len);
@@ -3221,7 +3457,9 @@ pub const Managed = struct {
     /// r = ~a under 2s-complement wrapping semantics.
     /// r and a may alias.
     pub fn bitNotWrap(r: *Managed, a: *const Managed, signedness: Signedness, bit_count: usize) !void {
-        try r.ensureTwosCompCapacity(bit_count);
+        const aliased = limbsAliasDistinct(r, a);
+        const needed = calcTwosCompLimbCount(bit_count);
+        try r.ensureAliasAwareCapacity(needed, aliased);
         var m = r.toMutable();
         m.bitNotWrap(a.toConst(), signedness, bit_count);
         r.setMetadata(m.positive, m.len);
@@ -3231,7 +3469,9 @@ pub const Managed = struct {
     ///
     /// a and b are zero-extended to the longer of a or b.
     pub fn bitOr(r: *Managed, a: *const Managed, b: *const Managed) !void {
-        try r.ensureCapacity(@max(a.len(), b.len()));
+        const aliased = limbsAliasDistinct(r, a) or limbsAliasDistinct(r, b);
+        const needed = @max(a.len(), b.len());
+        try r.ensureAliasAwareCapacity(needed, aliased);
         var m = r.toMutable();
         m.bitOr(a.toConst(), b.toConst());
         r.setMetadata(m.positive, m.len);
@@ -3243,7 +3483,8 @@ pub const Managed = struct {
             if (b.isPositive()) b.len() else if (a.isPositive()) a.len() else a.len() + 1
         else if (a.isPositive()) a.len() else if (b.isPositive()) b.len() else b.len() + 1;
 
-        try r.ensureCapacity(cap);
+        const aliased = limbsAliasDistinct(r, a) or limbsAliasDistinct(r, b);
+        try r.ensureAliasAwareCapacity(cap, aliased);
         var m = r.toMutable();
         m.bitAnd(a.toConst(), b.toConst());
         r.setMetadata(m.positive, m.len);
@@ -3252,7 +3493,8 @@ pub const Managed = struct {
     /// r = a ^ b
     pub fn bitXor(r: *Managed, a: *const Managed, b: *const Managed) !void {
         const cap = @max(a.len(), b.len()) + @intFromBool(a.isPositive() != b.isPositive());
-        try r.ensureCapacity(cap);
+        const aliased = limbsAliasDistinct(r, a) or limbsAliasDistinct(r, b);
+        try r.ensureAliasAwareCapacity(cap, aliased);
 
         var m = r.toMutable();
         m.bitXor(a.toConst(), b.toConst());
@@ -3264,7 +3506,9 @@ pub const Managed = struct {
     ///
     /// rma's allocator is used for temporary storage to boost multiplication performance.
     pub fn gcd(rma: *Managed, x: *const Managed, y: *const Managed) !void {
-        try rma.ensureCapacity(@min(x.len(), y.len()));
+        const aliased = limbsAliasDistinct(rma, x) or limbsAliasDistinct(rma, y);
+        const needed = @min(x.len(), y.len());
+        try rma.ensureAliasAwareCapacity(needed, aliased);
         var m = rma.toMutable();
         var limbs_buffer = std.array_list.Managed(Limb).init(rma.allocator);
         defer limbs_buffer.deinit();
@@ -3275,18 +3519,20 @@ pub const Managed = struct {
     /// r = a * a
     pub fn sqr(rma: *Managed, a: *const Managed) !void {
         const needed_limbs = 2 * a.len() + 1;
+        const capacity_alias = limbsAliasDistinct(rma, a);
+        const same_buffer = rma.limbs.ptr == a.limbs.ptr;
+        try rma.ensureAliasAwareCapacity(needed_limbs, capacity_alias);
 
-        if (rma.limbs.ptr == a.limbs.ptr) {
-            var m = try Managed.initCapacity(rma.allocator, needed_limbs);
-            errdefer m.deinit();
-            var m_mut = m.toMutable();
-            m_mut.sqrNoAlias(a.toConst(), rma.allocator);
-            m.setMetadata(m_mut.positive, m_mut.len);
-
-            rma.deinit();
-            rma.swap(&m);
+        if (same_buffer) {
+            const a_len = a.len();
+            const tmp = try rma.allocator.alloc(Limb, a_len);
+            defer rma.allocator.free(tmp);
+            @memcpy(tmp[0..a_len], a.limbs[0..a_len]);
+            const a_const: Const = .{ .limbs = tmp[0..a_len], .positive = a.isPositive() };
+            var rma_mut = rma.toMutable();
+            rma_mut.sqrNoAlias(a_const, rma.allocator);
+            rma.setMetadata(rma_mut.positive, rma_mut.len);
         } else {
-            try rma.ensureCapacity(needed_limbs);
             var rma_mut = rma.toMutable();
             rma_mut.sqrNoAlias(a.toConst(), rma.allocator);
             rma.setMetadata(rma_mut.positive, rma_mut.len);
@@ -3295,21 +3541,23 @@ pub const Managed = struct {
 
     pub fn pow(rma: *Managed, a: *const Managed, b: u32) !void {
         const needed_limbs = calcPowLimbsBufferLen(a.bitCountAbs(), b);
+        const capacity_alias = limbsAliasDistinct(rma, a);
+        const same_buffer = rma.limbs.ptr == a.limbs.ptr;
 
+        try rma.ensureAliasAwareCapacity(needed_limbs, capacity_alias);
         const limbs_buffer = try rma.allocator.alloc(Limb, needed_limbs);
         defer rma.allocator.free(limbs_buffer);
 
-        if (rma.limbs.ptr == a.limbs.ptr) {
-            var m = try Managed.initCapacity(rma.allocator, needed_limbs);
-            errdefer m.deinit();
-            var m_mut = m.toMutable();
-            m_mut.pow(a.toConst(), b, limbs_buffer);
-            m.setMetadata(m_mut.positive, m_mut.len);
-
-            rma.deinit();
-            rma.swap(&m);
+        if (same_buffer) {
+            const a_len = a.len();
+            const tmp = try rma.allocator.alloc(Limb, a_len);
+            defer rma.allocator.free(tmp);
+            @memcpy(tmp[0..a_len], a.limbs[0..a_len]);
+            const a_const: Const = .{ .limbs = tmp[0..a_len], .positive = a.isPositive() };
+            var rma_mut = rma.toMutable();
+            rma_mut.pow(a_const, b, limbs_buffer);
+            rma.setMetadata(rma_mut.positive, rma_mut.len);
         } else {
-            try rma.ensureCapacity(needed_limbs);
             var rma_mut = rma.toMutable();
             rma_mut.pow(a.toConst(), b, limbs_buffer);
             rma.setMetadata(rma_mut.positive, rma_mut.len);
@@ -3319,6 +3567,7 @@ pub const Managed = struct {
     /// r = ⌊√a⌋
     pub fn sqrt(rma: *Managed, a: *const Managed) !void {
         const bit_count = a.bitCountAbs();
+        const aliased = limbsAliasDistinct(rma, a);
 
         if (bit_count == 0) {
             try rma.set(0);
@@ -3334,7 +3583,8 @@ pub const Managed = struct {
         const limbs_buffer = try rma.allocator.alloc(Limb, needed_limbs);
         defer rma.allocator.free(limbs_buffer);
 
-        try rma.ensureCapacity((a.len() - 1) / 2 + 1);
+        const needed = (a.len() - 1) / 2 + 1;
+        try rma.ensureAliasAwareCapacity(needed, aliased);
         var m = rma.toMutable();
         m.sqrt(a.toConst(), limbs_buffer);
         rma.setMetadata(m.positive, m.len);
@@ -3342,7 +3592,9 @@ pub const Managed = struct {
 
     /// r = truncate(Int(signedness, bit_count), a)
     pub fn truncate(r: *Managed, a: *const Managed, signedness: Signedness, bit_count: usize) !void {
-        try r.ensureCapacity(calcTwosCompLimbCount(bit_count));
+        const aliased = limbsAliasDistinct(r, a);
+        const needed = calcTwosCompLimbCount(bit_count);
+        try r.ensureAliasAwareCapacity(needed, aliased);
         var m = r.toMutable();
         m.truncate(a.toConst(), signedness, bit_count);
         r.setMetadata(m.positive, m.len);
@@ -3350,7 +3602,9 @@ pub const Managed = struct {
 
     /// r = saturate(Int(signedness, bit_count), a)
     pub fn saturate(r: *Managed, a: *const Managed, signedness: Signedness, bit_count: usize) !void {
-        try r.ensureCapacity(calcTwosCompLimbCount(bit_count));
+        const aliased = limbsAliasDistinct(r, a);
+        const needed = calcTwosCompLimbCount(bit_count);
+        try r.ensureAliasAwareCapacity(needed, aliased);
         var m = r.toMutable();
         m.saturate(a.toConst(), signedness, bit_count);
         r.setMetadata(m.positive, m.len);
@@ -3359,7 +3613,9 @@ pub const Managed = struct {
     /// r = @popCount(a) with 2s-complement semantics.
     /// r and a may be aliases.
     pub fn popCount(r: *Managed, a: *const Managed, bit_count: usize) !void {
-        try r.ensureCapacity(calcTwosCompLimbCount(bit_count));
+        const aliased = limbsAliasDistinct(r, a);
+        const needed = calcTwosCompLimbCount(bit_count);
+        try r.ensureAliasAwareCapacity(needed, aliased);
         var m = r.toMutable();
         m.popCount(a.toConst(), bit_count);
         r.setMetadata(m.positive, m.len);
@@ -3588,6 +3844,7 @@ fn llmulaccKaratsuba(
 /// r = r (op) a.
 /// The result is computed modulo `r.len`.
 fn llaccum(comptime op: AccOp, r: []Limb, a: []const Limb) void {
+    assert(!slicesOverlap(r, a) or @intFromPtr(r.ptr) <= @intFromPtr(a.ptr));
     if (op == .sub) {
         _ = llsubcarry(r, r, a);
         return;
@@ -3657,6 +3914,8 @@ fn llmulaccLong(comptime op: AccOp, r: []Limb, a: []const Limb, b: []const Limb)
 /// The result is computed modulo `r.len`.
 /// Returns whether the operation overflowed.
 fn llmulLimb(comptime op: AccOp, acc: []Limb, y: []const Limb, xi: Limb) bool {
+    assert(!slicesOverlap(acc, y) or @intFromPtr(acc.ptr) <= @intFromPtr(y.ptr));
+
     if (xi == 0) {
         return false;
     }
@@ -3719,6 +3978,8 @@ fn llsubcarry(r: []Limb, a: []const Limb, b: []const Limb) Limb {
     assert(a.len != 0 and b.len != 0);
     assert(a.len >= b.len);
     assert(r.len >= a.len);
+    assert(!slicesOverlap(r, a) or @intFromPtr(r.ptr) <= @intFromPtr(a.ptr));
+    assert(!slicesOverlap(r, b) or @intFromPtr(r.ptr) <= @intFromPtr(b.ptr));
 
     var i: usize = 0;
     var borrow: Limb = 0;
@@ -3750,6 +4011,8 @@ fn lladdcarry(r: []Limb, a: []const Limb, b: []const Limb) Limb {
     assert(a.len != 0 and b.len != 0);
     assert(a.len >= b.len);
     assert(r.len >= a.len);
+    assert(!slicesOverlap(r, a) or @intFromPtr(r.ptr) <= @intFromPtr(a.ptr));
+    assert(!slicesOverlap(r, b) or @intFromPtr(r.ptr) <= @intFromPtr(b.ptr));
 
     var i: usize = 0;
     var carry: Limb = 0;
@@ -3984,9 +4247,8 @@ fn llsignedor(r: []Limb, a: []const Limb, a_positive: bool, b: []const Limb, b_p
         assert(r_carry == 0);
 
         // With b = 0, we get (-a - 1) & ~0 = -a - 1.
-        // Note, if a_borrow is zero we do not need to compute anything for
-        // the higher limbs so we can early return here.
-        while (i < a.len and a_borrow == 1) : (i += 1) {
+        // Copy the higher limbs even after the borrow is zero in case r does not alias a.
+        while (i < a.len) : (i += 1) {
             const ov = @subWithOverflow(a[i], a_borrow);
             r[i] = ov[0];
             a_borrow = ov[1];
@@ -4624,4 +4886,30 @@ fn testOneShiftCaseAliasing(func: fn ([]Limb, []const Limb, usize) usize, case: 
         try std.testing.expectEqual(expected.len, len);
         try std.testing.expectEqualSlices(Limb, expected, r[base .. base + len]);
     }
+}
+
+test "format" {
+    var a: Managed = try .init(std.testing.allocator);
+    defer a.deinit();
+
+    try a.set(123);
+    try testFormat(a, "123");
+
+    try a.set(-123);
+    try testFormat(a, "-123");
+
+    try a.set(20000000000000000000); // > maxInt(u64)
+    try testFormat(a, "20000000000000000000");
+
+    try a.set(1 << 64 * @sizeOf(usize) * 8);
+    try testFormat(a, "(BigInt)");
+
+    try a.set(-(1 << 64 * @sizeOf(usize) * 8));
+    try testFormat(a, "(BigInt)");
+}
+
+fn testFormat(a: Managed, expected: []const u8) !void {
+    try std.testing.expectFmt(expected, "{f}", .{a});
+    try std.testing.expectFmt(expected, "{f}", .{a.toMutable()});
+    try std.testing.expectFmt(expected, "{f}", .{a.toConst()});
 }

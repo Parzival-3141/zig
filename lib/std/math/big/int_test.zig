@@ -1,5 +1,4 @@
 const std = @import("../../std.zig");
-const builtin = @import("builtin");
 const mem = std.mem;
 const testing = std.testing;
 const Managed = std.math.big.int.Managed;
@@ -276,8 +275,6 @@ fn setFloat(comptime Float: type) !void {
     try expectNormalized(1 << 10, res.toConst());
 }
 test setFloat {
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
-
     try setFloat(f16);
     try setFloat(f32);
     try setFloat(f64);
@@ -484,7 +481,6 @@ fn toFloat(comptime Float: type) !void {
     );
 }
 test toFloat {
-    if (builtin.zig_backend == .stage2_llvm) return error.SkipZigTest; // https://github.com/ziglang/zig/issues/24191
     try toFloat(f16);
     try toFloat(f32);
     try toFloat(f64);
@@ -583,7 +579,9 @@ test "bitcount + sizeInBaseUpperBound" {
     try testing.expect(a.sizeInBaseUpperBound(2) >= 32);
     try testing.expect(a.sizeInBaseUpperBound(10) >= 10);
 
-    try a.shiftLeft(&a, 5000);
+    const shift = 5000;
+    try a.ensureCapacity(a.len() + (shift / @bitSizeOf(Limb)) + 1);
+    try a.shiftLeft(&a, shift);
     try testing.expectEqual(5032, a.bitCountAbs());
     try testing.expect(a.sizeInBaseUpperBound(2) >= 5032);
     a.setSign(false);
@@ -600,7 +598,6 @@ test "bitcount/to" {
     try testing.expectEqual(0, a.bitCountTwosComp());
 
     try testing.expectEqual(0, try a.toInt(u0));
-    try testing.expectEqual(0, try a.toInt(i0));
 
     try a.set(-1);
     try testing.expectEqual(1, a.bitCountTwosComp());
@@ -629,7 +626,6 @@ test "fits" {
 
     try a.set(0);
     try testing.expect(a.fits(u0));
-    try testing.expect(a.fits(i0));
 
     try a.set(255);
     try testing.expect(!a.fits(u0));
@@ -709,7 +705,6 @@ test "twos complement limit set" {
     try testTwosComplementLimit(u1);
     try testTwosComplementLimit(i1);
     try testTwosComplementLimit(u0);
-    try testTwosComplementLimit(i0);
     try testTwosComplementLimit(u65);
     try testTwosComplementLimit(i65);
 }
@@ -737,7 +732,7 @@ test "string to" {
     defer testing.allocator.free(as);
     const es = "120317241209124781241290847124";
 
-    try testing.expect(mem.eql(u8, as, es));
+    try testing.expectEqualSlices(u8, es, as);
 }
 
 test "string to base base error" {
@@ -755,7 +750,7 @@ test "string to base 2" {
     defer testing.allocator.free(as);
     const es = "-1011";
 
-    try testing.expect(mem.eql(u8, as, es));
+    try testing.expectEqualSlices(u8, es, as);
 }
 
 test "string to base 16" {
@@ -766,7 +761,7 @@ test "string to base 16" {
     defer testing.allocator.free(as);
     const es = "efffffff00000001eeeeeeefaaaaaaab";
 
-    try testing.expect(mem.eql(u8, as, es));
+    try testing.expectEqualSlices(u8, es, as);
 }
 
 test "string to base 36" {
@@ -777,7 +772,7 @@ test "string to base 36" {
     defer testing.allocator.free(as);
     const es = "fifvthrv1mzt79ez9";
 
-    try testing.expect(mem.eql(u8, as, es));
+    try testing.expectEqualSlices(u8, es, as);
 }
 
 test "neg string to" {
@@ -788,7 +783,7 @@ test "neg string to" {
     defer testing.allocator.free(as);
     const es = "-123907434";
 
-    try testing.expect(mem.eql(u8, as, es));
+    try testing.expectEqualSlices(u8, es, as);
 }
 
 test "zero string to" {
@@ -799,7 +794,7 @@ test "zero string to" {
     defer testing.allocator.free(as);
     const es = "0";
 
-    try testing.expect(mem.eql(u8, as, es));
+    try testing.expectEqualSlices(u8, es, as);
 }
 
 test "clone" {
@@ -1258,6 +1253,28 @@ test "subSat single-multi, signed, limb aligned" {
     try testing.expectEqual(minInt(SignedDoubleLimb), try a.toInt(SignedDoubleLimb));
 }
 
+test "addSat multi-multi, signed, unused limb" {
+    var a = try Managed.initSet(testing.allocator, 1 << (@bitSizeOf(Limb) - 1));
+    defer a.deinit();
+
+    try a.ensureTwosCompCapacity(3 * @bitSizeOf(Limb));
+    try a.addSat(&a, &a, .signed, 3 * @bitSizeOf(Limb));
+
+    try testing.expectEqual(1 << @bitSizeOf(Limb), try a.toInt(SignedDoubleLimb));
+}
+
+test "subSat multi-multi, signed, unused limb" {
+    var a = try Managed.initSet(testing.allocator, -1 << (@bitSizeOf(Limb) - 1));
+    defer a.deinit();
+
+    var b = try Managed.initSet(testing.allocator, 1 << (@bitSizeOf(Limb) - 1));
+    defer b.deinit();
+
+    try a.subSat(&a, &b, .signed, 3 * @bitSizeOf(Limb));
+
+    try testing.expectEqual(-1 << @bitSizeOf(Limb), try a.toInt(SignedDoubleLimb));
+}
+
 test "sub single-single" {
     var a = try Managed.initSet(testing.allocator, 50);
     defer a.deinit();
@@ -1370,8 +1387,6 @@ test "mul multi-single" {
 }
 
 test "mul multi-multi" {
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
-
     var op1: u256 = 0x998888efefefefefefefef;
     var op2: u256 = 0x333000abababababababab;
     _ = .{ &op1, &op2 };
@@ -1493,8 +1508,6 @@ test "mulWrap single-single signed" {
 }
 
 test "mulWrap multi-multi unsigned" {
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
-
     var op1: u256 = 0x998888efefefefefefefef;
     var op2: u256 = 0x333000abababababababab;
     _ = .{ &op1, &op2 };
@@ -1512,11 +1525,6 @@ test "mulWrap multi-multi unsigned" {
 }
 
 test "mulWrap multi-multi signed" {
-    switch (builtin.zig_backend) {
-        .stage2_c => return error.SkipZigTest,
-        else => {},
-    }
-
     var a = try Managed.initSet(testing.allocator, maxInt(SignedDoubleLimb) - 1);
     defer a.deinit();
     var b = try Managed.initSet(testing.allocator, maxInt(SignedDoubleLimb));
@@ -1723,8 +1731,6 @@ test "div q=0 alias" {
 }
 
 test "div multi-multi q < r" {
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
-
     const op1 = 0x1ffffffff0078f432;
     const op2 = 0x1ffffffff01000000;
     var a = try Managed.initSet(testing.allocator, op1);
@@ -2106,9 +2112,45 @@ test "div floor positive close to zero" {
     try testing.expectEqual(10, try r.toInt(i32));
 }
 
-test "div multi-multi with rem" {
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
+fn testDivCeil(comptime T: type, u: T, v: T, eq: T, er: T) !void {
+    var a = try Managed.initSet(testing.allocator, u);
+    defer a.deinit();
+    var b = try Managed.initSet(testing.allocator, v);
+    defer b.deinit();
 
+    var q = try Managed.init(testing.allocator);
+    defer q.deinit();
+    var r = try Managed.init(testing.allocator);
+    defer r.deinit();
+
+    try Managed.divCeil(&q, &r, &a, &b);
+
+    try testing.expectEqual(eq, try q.toInt(T));
+    try testing.expectEqual(er, try r.toInt(T));
+}
+
+test "div ceil small" {
+    try testDivCeil(i32, 5, 3, 2, -1);
+    try testDivCeil(i32, -5, 3, -1, -2);
+    try testDivCeil(i32, 5, -3, -1, 2);
+    try testDivCeil(i32, -5, -3, 2, 1);
+    try testDivCeil(i32, -0x80000000, 1, -0x80000000, 0);
+}
+
+test "div ceil multi-limb" {
+    {
+        const a = (@as(i128, 1) << 100) + 3;
+        const b: i128 = 4;
+        try testDivCeil(i128, a, b, (1 << 98) + 1, -1);
+    }
+    {
+        const a = -((@as(i128, 1) << 100) + 3);
+        const b: i128 = 4;
+        try testDivCeil(i128, a, b, -(1 << 98), -3);
+    }
+}
+
+test "div multi-multi with rem" {
     var a = try Managed.initSet(testing.allocator, 0x8888999911110000ffffeeeeddddccccbbbbaaaa9999);
     defer a.deinit();
     var b = try Managed.initSet(testing.allocator, 0x99990000111122223333);
@@ -2125,8 +2167,6 @@ test "div multi-multi with rem" {
 }
 
 test "div multi-multi no rem" {
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
-
     var a = try Managed.initSet(testing.allocator, 0x8888999911110000ffffeeeedb4fec200ee3a4286361);
     defer a.deinit();
     var b = try Managed.initSet(testing.allocator, 0x99990000111122223333);
@@ -2143,8 +2183,6 @@ test "div multi-multi no rem" {
 }
 
 test "div multi-multi (2 branch)" {
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
-
     var a = try Managed.initSet(testing.allocator, 0x866666665555555588888887777777761111111111111111);
     defer a.deinit();
     var b = try Managed.initSet(testing.allocator, 0x86666666555555554444444433333333);
@@ -2161,8 +2199,6 @@ test "div multi-multi (2 branch)" {
 }
 
 test "div multi-multi (3.1/3.3 branch)" {
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
-
     var a = try Managed.initSet(testing.allocator, 0x11111111111111111111111111111111111111111111111111111111111111);
     defer a.deinit();
     var b = try Managed.initSet(testing.allocator, 0x1111111111111111111111111111111111111111171);
@@ -2179,8 +2215,6 @@ test "div multi-multi (3.1/3.3 branch)" {
 }
 
 test "div multi-single zero-limb trailing" {
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
-
     var a = try Managed.initSet(testing.allocator, 0x60000000000000000000000000000000000000000000000000000000000000000);
     defer a.deinit();
     var b = try Managed.initSet(testing.allocator, 0x10000000000000000);
@@ -2199,8 +2233,6 @@ test "div multi-single zero-limb trailing" {
 }
 
 test "div multi-multi zero-limb trailing (with rem)" {
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
-
     var a = try Managed.initSet(testing.allocator, 0x86666666555555558888888777777776111111111111111100000000000000000000000000000000);
     defer a.deinit();
     var b = try Managed.initSet(testing.allocator, 0x8666666655555555444444443333333300000000000000000000000000000000);
@@ -2220,8 +2252,6 @@ test "div multi-multi zero-limb trailing (with rem)" {
 }
 
 test "div multi-multi zero-limb trailing (with rem) and dividend zero-limb count > divisor zero-limb count" {
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
-
     var a = try Managed.initSet(testing.allocator, 0x8666666655555555888888877777777611111111111111110000000000000000);
     defer a.deinit();
     var b = try Managed.initSet(testing.allocator, 0x8666666655555555444444443333333300000000000000000000000000000000);
@@ -2241,8 +2271,6 @@ test "div multi-multi zero-limb trailing (with rem) and dividend zero-limb count
 }
 
 test "div multi-multi zero-limb trailing (with rem) and dividend zero-limb count < divisor zero-limb count" {
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
-
     var a = try Managed.initSet(testing.allocator, 0x86666666555555558888888777777776111111111111111100000000000000000000000000000000);
     defer a.deinit();
     var b = try Managed.initSet(testing.allocator, 0x866666665555555544444444333333330000000000000000);
@@ -2349,7 +2377,7 @@ test "truncate multi to single signed" {
 
 test "truncate multi to multi unsigned" {
     const bits = @typeInfo(SignedDoubleLimb).int.bits;
-    const Int = std.meta.Int(.unsigned, bits - 1);
+    const Int = @Int(.unsigned, bits - 1);
 
     var a = try Managed.initSet(testing.allocator, maxInt(SignedDoubleLimb));
     defer a.deinit();
@@ -2365,7 +2393,7 @@ test "truncate multi to multi signed" {
 
     try a.truncate(&a, .signed, @bitSizeOf(Limb) + 1);
 
-    try testing.expectEqual(-1 << @bitSizeOf(Limb), try a.toInt(std.meta.Int(.signed, @bitSizeOf(Limb) + 1)));
+    try testing.expectEqual(-1 << @bitSizeOf(Limb), try a.toInt(@Int(.signed, @bitSizeOf(Limb) + 1)));
 }
 
 test "truncate negative multi to single" {
@@ -2380,7 +2408,9 @@ test "truncate negative multi to single" {
 test "truncate multi unsigned many" {
     var a = try Managed.initSet(testing.allocator, 1);
     defer a.deinit();
-    try a.shiftLeft(&a, 1023);
+    const shift = 1023;
+    try a.ensureCapacity(a.len() + (shift / @bitSizeOf(Limb)) + 1);
+    try a.shiftLeft(&a, shift);
 
     var b = try Managed.init(testing.allocator);
     defer b.deinit();
@@ -2771,13 +2801,6 @@ test "bitNotWrap signed multi" {
 }
 
 test "bitNotWrap more than two limbs" {
-    // This test requires int sizes greater than 128 bits.
-    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
-    // LLVM: unexpected runtime library name: __umodei4
-    if (builtin.zig_backend == .stage2_llvm and comptime builtin.target.cpu.arch.isWasm()) return error.SkipZigTest; // TODO
-
     var a = try Managed.initSet(testing.allocator, maxInt(Limb));
     defer a.deinit();
 
@@ -2787,11 +2810,11 @@ test "bitNotWrap more than two limbs" {
     const bits = @bitSizeOf(Limb) * 4 + 2;
 
     try res.bitNotWrap(&a, .unsigned, bits);
-    const Unsigned = @Type(.{ .int = .{ .signedness = .unsigned, .bits = bits } });
+    const Unsigned = @Int(.unsigned, bits);
     try testing.expectEqual((try res.toInt(Unsigned)), ~@as(Unsigned, maxInt(Limb)));
 
     try res.bitNotWrap(&a, .signed, bits);
-    const Signed = @Type(.{ .int = .{ .signedness = .signed, .bits = bits } });
+    const Signed = @Int(.signed, bits);
     try testing.expectEqual((try res.toInt(Signed)), ~@as(Signed, maxInt(Limb)));
 }
 
@@ -3019,6 +3042,19 @@ test "bitwise or negative-positive multi-limb" {
     try testing.expectEqual(-maxInt(Limb), try a.toInt(SignedDoubleLimb));
 }
 
+test "bitwise or negative-positive multi-limb non-aliased" {
+    var a = try Managed.initSet(testing.allocator, -maxInt(Limb) - 2);
+    defer a.deinit();
+    var b = try Managed.initSet(testing.allocator, 1);
+    defer b.deinit();
+    var r = try Managed.init(testing.allocator);
+    defer r.deinit();
+
+    try r.bitOr(&a, &b);
+
+    try testing.expectEqual(-maxInt(Limb) - 2, try r.toInt(SignedDoubleLimb));
+}
+
 test "bitwise or positive-negative simple" {
     var a = try Managed.initSet(testing.allocator, 0xffffffff11111111);
     defer a.deinit();
@@ -3121,8 +3157,6 @@ test "gcd non-one large" {
 }
 
 test "gcd large multi-limb result" {
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
-
     var a = try Managed.initSet(testing.allocator, 0x12345678123456781234567812345678123456781234567812345678);
     defer a.deinit();
     var b = try Managed.initSet(testing.allocator, 0x12345671234567123456712345671234567123456712345671234567);
@@ -3263,7 +3297,7 @@ test "regression test for 1 limb overflow with alias" {
     var b = try Managed.initSet(testing.allocator, 12200160415121876738);
     defer b.deinit();
 
-    try a.ensureAddCapacity(a.toConst(), b.toConst());
+    try a.ensureAddCapacity(&a, &b);
     try a.add(&a, &b);
 
     try testing.expectEqual(.eq, a.toConst().orderAgainstScalar(19740274219868223167));
@@ -3277,7 +3311,7 @@ test "regression test for realloc with alias" {
     var b = try Managed.initSet(testing.allocator, 9079598147510263717870894449029933369491131786514446266146);
     defer b.deinit();
 
-    try a.ensureAddCapacity(a.toConst(), b.toConst());
+    try a.ensureAddCapacity(&a, &b);
     try a.add(&a, &b);
 
     try testing.expectEqual(.eq, a.toConst().orderAgainstScalar(14691098406862188148944207245954912110548093601382197697835));
@@ -3330,7 +3364,7 @@ test "big int popcount" {
     try popCountTest(&a, limb_bits * 2 + 1, limb_bits * 2 + 1);
 
     // Check very large numbers.
-    try a.setString(16, "ff00000100000100" ++ ("0000000000000000" ** 62));
+    try a.setString(16, "ff00000100000100" ++ &@as([16 * 62]u8, @splat('0')));
     try popCountTest(&a, 4032, 10);
     try popCountTest(&a, 6000, 10);
     a.negate();
@@ -3373,7 +3407,7 @@ test "big int conversion read/write twos complement" {
     var buffer1 = try testing.allocator.alloc(u8, 64);
     defer testing.allocator.free(buffer1);
 
-    const endians = [_]std.builtin.Endian{ .little, .big };
+    const endians = [_]std.lang.Endian{ .little, .big };
     const abi_size = 64;
 
     for (endians) |endian| {
@@ -3404,26 +3438,26 @@ test "big int conversion read twos complement with padding" {
 
     var bit_count: usize = 12 * 8 + 1;
     a.toConst().writeTwosComplement(buffer1[0..13], .little);
-    try testing.expect(std.mem.eql(u8, buffer1, &[_]u8{ 0xd, 0xc, 0xb, 0xa, 0x9, 0x8, 0x7, 0x6, 0x5, 0x4, 0x3, 0x2, 0x1, 0xaa, 0xaa, 0xaa }));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xd, 0xc, 0xb, 0xa, 0x9, 0x8, 0x7, 0x6, 0x5, 0x4, 0x3, 0x2, 0x1, 0xaa, 0xaa, 0xaa }, buffer1);
     a.toConst().writeTwosComplement(buffer1[0..13], .big);
-    try testing.expect(std.mem.eql(u8, buffer1, &[_]u8{ 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xaa, 0xaa, 0xaa }));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xaa, 0xaa, 0xaa }, buffer1);
     a.toConst().writeTwosComplement(buffer1[0..16], .little);
-    try testing.expect(std.mem.eql(u8, buffer1, &[_]u8{ 0xd, 0xc, 0xb, 0xa, 0x9, 0x8, 0x7, 0x6, 0x5, 0x4, 0x3, 0x2, 0x1, 0x0, 0x0, 0x0 }));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xd, 0xc, 0xb, 0xa, 0x9, 0x8, 0x7, 0x6, 0x5, 0x4, 0x3, 0x2, 0x1, 0x0, 0x0, 0x0 }, buffer1);
     a.toConst().writeTwosComplement(buffer1[0..16], .big);
-    try testing.expect(std.mem.eql(u8, buffer1, &[_]u8{ 0x0, 0x0, 0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd }));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x0, 0x0, 0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd }, buffer1);
 
     @memset(buffer1, 0xaa);
     try a.set(-0x01_02030405_06070809_0a0b0c0d);
     bit_count = 12 * 8 + 2;
 
     a.toConst().writeTwosComplement(buffer1[0..13], .little);
-    try testing.expect(std.mem.eql(u8, buffer1, &[_]u8{ 0xf3, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xaa, 0xaa, 0xaa }));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xf3, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xaa, 0xaa, 0xaa }, buffer1);
     a.toConst().writeTwosComplement(buffer1[0..13], .big);
-    try testing.expect(std.mem.eql(u8, buffer1, &[_]u8{ 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8, 0xf7, 0xf6, 0xf5, 0xf4, 0xf3, 0xf3, 0xaa, 0xaa, 0xaa }));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8, 0xf7, 0xf6, 0xf5, 0xf4, 0xf3, 0xf3, 0xaa, 0xaa, 0xaa }, buffer1);
     a.toConst().writeTwosComplement(buffer1[0..16], .little);
-    try testing.expect(std.mem.eql(u8, buffer1, &[_]u8{ 0xf3, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff, 0xff, 0xff }));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xf3, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff, 0xff, 0xff }, buffer1);
     a.toConst().writeTwosComplement(buffer1[0..16], .big);
-    try testing.expect(std.mem.eql(u8, buffer1, &[_]u8{ 0xff, 0xff, 0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8, 0xf7, 0xf6, 0xf5, 0xf4, 0xf3, 0xf3 }));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xff, 0xff, 0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8, 0xf7, 0xf6, 0xf5, 0xf4, 0xf3, 0xf3 }, buffer1);
 }
 
 test "big int write twos complement +/- zero" {
@@ -3438,13 +3472,13 @@ test "big int write twos complement +/- zero" {
     // Test zero
 
     m.toConst().writeTwosComplement(buffer1[0..13], .little);
-    try testing.expect(std.mem.eql(u8, buffer1, &(([_]u8{0} ** 13) ++ ([_]u8{0xaa} ** 3))));
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xAA, 0xAA, 0xAA }, buffer1);
     m.toConst().writeTwosComplement(buffer1[0..13], .big);
-    try testing.expect(std.mem.eql(u8, buffer1, &(([_]u8{0} ** 13) ++ ([_]u8{0xaa} ** 3))));
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xAA, 0xAA, 0xAA }, buffer1);
     m.toConst().writeTwosComplement(buffer1[0..16], .little);
-    try testing.expect(std.mem.eql(u8, buffer1, &(([_]u8{0} ** 16))));
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, buffer1);
     m.toConst().writeTwosComplement(buffer1[0..16], .big);
-    try testing.expect(std.mem.eql(u8, buffer1, &(([_]u8{0} ** 16))));
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, buffer1);
 
     @memset(buffer1, 0xaa);
     m.positive = false;
@@ -3452,13 +3486,13 @@ test "big int write twos complement +/- zero" {
     // Test negative zero
 
     m.toConst().writeTwosComplement(buffer1[0..13], .little);
-    try testing.expect(std.mem.eql(u8, buffer1, &(([_]u8{0} ** 13) ++ ([_]u8{0xaa} ** 3))));
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xAA, 0xAA, 0xAA }, buffer1);
     m.toConst().writeTwosComplement(buffer1[0..13], .big);
-    try testing.expect(std.mem.eql(u8, buffer1, &(([_]u8{0} ** 13) ++ ([_]u8{0xaa} ** 3))));
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xAA, 0xAA, 0xAA }, buffer1);
     m.toConst().writeTwosComplement(buffer1[0..16], .little);
-    try testing.expect(std.mem.eql(u8, buffer1, &(([_]u8{0} ** 16))));
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, buffer1);
     m.toConst().writeTwosComplement(buffer1[0..16], .big);
-    try testing.expect(std.mem.eql(u8, buffer1, &(([_]u8{0} ** 16))));
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, buffer1);
 }
 
 test "big int conversion write twos complement with padding" {
@@ -3535,7 +3569,7 @@ test "big int conversion write twos complement with padding" {
 
     // Test 0
 
-    buffer = &([_]u8{0} ** 16);
+    buffer = &@as([16]u8, @splat(0));
     m.readTwosComplement(buffer[0..13], bit_count, .little, .unsigned);
     try testing.expectEqual(.eq, m.toConst().orderAgainstScalar(0x0));
     m.readTwosComplement(buffer[0..13], bit_count, .big, .unsigned);
@@ -3546,7 +3580,7 @@ test "big int conversion write twos complement with padding" {
     try testing.expectEqual(.eq, m.toConst().orderAgainstScalar(0x0));
 
     bit_count = 0;
-    buffer = &([_]u8{0xaa} ** 16);
+    buffer = &@as([16]u8, @splat(0xaa));
     m.readTwosComplement(buffer[0..13], bit_count, .little, .unsigned);
     try testing.expectEqual(.eq, m.toConst().orderAgainstScalar(0x0));
     m.readTwosComplement(buffer[0..13], bit_count, .big, .unsigned);
@@ -3571,13 +3605,13 @@ test "big int conversion write twos complement zero" {
     const bit_count: usize = 12 * 8 + 1;
     var buffer: []const u8 = undefined;
 
-    buffer = &([_]u8{0} ** 13);
+    buffer = &@as([13]u8, @splat(0));
     m.readTwosComplement(buffer[0..13], bit_count, .little, .unsigned);
     try testing.expectEqual(.eq, m.toConst().orderAgainstScalar(0x0));
     m.readTwosComplement(buffer[0..13], bit_count, .big, .unsigned);
     try testing.expectEqual(.eq, m.toConst().orderAgainstScalar(0x0));
 
-    buffer = &([_]u8{0} ** 16);
+    buffer = &@as([16]u8, @splat(0));
     m.readTwosComplement(buffer[0..16], bit_count, .little, .unsigned);
     try testing.expectEqual(.eq, m.toConst().orderAgainstScalar(0x0));
     m.readTwosComplement(buffer[0..16], bit_count, .big, .unsigned);
@@ -3692,6 +3726,7 @@ test "mul multi-multi alias r with a and b" {
     var a = try Managed.initSet(testing.allocator, 2 * maxInt(Limb));
     defer a.deinit();
 
+    try a.ensureMulCapacity(&a, &a);
     try a.mul(&a, &a);
 
     var want = try Managed.initSet(testing.allocator, 4 * maxInt(Limb) * maxInt(Limb));
@@ -3816,7 +3851,7 @@ test "(BigInt) positive" {
 
     const b_fmt = try std.fmt.allocPrint(testing.allocator, "{d}", .{b});
     defer testing.allocator.free(b_fmt);
-    try testing.expect(!mem.eql(u8, b_fmt, "(BigInt)"));
+    try testing.expect(!mem.eql(u8, "(BigInt)", b_fmt));
 }
 
 test "(BigInt) negative" {
@@ -3840,7 +3875,7 @@ test "(BigInt) negative" {
     const b_fmt = try std.fmt.allocPrint(testing.allocator, "{d}", .{b});
     defer testing.allocator.free(b_fmt);
 
-    try testing.expect(mem.eql(u8, a_fmt, "(BigInt)"));
+    try testing.expectEqualSlices(u8, "(BigInt)", a_fmt);
     try testing.expect(!mem.eql(u8, b_fmt, "(BigInt)"));
 }
 
@@ -4066,4 +4101,41 @@ test "ctz" {
     };
     try testing.expectEqual(0, limb_max_squared.ctz(@bitSizeOf(Limb) * 2));
     try testing.expectEqual(0, limb_max_squared.ctz(@bitSizeOf(Limb) * 2 + 1));
+}
+
+test "log2" {
+    var a = try Managed.init(testing.allocator);
+    defer a.deinit();
+
+    try a.setString(2, "1");
+    try testing.expectEqual(0, a.toConst().log2());
+
+    try a.setString(2, "1111011");
+    try testing.expectEqual(6, a.toConst().log2());
+
+    try a.setString(2, "10100111011101010");
+    try testing.expectEqual(16, a.toConst().log2());
+
+    try a.setString(16, "a22d71c87a9ce406da4f5895f9f3cc3d603192baf6c8a2b5c32649d0465bf188fe799b3618085e49d71bdaec01");
+    try testing.expectEqual(359, a.toConst().log2());
+}
+
+test "log10" {
+    var a = try Managed.init(testing.allocator);
+    defer a.deinit();
+
+    try a.setString(10, "1");
+    try testing.expectEqual(0, a.toConst().log10Alloc(testing.allocator));
+
+    try a.setString(10, "1234");
+    try testing.expectEqual(3, a.toConst().log10Alloc(testing.allocator));
+
+    try a.setString(10, "123456789");
+    try testing.expectEqual(8, a.toConst().log10Alloc(testing.allocator));
+
+    try a.setString(10, "57594534510580048222343352832931567593656037535732288627581929757527496850784");
+    try testing.expectEqual(76, a.toConst().log10Alloc(testing.allocator));
+
+    try a.setString(10, "504758845984192913149382719638135788792820830414213085834451043864912744833203879823150928260925344757009154551640690830148486352800955148298533547472300");
+    try testing.expectEqual(152, a.toConst().log10Alloc(testing.allocator));
 }

@@ -13,7 +13,50 @@ static void panic(const char *reason) {
     abort();
 }
 
-#if defined(__WIN32__)
+#if defined(__GNUC__) && !defined(__clang__)
+    #define GCC_VERSION (__GNUC__         * 10000 \
+                         + __GNUC_MINOR__ * 100   \
+                         + __GNUC_PATCHLEVEL__)
+    // GCC versions 10.0--15.1 have a miscompilation where some bytes of a union may get clobbered
+    // depending on the union layout and the order in which types are defined. This miscompilation
+    // affects the output of the C backend, and thus can affect the bootstrap process. Specifically,
+    // we observe that using the self-hosted x86_64 backend in 'zig2' will cause all function calls
+    // to be relocated incorrectly, causing immediate crashes on any binary produced by it.
+    //
+    // The only reliable workaround for this bug is to disable the optimization pass containing it,
+    // so here we detect whether the compiler being used requires that workaround.
+    //
+    // The upstream bug is fixed in GCC version 15.2 onwards (and was also backported to the 13 and
+    // 14 branches, however there are no 13.x and 14.x releases that contains the fix as of now).
+    // Once this bug is no longer widespread, we can remove this workaround.
+    //
+    // Upstream bug report: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=119085
+    #if (GCC_VERSION >= 160000)                         || \
+        (GCC_VERSION >= 150200 && GCC_VERSION < 160000) || \
+        (GCC_VERSION >  140300 && GCC_VERSION < 150000) || \
+        (GCC_VERSION >  130400 && GCC_VERSION < 140000) || \
+        (GCC_VERSION <= 100000)
+      #define GCC_BUG_119085_PRESENT 0
+    #else
+      #define GCC_BUG_119085_PRESENT 1
+    #endif
+
+
+    // GCC doesn't take into account alignment annotations when --Waddress-of-packed-member is
+    // evaluated, which causes false positive warnings when the C backend generates code that takes
+    // the address of a field in a packed struct.
+    //
+    // There is no fix for this as now, so the only way to get rid of the false positive warnings
+    // is to disable the flag altogether.
+    //
+    // Upstream bug report: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=94081
+    #define GCC_BUG_94081_PRESENT 1
+#else
+    #define GCC_BUG_94081_PRESENT  0
+    #define GCC_BUG_119085_PRESENT 0
+#endif
+
+#if defined(_WIN32)
 #error TODO write the functionality for executing child process into this build script
 #else
 
@@ -56,7 +99,7 @@ static void print_and_run(const char **argv) {
 static const char *get_host_os(void) {
     const char *host_os = getenv("ZIG_HOST_TARGET_OS");
     if (host_os != NULL) return host_os;
-#if defined(__WIN32__)
+#if defined(_WIN32)
     return "windows";
 #elif defined(__APPLE__)
     return "macos";
@@ -116,7 +159,7 @@ int main(int argc, char **argv) {
     }
     {
         const char *child_argv[] = {
-            cc, "-o", "zig1", "zig1.c", "stage1/wasi.c", "-std=c99", "-Os", "-lm", NULL,
+            cc, "-o", "zig1", "zig1.c", "stage1/wasi.c", "-std=c99", "-Os", "-fno-strict-aliasing", "-lm", NULL,
         };
         print_and_run(child_argv);
     }
@@ -125,7 +168,7 @@ int main(int argc, char **argv) {
         if (f == NULL)
             panic("unable to open config.zig for writing");
 
-        const char *zig_version = "0.14.0-dev.bootstrap";
+        const char *zig_version = "0.17.1-bootstrap";
 
         int written = fprintf(f,
             "pub const have_llvm = false;\n"
@@ -143,6 +186,7 @@ int main(int argc, char **argv) {
             "pub const skip_non_native = false;\n"
             "pub const debug_gpa = false;\n"
             "pub const dev = .core;\n"
+            "pub const io_mode: enum { threaded, evented } = .threaded;\n"
             "pub const value_interpret_mode = .direct;\n"
         , zig_version);
         if (written < 100)
@@ -158,10 +202,8 @@ int main(int argc, char **argv) {
             "--name", "zig2", "-femit-bin=zig2.c",
             "-target", host_triple,
             "--dep", "build_options",
-            "--dep", "aro",
             "-Mroot=src/main.zig",
             "-Mbuild_options=config.zig",
-            "-Maro=lib/compiler/aro/aro.zig",
             NULL,
         };
         print_and_run(child_argv);
@@ -170,7 +212,7 @@ int main(int argc, char **argv) {
     {
         const char *child_argv[] = {
             "./zig1", "lib", "build-obj",
-            "-ofmt=c", "-OReleaseSmall",
+            "-ofmt=c", "-lc", "-OReleaseSmall",
             "--name", "compiler_rt", "-femit-bin=compiler_rt.c",
             "-target", host_triple,
             "-Mroot=lib/compiler_rt.zig",
@@ -191,6 +233,13 @@ int main(int argc, char **argv) {
 #endif
 #if defined(__GNUC__)
             "-pthread",
+#endif
+            "-fno-strict-aliasing",
+#if GCC_BUG_119085_PRESENT
+            "-fno-tree-sra",
+#endif
+#if GCC_BUG_94081_PRESENT
+            "-Wno-address-of-packed-member",
 #endif
             NULL,
         };

@@ -9,7 +9,7 @@ const StringIndexContext = std.hash_map.StringIndexContext;
 const ZonGen = @This();
 const Zoir = @import("Zoir.zig");
 const Ast = @import("Ast.zig");
-const Writer = std.io.Writer;
+const Writer = std.Io.Writer;
 
 gpa: Allocator,
 tree: Ast,
@@ -17,13 +17,13 @@ tree: Ast,
 options: Options,
 
 nodes: std.MultiArrayList(Zoir.Node.Repr),
-extra: std.ArrayListUnmanaged(u32),
-limbs: std.ArrayListUnmanaged(std.math.big.Limb),
-string_bytes: std.ArrayListUnmanaged(u8),
+extra: std.ArrayList(u32),
+limbs: std.ArrayList(std.math.big.Limb),
+string_bytes: std.ArrayList(u8),
 string_table: std.HashMapUnmanaged(u32, void, StringIndexContext, std.hash_map.default_max_load_percentage),
 
-compile_errors: std.ArrayListUnmanaged(Zoir.CompileError),
-error_notes: std.ArrayListUnmanaged(Zoir.CompileError.Note),
+compile_errors: std.ArrayList(Zoir.CompileError),
+error_notes: std.ArrayList(Zoir.CompileError.Note),
 
 pub const Options = struct {
     /// When false, string literals are not parsed. `string_literal` nodes will contain empty
@@ -67,38 +67,30 @@ pub fn generate(gpa: Allocator, tree: Ast, options: Options) Allocator.Error!Zoi
     }
 
     if (zg.compile_errors.items.len > 0) {
-        const string_bytes = try zg.string_bytes.toOwnedSlice(gpa);
-        errdefer gpa.free(string_bytes);
-        const compile_errors = try zg.compile_errors.toOwnedSlice(gpa);
-        errdefer gpa.free(compile_errors);
-        const error_notes = try zg.error_notes.toOwnedSlice(gpa);
-        errdefer gpa.free(error_notes);
+        try zg.string_bytes.shrinkToLen(gpa);
+        try zg.compile_errors.shrinkToLen(gpa);
+        try zg.error_notes.shrinkToLen(gpa);
 
         return .{
             .nodes = .empty,
             .extra = &.{},
             .limbs = &.{},
-            .string_bytes = string_bytes,
-            .compile_errors = compile_errors,
-            .error_notes = error_notes,
+            .string_bytes = zg.string_bytes.toOwnedSliceAssert(),
+            .compile_errors = zg.compile_errors.toOwnedSliceAssert(),
+            .error_notes = zg.error_notes.toOwnedSliceAssert(),
         };
     } else {
         assert(zg.error_notes.items.len == 0);
 
-        var nodes = zg.nodes.toOwnedSlice();
-        errdefer nodes.deinit(gpa);
-        const extra = try zg.extra.toOwnedSlice(gpa);
-        errdefer gpa.free(extra);
-        const limbs = try zg.limbs.toOwnedSlice(gpa);
-        errdefer gpa.free(limbs);
-        const string_bytes = try zg.string_bytes.toOwnedSlice(gpa);
-        errdefer gpa.free(string_bytes);
+        try zg.extra.shrinkToLen(gpa);
+        try zg.limbs.shrinkToLen(gpa);
+        try zg.string_bytes.shrinkToLen(gpa);
 
         return .{
-            .nodes = nodes,
-            .extra = extra,
-            .limbs = limbs,
-            .string_bytes = string_bytes,
+            .nodes = zg.nodes.toOwnedSlice(),
+            .extra = zg.extra.toOwnedSliceAssert(),
+            .limbs = zg.limbs.toOwnedSliceAssert(),
+            .string_bytes = zg.string_bytes.toOwnedSliceAssert(),
             .compile_errors = &.{},
             .error_notes = &.{},
         };
@@ -174,7 +166,6 @@ fn expr(zg: *ZonGen, node: Ast.Node.Index, dest_node: Zoir.Node.Index) Allocator
         .less_than,
         .less_or_equal,
         .array_cat,
-        .array_mult,
         .bool_and,
         .bool_or,
         .bool_not,
@@ -238,7 +229,7 @@ fn expr(zg: *ZonGen, node: Ast.Node.Index, dest_node: Zoir.Node.Index) Allocator
         => try zg.addErrorNode(node, "control flow is not allowed in ZON", .{}),
 
         .@"comptime" => try zg.addErrorNode(node, "keyword 'comptime' is not allowed in ZON", .{}),
-        .asm_simple, .@"asm", .asm_legacy => try zg.addErrorNode(node, "inline asm is not allowed in ZON", .{}),
+        .asm_simple, .@"asm" => try zg.addErrorNode(node, "inline asm is not allowed in ZON", .{}),
 
         .builtin_call_two,
         .builtin_call_two_comma,
@@ -336,14 +327,14 @@ fn expr(zg: *ZonGen, node: Ast.Node.Index, dest_node: Zoir.Node.Index) Allocator
             };
             zg.setNode(dest_node, .{
                 .tag = .enum_literal,
-                .data = @intFromEnum(str_index),
+                .data = @backingInt(str_index),
                 .ast_node = node,
             });
         },
         .string_literal, .multiline_string_literal => if (zg.strLitAsString(node)) |result| switch (result) {
             .nts => |nts| zg.setNode(dest_node, .{
                 .tag = .string_literal_null,
-                .data = @intFromEnum(nts),
+                .data = @backingInt(nts),
                 .ast_node = node,
             }),
             .slice => |slice| {
@@ -386,7 +377,7 @@ fn expr(zg: *ZonGen, node: Ast.Node.Index, dest_node: Zoir.Node.Index) Allocator
             });
 
             for (full.ast.elements, first_elem..) |elem_node, elem_dest_node| {
-                try zg.expr(elem_node, @enumFromInt(elem_dest_node));
+                try zg.expr(elem_node, @fromBackingInt(@intCast(elem_dest_node)));
             }
         },
 
@@ -427,18 +418,19 @@ fn expr(zg: *ZonGen, node: Ast.Node.Index, dest_node: Zoir.Node.Index) Allocator
             });
 
             // For short initializers, track the names on the stack rather than going through gpa.
-            var sfba_state = std.heap.stackFallback(256, gpa);
-            const sfba = sfba_state.get();
+            var bfa_buf: [256]u8 = undefined;
+            var bfa_state: std.heap.BufferFirstAllocator = .init(&bfa_buf, gpa);
+            const bfa = bfa_state.allocator();
             var field_names: std.AutoHashMapUnmanaged(Zoir.NullTerminatedString, Ast.TokenIndex) = .empty;
-            defer field_names.deinit(sfba);
+            defer field_names.deinit(bfa);
 
             var reported_any_duplicate = false;
 
             for (full.ast.fields, names_start.., first_elem..) |elem_node, extra_name_idx, elem_dest_node| {
                 const name_token = tree.firstToken(elem_node) - 2;
                 if (zg.identAsString(name_token)) |name_str| {
-                    zg.extra.items[extra_name_idx] = @intFromEnum(name_str);
-                    const gop = try field_names.getOrPut(sfba, name_str);
+                    zg.extra.items[extra_name_idx] = @backingInt(name_str);
+                    const gop = try field_names.getOrPut(bfa, name_str);
                     if (gop.found_existing and !reported_any_duplicate) {
                         reported_any_duplicate = true;
                         const earlier_token = gop.value_ptr.*;
@@ -451,7 +443,7 @@ fn expr(zg: *ZonGen, node: Ast.Node.Index, dest_node: Zoir.Node.Index) Allocator
                     error.BadString => {}, // there's an error, so it's fine to not populate `zg.extra`
                     error.OutOfMemory => |e| return e,
                 }
-                try zg.expr(elem_node, @enumFromInt(elem_dest_node));
+                try zg.expr(elem_node, @fromBackingInt(@intCast(elem_dest_node)));
             }
         },
     }
@@ -472,7 +464,7 @@ fn appendIdentStr(zg: *ZonGen, ident_token: Ast.TokenIndex) error{ OutOfMemory, 
     const raw_string = zg.tree.tokenSlice(ident_token)[offset..];
     try zg.string_bytes.ensureUnusedCapacity(gpa, raw_string.len);
     const result = r: {
-        var aw: std.io.Writer.Allocating = .fromArrayList(gpa, &zg.string_bytes);
+        var aw: Writer.Allocating = .fromArrayList(gpa, &zg.string_bytes);
         defer zg.string_bytes = aw.toArrayList();
         break :r std.zig.string_literal.parseWrite(&aw.writer, raw_string) catch |err| switch (err) {
             error.WriteFailed => return error.OutOfMemory,
@@ -487,7 +479,7 @@ fn appendIdentStr(zg: *ZonGen, ident_token: Ast.TokenIndex) error{ OutOfMemory, 
     }
 
     const slice = zg.string_bytes.items[start..];
-    if (mem.indexOfScalar(u8, slice, 0) != null) {
+    if (mem.findScalar(u8, slice, 0) != null) {
         try zg.addErrorTok(ident_token, "identifier cannot contain null bytes", .{});
         return error.BadString;
     } else if (slice.len == 0) {
@@ -498,7 +490,7 @@ fn appendIdentStr(zg: *ZonGen, ident_token: Ast.TokenIndex) error{ OutOfMemory, 
 }
 
 /// Estimates the size of a string node without parsing it.
-pub fn strLitSizeHint(tree: Ast, node: Ast.Node.Index) usize {
+pub fn strLitSizeHint(tree: *const Ast, node: Ast.Node.Index) usize {
     switch (tree.nodeTag(node)) {
         // Parsed string literals are typically around the size of the raw strings.
         .string_literal => {
@@ -523,7 +515,7 @@ pub fn strLitSizeHint(tree: Ast, node: Ast.Node.Index) usize {
 
 /// Parses the given node as a string literal.
 pub fn parseStrLit(
-    tree: Ast,
+    tree: *const Ast,
     node: Ast.Node.Index,
     writer: *Writer,
 ) Writer.Error!std.zig.string_literal.Result {
@@ -567,12 +559,12 @@ fn strLitAsString(zg: *ZonGen, str_node: Ast.Node.Index) error{ OutOfMemory, Bad
     const gpa = zg.gpa;
     const string_bytes = &zg.string_bytes;
     const str_index: u32 = @intCast(zg.string_bytes.items.len);
-    const size_hint = strLitSizeHint(zg.tree, str_node);
+    const size_hint = strLitSizeHint(&zg.tree, str_node);
     try string_bytes.ensureUnusedCapacity(gpa, size_hint);
     const result = r: {
-        var aw: std.io.Writer.Allocating = .fromArrayList(gpa, &zg.string_bytes);
+        var aw: Writer.Allocating = .fromArrayList(gpa, &zg.string_bytes);
         defer zg.string_bytes = aw.toArrayList();
-        break :r parseStrLit(zg.tree, str_node, &aw.writer) catch |err| switch (err) {
+        break :r parseStrLit(&zg.tree, str_node, &aw.writer) catch |err| switch (err) {
             error.WriteFailed => return error.OutOfMemory,
         };
     };
@@ -586,7 +578,7 @@ fn strLitAsString(zg: *ZonGen, str_node: Ast.Node.Index) error{ OutOfMemory, Bad
         },
     }
     const key: []const u8 = string_bytes.items[str_index..];
-    if (std.mem.indexOfScalar(u8, key, 0) != null) return .{ .slice = .{
+    if (std.mem.findScalar(u8, key, 0) != null) return .{ .slice = .{
         .start = str_index,
         .len = @intCast(key.len),
     } };
@@ -598,11 +590,11 @@ fn strLitAsString(zg: *ZonGen, str_node: Ast.Node.Index) error{ OutOfMemory, Bad
     );
     if (gop.found_existing) {
         string_bytes.shrinkRetainingCapacity(str_index);
-        return .{ .nts = @enumFromInt(gop.key_ptr.*) };
+        return .{ .nts = @fromBackingInt(@intCast(gop.key_ptr.*)) };
     }
     gop.key_ptr.* = str_index;
     try string_bytes.append(gpa, 0);
-    return .{ .nts = @enumFromInt(str_index) };
+    return .{ .nts = @fromBackingInt(@intCast(str_index)) };
 }
 
 fn identAsString(zg: *ZonGen, ident_token: Ast.TokenIndex) !Zoir.NullTerminatedString {
@@ -618,11 +610,11 @@ fn identAsString(zg: *ZonGen, ident_token: Ast.TokenIndex) !Zoir.NullTerminatedS
     );
     if (gop.found_existing) {
         string_bytes.shrinkRetainingCapacity(str_index);
-        return @enumFromInt(gop.key_ptr.*);
+        return @fromBackingInt(@intCast(gop.key_ptr.*));
     }
     gop.key_ptr.* = str_index;
     try string_bytes.append(gpa, 0);
-    return @enumFromInt(str_index);
+    return @fromBackingInt(@intCast(str_index));
 }
 
 fn numberLiteral(zg: *ZonGen, num_node: Ast.Node.Index, src_node: Ast.Node.Index, dest_node: Zoir.Node.Index, sign: enum { negative, positive }) !void {
@@ -664,10 +656,10 @@ fn numberLiteral(zg: *ZonGen, num_node: Ast.Node.Index, src_node: Ast.Node.Index
             };
             var big_int: std.math.big.int.Managed = try .init(gpa);
             defer big_int.deinit();
-            big_int.setString(@intFromEnum(base), num_without_prefix) catch |err| switch (err) {
+            big_int.setString(@backingInt(base), num_without_prefix) catch |err| switch (err) {
                 error.InvalidCharacter => unreachable, // caught in `parseNumberLiteral`
                 error.InvalidBase => unreachable, // we only pass 16, 8, 2, see above
-                error.OutOfMemory => return error.OutOfMemory,
+                error.OutOfMemory => |e| return e,
             };
             switch (sign) {
                 .positive => {},
@@ -771,7 +763,7 @@ fn identifier(zg: *ZonGen, node: Ast.Node.Index, dest_node: Zoir.Node.Index) !vo
 }
 
 fn setNode(zg: *ZonGen, dest: Zoir.Node.Index, repr: Zoir.Node.Repr) void {
-    zg.nodes.set(@intFromEnum(dest), repr);
+    zg.nodes.set(@backingInt(dest), repr);
 }
 
 fn lowerStrLitError(
@@ -785,7 +777,7 @@ fn lowerStrLitError(
 }
 
 fn lowerNumberError(zg: *ZonGen, err: std.zig.number_literal.Error, token: Ast.TokenIndex, bytes: []const u8) Allocator.Error!void {
-    const is_float = std.mem.indexOfScalar(u8, bytes, '.') != null;
+    const is_float = std.mem.findScalar(u8, bytes, '.') != null;
     switch (err) {
         .leading_zero => if (is_float) {
             try zg.addErrorTok(token, "number '{s}' has leading zero", .{bytes});
@@ -820,9 +812,9 @@ fn errNoteNode(zg: *ZonGen, node: Ast.Node.Index, comptime format: []const u8, a
     const message_idx: u32 = @intCast(zg.string_bytes.items.len);
     try zg.string_bytes.print(zg.gpa, format ++ "\x00", args);
     return .{
-        .msg = @enumFromInt(message_idx),
+        .msg = @fromBackingInt(@intCast(message_idx)),
         .token = .none,
-        .node_or_offset = @intFromEnum(node),
+        .node_or_offset = @backingInt(node),
     };
 }
 
@@ -830,20 +822,20 @@ fn errNoteTok(zg: *ZonGen, tok: Ast.TokenIndex, comptime format: []const u8, arg
     const message_idx: u32 = @intCast(zg.string_bytes.items.len);
     try zg.string_bytes.print(zg.gpa, format ++ "\x00", args);
     return .{
-        .msg = @enumFromInt(message_idx),
+        .msg = @fromBackingInt(@intCast(message_idx)),
         .token = .fromToken(tok),
         .node_or_offset = 0,
     };
 }
 
 fn addErrorNode(zg: *ZonGen, node: Ast.Node.Index, comptime format: []const u8, args: anytype) Allocator.Error!void {
-    return zg.addErrorInner(.none, @intFromEnum(node), format, args, &.{});
+    return zg.addErrorInner(.none, @backingInt(node), format, args, &.{});
 }
 fn addErrorTok(zg: *ZonGen, tok: Ast.TokenIndex, comptime format: []const u8, args: anytype) Allocator.Error!void {
     return zg.addErrorInner(.fromToken(tok), 0, format, args, &.{});
 }
 fn addErrorNodeNotes(zg: *ZonGen, node: Ast.Node.Index, comptime format: []const u8, args: anytype, notes: []const Zoir.CompileError.Note) Allocator.Error!void {
-    return zg.addErrorInner(.none, @intFromEnum(node), format, args, notes);
+    return zg.addErrorInner(.none, @backingInt(node), format, args, notes);
 }
 fn addErrorTokNotes(zg: *ZonGen, tok: Ast.TokenIndex, comptime format: []const u8, args: anytype, notes: []const Zoir.CompileError.Note) Allocator.Error!void {
     return zg.addErrorInner(.fromToken(tok), 0, format, args, notes);
@@ -872,7 +864,7 @@ fn addErrorInner(
     try zg.string_bytes.print(gpa, format ++ "\x00", args);
 
     try zg.compile_errors.append(gpa, .{
-        .msg = @enumFromInt(message_idx),
+        .msg = @fromBackingInt(@intCast(message_idx)),
         .token = token,
         .node_or_offset = node_or_offset,
         .first_note = first_note,
@@ -885,11 +877,11 @@ fn lowerAstErrors(zg: *ZonGen) Allocator.Error!void {
     const tree = zg.tree;
     assert(tree.errors.len > 0);
 
-    var msg: std.io.Writer.Allocating = .init(gpa);
+    var msg: Writer.Allocating = .init(gpa);
     defer msg.deinit();
     const msg_bw = &msg.writer;
 
-    var notes: std.ArrayListUnmanaged(Zoir.CompileError.Note) = .empty;
+    var notes: std.ArrayList(Zoir.CompileError.Note) = .empty;
     defer notes.deinit(gpa);
 
     var cur_err = tree.errors[0];

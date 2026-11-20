@@ -7,6 +7,8 @@ const expect = testing.expect;
 const expectEqual = testing.expectEqual;
 
 test "array to slice" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const a: u32 align(4) = 3;
     const b: u32 align(8) = 4;
     const a_slice: []align(1) const u32 = @as(*const [1]u32, &a)[0..];
@@ -19,6 +21,7 @@ test "array to slice" {
 }
 
 test "arrays" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -43,6 +46,17 @@ test "arrays" {
 }
 fn getArrayLen(a: []const u32) usize {
     return a.len;
+}
+
+test "runtime array concat with comptime slice" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+    var a: [1]u8 = .{1};
+    const b = (comptime @as([]const u8, &.{0})) ++ &a;
+    const c = &a ++ (comptime @as([]const u8, &.{0}));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1 }, b);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0 }, c);
 }
 
 test "array concat with undefined" {
@@ -84,24 +98,30 @@ test "array concat with tuple" {
     }
 }
 
+test "array concat with undefined tuple" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    {
+        const array: [2]u64 = .{ 1, 2 };
+        var seq = array ++ @as(struct { u32, u16 }, undefined);
+        seq[2] = 3;
+        seq[3] = 4;
+        try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3, 4 }, &seq);
+    }
+    {
+        const array: [2]u64 = undefined;
+        var seq = @as(struct { u32, u16 }, undefined) ++ array;
+        for (&seq, 1..) |*s, i| s.* = i;
+        try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3, 4 }, &seq);
+    }
+}
+
 test "array init with concat" {
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const a = 'a';
     var i: [4]u8 = [2]u8{ a, 'b' } ++ [2]u8{ 'c', 'd' };
     try expect(std.mem.eql(u8, &i, "abcd"));
-}
-
-test "array init with mult" {
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-
-    const a = 'a';
-    var i: [8]u8 = [2]u8{ a, 'b' } ** 4;
-    try expect(std.mem.eql(u8, &i, "abababab"));
-
-    var j: [4]u8 = [1]u8{'a'} ** 4;
-    try expect(std.mem.eql(u8, &j, "aaaa"));
 }
 
 test "array literal with explicit type" {
@@ -184,7 +204,7 @@ test "array with sentinels" {
 
 test "void arrays" {
     var array: [4]void = undefined;
-    array[0] = void{};
+    array[0] = {};
     array[1] = array[2];
     try expect(@sizeOf(@TypeOf(array)) == 0);
     try expect(array.len == 4);
@@ -259,6 +279,7 @@ fn doSomeMangling(array: *[4]u8) void {
 
 test "implicit cast zero sized array ptr to slice" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     {
         var b = "".*;
@@ -306,26 +327,6 @@ test "set global var array via slice embedded in struct" {
     try expect(s_array[0].b == 1);
     try expect(s_array[1].b == 2);
     try expect(s_array[2].b == 3);
-}
-
-test "read/write through global variable array of struct fields initialized via array mult" {
-    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-
-    const S = struct {
-        fn doTheTest() !void {
-            try expect(storage[0].term == 1);
-            storage[0] = MyStruct{ .term = 123 };
-            try expect(storage[0].term == 123);
-        }
-
-        pub const MyStruct = struct {
-            term: usize,
-        };
-
-        var storage: [1]MyStruct = [_]MyStruct{MyStruct{ .term = 1 }} ** 1;
-    };
-    try S.doTheTest();
 }
 
 test "implicit cast single-item pointer" {
@@ -539,28 +540,6 @@ test "sentinel element count towards the ABI size calculation" {
     try comptime S.doTheTest();
 }
 
-test "zero-sized array with recursive type definition" {
-    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
-
-    const U = struct {
-        fn foo(comptime T: type, comptime n: usize) type {
-            return struct {
-                s: [n]T,
-                x: usize = n,
-            };
-        }
-    };
-
-    const S = struct {
-        list: U.foo(@This(), 0),
-    };
-
-    var t: S = .{ .list = .{ .s = undefined } };
-    _ = &t;
-    try expect(@as(usize, 0) == t.list.x);
-}
-
 test "type coercion of anon struct literal to array" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
@@ -603,6 +582,7 @@ test "array with comptime-only element type" {
 }
 
 test "tuple to array handles sentinel" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -611,6 +591,24 @@ test "tuple to array handles sentinel" {
         var b: [3:0]u8 = a;
     };
     try expect(S.b[0] == 1);
+    try expect(S.b[1] == 2);
+    try expect(S.b[2] == 3);
+    try expect(S.b[3] == 0);
+}
+
+test "array-like to array handles sentinel" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+
+    const S = struct {
+        const a: @Vector(3, u8) = .{ 1, 2, 3 };
+        var b: [3:0]u8 = a;
+    };
+    try expect(S.b[0] == 1);
+    try expect(S.b[1] == 2);
+    try expect(S.b[2] == 3);
+    try expect(S.b[3] == 0);
 }
 
 test "array init of container level array variable" {
@@ -651,20 +649,28 @@ test "array of array agregate init" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
-    var a = [1]u32{11} ** 10;
-    var b = [1][10]u32{a} ** 2;
+    var a: [10]u32 = @splat(11);
+    var b: [2][10]u32 = @splat(a);
     _ = .{ &a, &b };
     try std.testing.expect(b[1][1] == 11);
 }
 
 test "pointer to array has ptr field" {
-    const arr: *const [5]u32 = &.{ 10, 20, 30, 40, 50 };
-    try std.testing.expect(arr.ptr == @as([*]const u32, arr));
-    try std.testing.expect(arr.ptr[0] == 10);
-    try std.testing.expect(arr.ptr[1] == 20);
-    try std.testing.expect(arr.ptr[2] == 30);
-    try std.testing.expect(arr.ptr[3] == 40);
-    try std.testing.expect((&arr.ptr).*[4] == 50);
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        fn doTheTest(p: *const [5]u32) !void {
+            try std.testing.expect(p.ptr == @as([*]const u32, p));
+            try std.testing.expect(p.ptr[0] == 10);
+            try std.testing.expect(p.ptr[1] == 20);
+            try std.testing.expect(p.ptr[2] == 30);
+            try std.testing.expect(p.ptr[3] == 40);
+            try std.testing.expect((&p.ptr).*[4] == 50);
+        }
+    };
+    const arr: [5]u32 = .{ 10, 20, 30, 40, 50 };
+    try comptime S.doTheTest(&arr);
+    try S.doTheTest(&arr);
 }
 
 test "discarded array init preserves result location" {
@@ -848,8 +854,6 @@ test "pointer to sentinel-terminated array initialized through reference to anon
 }
 
 test "tuple initialized through reference to anonymous array init provides result types" {
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
-
     const Tuple = struct { u64, *const u32 };
     const foo: *const Tuple = &.{
         @intCast(12345),
@@ -955,7 +959,6 @@ test "accessing multidimensional global array at comptime" {
 
 test "union that needs padding bytes inside an array" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -990,73 +993,6 @@ test "runtime index of array of zero-bit values" {
     try std.testing.expect(result.value == {});
 }
 
-test "@splat array" {
-    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-
-    const S = struct {
-        fn doTheTest(comptime T: type, x: T) !void {
-            const arr: [10]T = @splat(x);
-            for (arr) |elem| {
-                try expectEqual(x, elem);
-            }
-        }
-    };
-
-    try S.doTheTest(u32, 123);
-    try comptime S.doTheTest(u32, 123);
-
-    const Foo = struct { x: u8 };
-    try S.doTheTest(Foo, .{ .x = 10 });
-    try comptime S.doTheTest(Foo, .{ .x = 10 });
-}
-
-test "@splat array with sentinel" {
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-
-    const S = struct {
-        fn doTheTest(comptime T: type, x: T, comptime s: T) !void {
-            const arr: [10:s]T = @splat(x);
-            for (arr) |elem| {
-                try expectEqual(x, elem);
-            }
-            const ptr: [*]const T = &arr;
-            try expectEqual(s, ptr[10]); // sentinel correct
-        }
-    };
-
-    try S.doTheTest(u32, 100, 42);
-    try comptime S.doTheTest(u32, 100, 42);
-
-    try S.doTheTest(?*anyopaque, @ptrFromInt(0x1000), null);
-    try comptime S.doTheTest(?*anyopaque, @ptrFromInt(0x1000), null);
-}
-
-test "@splat zero-length array" {
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-
-    const S = struct {
-        fn doTheTest(comptime T: type, comptime s: T) !void {
-            var runtime_undef: T = undefined;
-            runtime_undef = undefined;
-            // The array should be comptime-known despite the `@splat` operand being runtime-known.
-            const arr: [0:s]T = @splat(runtime_undef);
-            const ptr: [*]const T = &arr;
-            comptime assert(ptr[0] == s);
-        }
-    };
-
-    try S.doTheTest(u32, 42);
-    try comptime S.doTheTest(u32, 42);
-
-    try S.doTheTest(?*anyopaque, null);
-    try comptime S.doTheTest(?*anyopaque, null);
-}
-
 test "initialize slice with reference to empty array initializer" {
     const a: []const u8 = &.{};
     comptime assert(a.len == 0);
@@ -1088,8 +1024,6 @@ test "pass pointer to empty array initializer to anytype parameter" {
 }
 
 test "initialize pointer to anyopaque with reference to empty array initializer" {
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
-
     const ptr: *const anyopaque = &.{};
     // The above acts like an untyped initializer, since the `.{}` has no result type.
     // So, `ptr` points in memory to an empty tuple (`@TypeOf(.{})`).
@@ -1113,15 +1047,50 @@ test "sentinel of runtime-known array initialization is populated" {
     try expect(elems[1] == 123);
 }
 
-test "splat with an error union or optional result type" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
-
+test "resist alias of explicit copy of array passed as arg" {
     const S = struct {
-        fn doTest(T: type) !?T {
-            return @splat(1);
+        const Thing = [1]u32;
+
+        fn destroy_and_replace(box_b: *Thing, a: Thing, box_a: *Thing) void {
+            box_a.* = undefined;
+            box_b.* = a;
         }
     };
 
-    _ = try S.doTest(@Vector(4, u32));
-    _ = try S.doTest([4]u32);
+    var buf_a: S.Thing = .{1234};
+    var buf_b: S.Thing = .{5678};
+    const box_a = &buf_a;
+    const box_b = &buf_b;
+
+    const a = box_a.*; // explicit copy
+    S.destroy_and_replace(box_b, a, box_a);
+
+    try expect(buf_b[0] == 1234);
+}
+
+test "access element through reference" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        fn doTheTest(x: u8) !void {
+            {
+                var val: [1]u8 = .{x};
+                const single_ptr: *[1]u8 = &val;
+                try expect(single_ptr.*[0] == x);
+                const elem_ptr = &single_ptr.*[0];
+                comptime assert(@TypeOf(elem_ptr) == *u8);
+                try expect(elem_ptr.* == x);
+            }
+            {
+                var val: [1]u8 = .{x};
+                const c_ptr: [*c][1]u8 = &val;
+                try expect(c_ptr.*[0] == x);
+                const elem_ptr = &c_ptr.*[0];
+                comptime assert(@TypeOf(elem_ptr) == *u8);
+                try expect(elem_ptr.* == x);
+            }
+        }
+    };
+    try comptime S.doTheTest(123);
+    try S.doTheTest(123);
 }

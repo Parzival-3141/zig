@@ -1,33 +1,16 @@
-$TARGET = "$($Env:ARCH)-windows-gnu"
-$ZIG_LLVM_CLANG_LLD_NAME = "zig+llvm+lld+clang-$TARGET-0.15.0-dev.233+7c85dc460"
+$TARGET = "x86_64-windows-gnu"
 $MCPU = "baseline"
-$ZIG_LLVM_CLANG_LLD_URL = "https://ziglang.org/deps/$ZIG_LLVM_CLANG_LLD_NAME.zip"
-$PREFIX_PATH = "$($Env:USERPROFILE)\$ZIG_LLVM_CLANG_LLD_NAME"
+$PREFIX_PATH = "$($Env:USERPROFILE)\deps\zig+llvm+lld+clang-$TARGET-0.17.0-dev.203+073889523"
 $ZIG = "$PREFIX_PATH\bin\zig.exe"
-$ZIG_LIB_DIR = "$(Get-Location)\lib"
+$ZSF_MAX_RSS = if ($Env:ZSF_MAX_RSS) { $Env:ZSF_MAX_RSS } else { 0 }
 
-if (!(Test-Path "$PREFIX_PATH.zip")) {
-    Write-Output "Downloading $ZIG_LLVM_CLANG_LLD_URL"
-    Invoke-WebRequest -Uri "$ZIG_LLVM_CLANG_LLD_URL" -OutFile "$PREFIX_PATH.zip"
-
-    Write-Output "Extracting..."
-    Add-Type -AssemblyName System.IO.Compression.FileSystem ;
-    [System.IO.Compression.ZipFile]::ExtractToDirectory("$PREFIX_PATH.zip", "$PREFIX_PATH\..")
-}
+$Env:PATH = "$($Env:USERPROFILE)\local\bin;$Env:PATH"
 
 function CheckLastExitCode {
     if (!$?) {
         exit 1
     }
     return 0
-}
-
-# Make the `zig version` number consistent.
-# This will affect the `zig build` command below which uses `git describe`.
-git fetch --tags
-
-if ((git rev-parse --is-shallow-repository) -eq "true") {
-    git fetch --unshallow # `git describe` won't work on a shallow repo
 }
 
 # Override the cache directories because they won't actually help other CI runs
@@ -37,12 +20,12 @@ $Env:ZIG_GLOBAL_CACHE_DIR="$(Get-Location)\zig-global-cache"
 $Env:ZIG_LOCAL_CACHE_DIR="$(Get-Location)\zig-local-cache"
 
 Write-Output "Building from source..."
-New-Item -Path 'build-release' -ItemType Directory
+New-Item -Force -Path 'build-release' -ItemType Directory
 Set-Location -Path 'build-release'
 
 # CMake gives a syntax error when file paths with backward slashes are used.
 # Here, we use forward slashes only to work around this.
-& cmake .. `
+cmake .. `
   -GNinja `
   -DCMAKE_INSTALL_PREFIX="stage3-release" `
   -DCMAKE_PREFIX_PATH="$($PREFIX_PATH -Replace "\\", "/")" `
@@ -60,68 +43,71 @@ CheckLastExitCode
 ninja install
 CheckLastExitCode
 
-Write-Output "Main test suite..."
-& "stage3-release\bin\zig.exe" build test docs `
-  --zig-lib-dir "$ZIG_LIB_DIR" `
-  --search-prefix "$PREFIX_PATH" `
-  -Dstatic-llvm `
-  -Dskip-non-native `
-  -Denable-symlinks-windows
-CheckLastExitCode
+# Must be done after zig cc is finished.
+$Env:ZIG_LIB_DIR="$(Get-Location)\..\lib"
 
-# Ensure that stage3 and stage4 are byte-for-byte identical.
-Write-Output "Build and compare stage4..."
-& "stage3-release\bin\zig.exe" build `
+Write-Output "Main test suite..."
+stage3-release\bin\zig.exe build install test docs `
+  --maxrss "$ZSF_MAX_RSS" `
   --prefix stage4-release `
-  -Denable-llvm `
-  -Dno-lib `
+  --search-prefix "$PREFIX_PATH" `
+  --test-timeout 30m `
+  -Dversion-string="$(stage3-release\bin\zig.exe version)" `
+  -Dtarget="$TARGET" `
+  -Dcpu="$MCPU" `
   -Doptimize=ReleaseFast `
   -Dstrip `
-  -Dtarget="$TARGET" `
   -Duse-zig-libcxx `
-  -Dversion-string="$(stage3-release\bin\zig version)"
+  -Denable-llvm `
+  -Dno-lib `
+  -Denable-symlinks-windows `
+  -Dskip-non-native
 CheckLastExitCode
 
-# Compare-Object returns an error code if the files differ.
+# Ensure that the fuzzer at least compiles.
+# https://codeberg.org/ziglang/zig/issues/31893
+# stage3-release\bin\zig.exe build test-std --fuzz=1K -Dno-lib -Dfuzz-only -Doptimize=ReleaseSafe
+# CheckLastExitCode
+# stage3-release\bin\zig.exe build test-std --fuzz=1K -Dno-lib -Dfuzz-only -Doptimize=Debug
+# CheckLastExitCode
+
+# Ensure that stage3 and stage4 are byte-for-byte identical.
 Write-Output "If the following command fails, it means nondeterminism has been"
 Write-Output "introduced, making stage3 and stage4 no longer byte-for-byte identical."
 Compare-Object (Get-Content stage3-release\bin\zig.exe) (Get-Content stage4-release\bin\zig.exe)
 CheckLastExitCode
 
 Write-Output "Build x86_64-windows-msvc behavior tests using the C backend..."
-& "stage3-release\bin\zig.exe" test `
-  ..\test\behavior.zig `
-  --zig-lib-dir "$ZIG_LIB_DIR" `
-  -ofmt=c `
-  -femit-bin="test-x86_64-windows-msvc.c" `
-  --test-no-exec `
-  -target x86_64-windows-msvc `
-  -lc
-CheckLastExitCode
-
-& "stage3-release\bin\zig.exe" build-obj `
-  --zig-lib-dir "$ZIG_LIB_DIR" `
+stage3-release\bin\zig.exe build-obj `
   -ofmt=c `
   -OReleaseSmall `
   --name compiler_rt `
   -femit-bin="compiler_rt-x86_64-windows-msvc.c" `
-  --dep build_options `
   -target x86_64-windows-msvc `
-  -Mroot="..\lib\compiler_rt.zig" `
-  -Mbuild_options="config.zig"
+  -lc `
+  ..\lib\compiler_rt.zig
 CheckLastExitCode
 
-Import-Module "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+stage3-release\bin\zig.exe test `
+  -ofmt=c `
+  -femit-bin="behavior-x86_64-windows-msvc.c" `
+  --test-no-exec `
+  -target x86_64-windows-msvc `
+  -lc `
+  ..\test\behavior.zig
 CheckLastExitCode
 
-Enter-VsDevShell -VsInstallPath "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools" `
+Import-Module "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+CheckLastExitCode
+
+Enter-VsDevShell -VsInstallPath "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools" `
   -DevCmdArguments '-arch=x64 -no_logo' `
   -StartInPath $(Get-Location)
 CheckLastExitCode
 
 Write-Output "Build and run behavior tests with msvc..."
-& cl.exe -I..\lib test-x86_64-windows-msvc.c compiler_rt-x86_64-windows-msvc.c /W3 /Z7 -link -nologo -debug -subsystem:console kernel32.lib ntdll.lib libcmt.lib
+cl /I..\lib /W3 /Z7 behavior-x86_64-windows-msvc.c compiler_rt-x86_64-windows-msvc.c /link /nologo /debug /subsystem:console kernel32.lib ntdll.lib libcmt.lib
 CheckLastExitCode
 
-& .\test-x86_64-windows-msvc.exe
+.\behavior-x86_64-windows-msvc
 CheckLastExitCode

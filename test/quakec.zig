@@ -338,7 +338,7 @@ pub fn add(
         step.dependOn(&b.addFail("test-quakec requires the compiler under testing to have the QuakeC backend enabled (-Ddev=quakec)").step);
         return;
     }
-    if (!opts.compiler_exe.root_module.resolved_target.?.query.isNative()) {
+    if (!@import("tests.zig").isNative(&opts.compiler_exe.root_module.resolved_target.?, &b.graph.host.result)) {
         step.dependOn(&b.addFail("test-quakec requires the compiler under testing to be built for the host target").step);
         return;
     }
@@ -347,7 +347,7 @@ pub fn add(
     for (case_sets) |set| {
         if (set.disabled) continue;
         for (opts.test_filters) |filter| {
-            if (std.mem.indexOf(u8, set.name, filter) != null) break;
+            if (std.mem.find(u8, set.name, filter) != null) break;
         } else if (opts.test_filters.len > 0) continue; // name does not match any filter
 
         const src = wf.add(b.fmt("cases/{s}.zig", .{set.name}), set.source);

@@ -26,10 +26,8 @@ export fn entry() usize {
 }
 
 // error
-// backend=stage2
-// target=native
 //
-// :8:9: error: duplicate switch value
+// :8:9: error: duplicate switch value 'error.Foo'
 // :5:9: note: previous value here
-// :17:9: error: duplicate switch value
+// :17:9: error: duplicate switch value 'error.Foo'
 // :14:9: note: previous value here

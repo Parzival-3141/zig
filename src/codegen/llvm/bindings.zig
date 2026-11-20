@@ -1,6 +1,3 @@
-//! We do this instead of @cImport because the self-hosted compiler is easier
-//! to bootstrap if it does not depend on translate-c.
-
 /// Do not compare directly to .True, use toBool() instead.
 pub const Bool = enum(c_int) {
     False,
@@ -8,7 +5,7 @@ pub const Bool = enum(c_int) {
     _,
 
     pub fn fromBool(b: bool) Bool {
-        return @as(Bool, @enumFromInt(@intFromBool(b)));
+        return @as(Bool, @fromBackingInt(@intCast(@intFromBool(b))));
     }
 
     pub fn toBool(b: Bool) bool {
@@ -282,6 +279,7 @@ pub extern fn LLVMInitializeSystemZAsmPrinter() void;
 pub extern fn LLVMInitializeWebAssemblyAsmPrinter() void;
 pub extern fn LLVMInitializeX86AsmPrinter() void;
 pub extern fn LLVMInitializeXCoreAsmPrinter() void;
+pub extern fn LLVMInitializeXtensaAsmPrinter() void;
 pub extern fn LLVMInitializeM68kAsmPrinter() void;
 pub extern fn LLVMInitializeVEAsmPrinter() void;
 pub extern fn LLVMInitializeARCAsmPrinter() void;
@@ -333,18 +331,12 @@ extern fn ZigLLVMWriteArchive(
     file_names_ptr: [*]const [*:0]const u8,
     file_names_len: usize,
     archive_kind: ArchiveKind,
+    err_file_index_out: *usize,
+    err_msg_out: *[*:0]u8,
 ) bool;
 
 pub const ParseCommandLineOptions = ZigLLVMParseCommandLineOptions;
 extern fn ZigLLVMParseCommandLineOptions(argc: usize, argv: [*]const [*:0]const u8) void;
-
-pub const WriteImportLibrary = ZigLLVMWriteImportLibrary;
-extern fn ZigLLVMWriteImportLibrary(
-    def_path: [*:0]const u8,
-    coff_machine: c_uint,
-    output_lib_path: [*:0]const u8,
-    kill_at: bool,
-) bool;
 
 pub const GetHostCPUName = LLVMGetHostCPUName;
 extern fn LLVMGetHostCPUName() ?[*:0]u8;

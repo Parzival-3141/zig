@@ -10,28 +10,30 @@ const math = std.math;
 const mem = std.mem;
 const expect = std.testing.expect;
 const arch = builtin.cpu.arch;
-const common = @import("common.zig");
-
-pub const panic = common.panic;
+const compiler_rt = @import("../compiler_rt.zig");
+const symbol = compiler_rt.symbol;
 
 comptime {
-    @export(&__roundh, .{ .name = "__roundh", .linkage = common.linkage, .visibility = common.visibility });
-    @export(&roundf, .{ .name = "roundf", .linkage = common.linkage, .visibility = common.visibility });
-    @export(&round, .{ .name = "round", .linkage = common.linkage, .visibility = common.visibility });
-    @export(&__roundx, .{ .name = "__roundx", .linkage = common.linkage, .visibility = common.visibility });
-    if (common.want_ppc_abi) {
-        @export(&roundq, .{ .name = "roundf128", .linkage = common.linkage, .visibility = common.visibility });
-    }
-    @export(&roundq, .{ .name = "roundq", .linkage = common.linkage, .visibility = common.visibility });
-    @export(&roundl, .{ .name = "roundl", .linkage = common.linkage, .visibility = common.visibility });
+    symbol(&__roundh, "__roundh");
+    symbol(&roundf, "roundf");
+    symbol(&round, "round");
+    symbol(&__roundx, "__roundx");
+    symbol(&roundq, "roundf128");
+    if (compiler_rt.have_c_longdouble) symbol(&roundl, "roundl");
 }
 
-pub fn __roundh(x: f16) callconv(.c) f16 {
+fn __roundh(x: compiler_rt.f16.Abi) callconv(.c) compiler_rt.f16.Abi {
+    return compiler_rt.f16.toAbi(round_f16(compiler_rt.f16.fromAbi(x)));
+}
+pub fn round_f16(x: f16) f16 {
     // TODO: more efficient implementation
-    return @floatCast(roundf(x));
+    return @floatCast(round_f32(x));
 }
 
-pub fn roundf(x_: f32) callconv(.c) f32 {
+fn roundf(x: compiler_rt.f32.Abi) callconv(.c) compiler_rt.f32.Abi {
+    return compiler_rt.f32.toAbi(round_f32(compiler_rt.f32.fromAbi(x)));
+}
+pub fn round_f32(x_: f32) f32 {
     const f32_toint = 1.0 / math.floatEps(f32);
 
     var x = x_;
@@ -46,7 +48,7 @@ pub fn roundf(x_: f32) callconv(.c) f32 {
         x = -x;
     }
     if (e < 0x7F - 1) {
-        if (common.want_float_exceptions) mem.doNotOptimizeAway(x + f32_toint);
+        if (compiler_rt.want_float_exceptions) mem.doNotOptimizeAway(x + f32_toint);
         return 0 * @as(f32, @bitCast(u));
     }
 
@@ -66,7 +68,10 @@ pub fn roundf(x_: f32) callconv(.c) f32 {
     }
 }
 
-pub fn round(x_: f64) callconv(.c) f64 {
+fn round(x: compiler_rt.f64.Abi) callconv(.c) compiler_rt.f64.Abi {
+    return compiler_rt.f64.toAbi(round_f64(compiler_rt.f64.fromAbi(x)));
+}
+pub fn round_f64(x_: f64) f64 {
     const f64_toint = 1.0 / math.floatEps(f64);
 
     var x = x_;
@@ -81,7 +86,7 @@ pub fn round(x_: f64) callconv(.c) f64 {
         x = -x;
     }
     if (e < 0x3ff - 1) {
-        if (common.want_float_exceptions) mem.doNotOptimizeAway(x + f64_toint);
+        if (compiler_rt.want_float_exceptions) mem.doNotOptimizeAway(x + f64_toint);
         return 0 * @as(f64, @bitCast(u));
     }
 
@@ -101,12 +106,18 @@ pub fn round(x_: f64) callconv(.c) f64 {
     }
 }
 
-pub fn __roundx(x: f80) callconv(.c) f80 {
+fn __roundx(x: compiler_rt.f80.Abi) callconv(.c) compiler_rt.f80.Abi {
+    return compiler_rt.f80.toAbi(round_f80(compiler_rt.f80.fromAbi(x)));
+}
+pub fn round_f80(x: f80) f80 {
     // TODO: more efficient implementation
-    return @floatCast(roundq(x));
+    return @floatCast(round_f128(x));
 }
 
-pub fn roundq(x_: f128) callconv(.c) f128 {
+fn roundq(x: compiler_rt.f128.Abi) callconv(.c) compiler_rt.f128.Abi {
+    return compiler_rt.f128.toAbi(round_f128(compiler_rt.f128.fromAbi(x)));
+}
+pub fn round_f128(x_: f128) f128 {
     const f128_toint = 1.0 / math.floatEps(f128);
 
     var x = x_;
@@ -121,7 +132,7 @@ pub fn roundq(x_: f128) callconv(.c) f128 {
         x = -x;
     }
     if (e < 0x3FFF - 1) {
-        if (common.want_float_exceptions) mem.doNotOptimizeAway(x + f128_toint);
+        if (compiler_rt.want_float_exceptions) mem.doNotOptimizeAway(x + f128_toint);
         return 0 * @as(f128, @bitCast(u));
     }
 
@@ -143,56 +154,79 @@ pub fn roundq(x_: f128) callconv(.c) f128 {
 
 pub fn roundl(x: c_longdouble) callconv(.c) c_longdouble {
     switch (@typeInfo(c_longdouble).float.bits) {
-        16 => return __roundh(x),
-        32 => return roundf(x),
-        64 => return round(x),
-        80 => return __roundx(x),
-        128 => return roundq(x),
-        else => @compileError("unreachable"),
+        64 => return round_f64(x),
+        80 => return round_f80(x),
+        128 => return round_f128(x),
+        else => comptime unreachable,
     }
 }
 
-test "round32" {
-    try expect(roundf(1.3) == 1.0);
-    try expect(roundf(-1.3) == -1.0);
-    try expect(roundf(0.2) == 0.0);
-    try expect(roundf(1.8) == 2.0);
+test round_f16 {
+    try expect(round_f16(1.3) == 1.0);
+    try expect(round_f16(-1.3) == -1.0);
+    try expect(round_f16(1.8) == 2.0);
+    try expect(round_f16(-1.8) == -2.0);
+    try expect(math.isPositiveZero(round_f16(0.2)));
+    try expect(math.isNegativeZero(round_f16(-0.2)));
+    try expect(math.isPositiveZero(round_f16(0.0)));
+    try expect(math.isNegativeZero(round_f16(-0.0)));
+    try expect(math.isPositiveInf(round_f16(math.inf(f32))));
+    try expect(math.isNegativeInf(round_f16(-math.inf(f32))));
+    try expect(math.isNan(round_f16(math.nan(f32))));
 }
 
-test "round64" {
-    try expect(round(1.3) == 1.0);
-    try expect(round(-1.3) == -1.0);
-    try expect(round(0.2) == 0.0);
-    try expect(round(1.8) == 2.0);
+test round_f32 {
+    try expect(round_f32(1.3) == 1.0);
+    try expect(round_f32(-1.3) == -1.0);
+    try expect(round_f32(1.8) == 2.0);
+    try expect(round_f32(-1.8) == -2.0);
+    try expect(math.isPositiveZero(round_f32(0.2)));
+    try expect(math.isNegativeZero(round_f32(-0.2)));
+    try expect(math.isPositiveZero(round_f32(0.0)));
+    try expect(math.isNegativeZero(round_f32(-0.0)));
+    try expect(math.isPositiveInf(round_f32(math.inf(f32))));
+    try expect(math.isNegativeInf(round_f32(-math.inf(f32))));
+    try expect(math.isNan(round_f32(math.nan(f32))));
 }
 
-test "round128" {
-    try expect(roundq(1.3) == 1.0);
-    try expect(roundq(-1.3) == -1.0);
-    try expect(roundq(0.2) == 0.0);
-    try expect(roundq(1.8) == 2.0);
+test round_f64 {
+    try expect(round_f64(1.3) == 1.0);
+    try expect(round_f64(-1.3) == -1.0);
+    try expect(round_f64(1.8) == 2.0);
+    try expect(round_f64(-1.8) == -2.0);
+    try expect(math.isPositiveZero(round_f64(0.2)));
+    try expect(math.isNegativeZero(round_f64(-0.2)));
+    try expect(math.isPositiveZero(round_f64(0.0)));
+    try expect(math.isNegativeZero(round_f64(-0.0)));
+    try expect(math.isPositiveInf(round_f64(math.inf(f64))));
+    try expect(math.isNegativeInf(round_f64(-math.inf(f64))));
+    try expect(math.isNan(round_f64(math.nan(f64))));
 }
 
-test "round32.special" {
-    try expect(roundf(0.0) == 0.0);
-    try expect(roundf(-0.0) == -0.0);
-    try expect(math.isPositiveInf(roundf(math.inf(f32))));
-    try expect(math.isNegativeInf(roundf(-math.inf(f32))));
-    try expect(math.isNan(roundf(math.nan(f32))));
+test round_f80 {
+    try expect(round_f80(1.3) == 1.0);
+    try expect(round_f80(-1.3) == -1.0);
+    try expect(round_f80(1.8) == 2.0);
+    try expect(round_f80(-1.8) == -2.0);
+    try expect(math.isPositiveZero(round_f80(0.2)));
+    try expect(math.isNegativeZero(round_f80(-0.2)));
+    try expect(math.isPositiveZero(round_f80(0.0)));
+    try expect(math.isNegativeZero(round_f80(-0.0)));
+    try expect(math.isPositiveInf(round_f80(math.inf(f64))));
+    try expect(math.isNegativeInf(round_f80(-math.inf(f64))));
+    try expect(math.isNan(round_f80(math.nan(f64))));
 }
 
-test "round64.special" {
-    try expect(round(0.0) == 0.0);
-    try expect(round(-0.0) == -0.0);
-    try expect(math.isPositiveInf(round(math.inf(f64))));
-    try expect(math.isNegativeInf(round(-math.inf(f64))));
-    try expect(math.isNan(round(math.nan(f64))));
-}
-
-test "round128.special" {
-    try expect(roundq(0.0) == 0.0);
-    try expect(roundq(-0.0) == -0.0);
-    try expect(math.isPositiveInf(roundq(math.inf(f128))));
-    try expect(math.isNegativeInf(roundq(-math.inf(f128))));
-    try expect(math.isNan(roundq(math.nan(f128))));
+test round_f128 {
+    try expect(round_f128(1.3) == 1.0);
+    try expect(round_f128(-1.3) == -1.0);
+    try expect(round_f128(1.8) == 2.0);
+    try expect(round_f128(-1.8) == -2.0);
+    try expect(math.isPositiveZero(round_f128(0.2)));
+    try expect(math.isNegativeZero(round_f128(-0.2)));
+    try expect(math.isPositiveZero(round_f128(0.0)));
+    try expect(math.isNegativeZero(round_f128(-0.0)));
+    try expect(math.isPositiveInf(round_f128(math.inf(f128))));
+    try expect(math.isNegativeInf(round_f128(-math.inf(f128))));
+    try expect(math.isNan(round_f128(math.nan(f128))));
 }

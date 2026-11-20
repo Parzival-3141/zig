@@ -31,9 +31,9 @@
 
 /// The root node of the trie.
 root: ?Node.Index = null,
-buffer: std.ArrayListUnmanaged(u8) = .empty,
+buffer: std.ArrayList(u8) = .empty,
 nodes: std.MultiArrayList(Node) = .{},
-edges: std.ArrayListUnmanaged(Edge) = .empty,
+edges: std.ArrayList(Edge) = .empty,
 
 /// Insert a symbol into the trie, updating the prefixes in the process.
 /// This operation may change the layout of the trie by splicing edges in
@@ -54,7 +54,7 @@ fn putNode(self: *Trie, node_index: Node.Index, allocator: Allocator, label: []c
     // Check for match with edges from this node.
     for (self.nodes.items(.edges)[node_index].items) |edge_index| {
         const edge = &self.edges.items[edge_index];
-        const match = mem.indexOfDiff(u8, edge.label, label) orelse return edge.node;
+        const match = mem.findDiff(u8, edge.label, label) orelse return edge.node;
         if (match == 0) continue;
         if (match == edge.label.len) return self.putNode(edge.node, allocator, label[match..]);
 
@@ -139,7 +139,7 @@ fn finalize(self: *Trie, allocator: Allocator) !void {
     try ordered_nodes.ensureTotalCapacityPrecise(self.nodes.items(.is_terminal).len);
 
     {
-        var fifo: std.ArrayListUnmanaged(Node.Index) = .empty;
+        var fifo: std.ArrayList(Node.Index) = .empty;
         defer fifo.deinit(allocator);
 
         try fifo.append(allocator, self.root.?);
@@ -170,8 +170,13 @@ fn finalize(self: *Trie, allocator: Allocator) !void {
     }
 
     try self.buffer.ensureTotalCapacityPrecise(allocator, size);
+
+    var allocating: std.Io.Writer.Allocating = .fromArrayList(allocator, &self.buffer);
+    defer self.buffer = allocating.toArrayList();
+    const writer = &allocating.writer;
+
     for (ordered_nodes.items) |node_index| {
-        try self.writeNode(node_index, self.buffer.writer(allocator));
+        try self.writeNode(node_index, writer);
     }
 }
 
@@ -232,7 +237,7 @@ pub fn deinit(self: *Trie, allocator: Allocator) void {
     self.buffer.deinit(allocator);
 }
 
-pub fn write(self: Trie, writer: anytype) !void {
+pub fn write(self: Trie, writer: *std.Io.Writer) !void {
     if (self.buffer.items.len == 0) return;
     try writer.writeAll(self.buffer.items);
 }
@@ -243,7 +248,7 @@ pub fn write(self: Trie, writer: anytype) !void {
 /// iterate over `Trie.ordered_nodes` and call this method on each node.
 /// This is one of the requirements of the MachO.
 /// Panics if `finalize` was not called before calling this method.
-fn writeNode(self: *Trie, node_index: Node.Index, writer: anytype) !void {
+fn writeNode(self: *Trie, node_index: Node.Index, writer: *std.Io.Writer) !void {
     const slice = self.nodes.slice();
     const edges = slice.items(.edges)[node_index];
     const is_terminal = slice.items(.is_terminal)[node_index];
@@ -253,21 +258,21 @@ fn writeNode(self: *Trie, node_index: Node.Index, writer: anytype) !void {
     if (is_terminal) {
         // Terminal node info: encode export flags and vmaddr offset of this symbol.
         var info_buf: [@sizeOf(u64) * 2]u8 = undefined;
-        var info_stream = std.io.fixedBufferStream(&info_buf);
+        var info_stream: std.Io.Writer = .fixed(&info_buf);
         // TODO Implement for special flags.
         assert(export_flags & macho.EXPORT_SYMBOL_FLAGS_REEXPORT == 0 and
             export_flags & macho.EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER == 0);
-        try leb.writeUleb128(info_stream.writer(), export_flags);
-        try leb.writeUleb128(info_stream.writer(), vmaddr_offset);
+        try info_stream.writeUleb128(export_flags);
+        try info_stream.writeUleb128(vmaddr_offset);
 
         // Encode the size of the terminal node info.
         var size_buf: [@sizeOf(u64)]u8 = undefined;
-        var size_stream = std.io.fixedBufferStream(&size_buf);
-        try leb.writeUleb128(size_stream.writer(), info_stream.pos);
+        var size_stream: std.Io.Writer = .fixed(&size_buf);
+        try size_stream.writeUleb128(info_stream.end);
 
         // Now, write them to the output stream.
-        try writer.writeAll(size_buf[0..size_stream.pos]);
-        try writer.writeAll(info_buf[0..info_stream.pos]);
+        try writer.writeAll(size_buf[0..size_stream.end]);
+        try writer.writeAll(info_buf[0..info_stream.end]);
     } else {
         // Non-terminal node is delimited by 0 byte.
         try writer.writeByte(0);
@@ -280,7 +285,7 @@ fn writeNode(self: *Trie, node_index: Node.Index, writer: anytype) !void {
         // Write edge label and offset to next node in trie.
         try writer.writeAll(edge.label);
         try writer.writeByte(0);
-        try leb.writeUleb128(writer, slice.items(.trie_offset)[edge.node]);
+        try writer.writeUleb128(slice.items(.trie_offset)[edge.node]);
     }
 }
 
@@ -323,7 +328,7 @@ const Node = struct {
     trie_offset: u32 = 0,
 
     /// List of all edges originating from this node.
-    edges: std.ArrayListUnmanaged(Edge.Index) = .empty,
+    edges: std.ArrayList(Edge.Index) = .empty,
 
     const Index = u32;
 };
@@ -346,7 +351,7 @@ fn expectEqualHexStrings(expected: []const u8, given: []const u8) !void {
     defer testing.allocator.free(expected_fmt);
     const given_fmt = try std.fmt.allocPrint(testing.allocator, "{x}", .{given});
     defer testing.allocator.free(given_fmt);
-    const idx = mem.indexOfDiff(u8, expected_fmt, given_fmt).?;
+    const idx = mem.findDiff(u8, expected_fmt, given_fmt).?;
     const padding = try testing.allocator.alloc(u8, idx + 5);
     defer testing.allocator.free(padding);
     @memset(padding, ' ');
@@ -414,7 +419,6 @@ test "ordering bug" {
 }
 
 const assert = std.debug.assert;
-const leb = std.leb;
 const log = std.log.scoped(.macho);
 const macho = std.macho;
 const mem = std.mem;

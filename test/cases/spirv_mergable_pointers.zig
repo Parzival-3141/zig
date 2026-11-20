@@ -12,6 +12,6 @@ export fn a() void {
 
 // compile
 // output_mode=Obj
-// backend=stage2
-// target=spirv64-vulkan
-// emit_bin=false
+// backend=selfhosted
+// target=spirv32-vulkan
+// emit_bin=true

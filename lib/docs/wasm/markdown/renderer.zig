@@ -2,25 +2,26 @@ const std = @import("std");
 const Document = @import("Document.zig");
 const Node = Document.Node;
 const assert = std.debug.assert;
+const Writer = std.Io.Writer;
 
 /// A Markdown document renderer.
 ///
 /// Each concrete `Renderer` type has a `renderDefault` function, with the
 /// intention that custom `renderFn` implementations can call `renderDefault`
 /// for node types for which they require no special rendering.
-pub fn Renderer(comptime Writer: type, comptime Context: type) type {
+pub fn Renderer(comptime Context: type) type {
     return struct {
         renderFn: *const fn (
             r: Self,
             doc: Document,
             node: Node.Index,
-            writer: Writer,
+            writer: *Writer,
         ) Writer.Error!void = renderDefault,
         context: Context,
 
         const Self = @This();
 
-        pub fn render(r: Self, doc: Document, writer: Writer) Writer.Error!void {
+        pub fn render(r: Self, doc: Document, writer: *Writer) Writer.Error!void {
             try r.renderFn(r, doc, .root, writer);
         }
 
@@ -28,10 +29,10 @@ pub fn Renderer(comptime Writer: type, comptime Context: type) type {
             r: Self,
             doc: Document,
             node: Node.Index,
-            writer: Writer,
+            writer: *Writer,
         ) Writer.Error!void {
-            const data = doc.nodes.items(.data)[@intFromEnum(node)];
-            switch (doc.nodes.items(.tag)[@intFromEnum(node)]) {
+            const data = doc.nodes.items(.data)[@backingInt(node)];
+            switch (doc.nodes.items(.tag)[@backingInt(node)]) {
                 .root => {
                     for (doc.extraChildren(data.container.children)) |child| {
                         try r.renderFn(r, doc, child, writer);
@@ -59,8 +60,8 @@ pub fn Renderer(comptime Writer: type, comptime Context: type) type {
                 .list_item => {
                     try writer.writeAll("<li>");
                     for (doc.extraChildren(data.list_item.children)) |child| {
-                        if (data.list_item.tight and doc.nodes.items(.tag)[@intFromEnum(child)] == .paragraph) {
-                            const para_data = doc.nodes.items(.data)[@intFromEnum(child)];
+                        if (data.list_item.tight and doc.nodes.items(.tag)[@backingInt(child)] == .paragraph) {
+                            const para_data = doc.nodes.items(.data)[@backingInt(child)];
                             for (doc.extraChildren(para_data.container.children)) |para_child| {
                                 try r.renderFn(r, doc, para_child, writer);
                             }
@@ -188,10 +189,10 @@ pub fn Renderer(comptime Writer: type, comptime Context: type) type {
 pub fn renderInlineNodeText(
     doc: Document,
     node: Node.Index,
-    writer: anytype,
-) @TypeOf(writer).Error!void {
-    const data = doc.nodes.items(.data)[@intFromEnum(node)];
-    switch (doc.nodes.items(.tag)[@intFromEnum(node)]) {
+    writer: *Writer,
+) Writer.Error!void {
+    const data = doc.nodes.items(.data)[@backingInt(node)];
+    switch (doc.nodes.items(.tag)[@backingInt(node)]) {
         .root,
         .list,
         .list_item,
@@ -230,18 +231,16 @@ pub fn renderInlineNodeText(
     }
 }
 
-pub fn fmtHtml(bytes: []const u8) std.fmt.Formatter([]const u8, formatHtml) {
+pub fn fmtHtml(bytes: []const u8) std.fmt.Alt([]const u8, formatHtml) {
     return .{ .data = bytes };
 }
 
-fn formatHtml(bytes: []const u8, writer: *std.io.Writer) std.io.Writer.Error!void {
-    for (bytes) |b| {
-        switch (b) {
-            '<' => try writer.writeAll("&lt;"),
-            '>' => try writer.writeAll("&gt;"),
-            '&' => try writer.writeAll("&amp;"),
-            '"' => try writer.writeAll("&quot;"),
-            else => try writer.writeByte(b),
-        }
-    }
+fn formatHtml(bytes: []const u8, w: *Writer) Writer.Error!void {
+    for (bytes) |b| switch (b) {
+        '<' => try w.writeAll("&lt;"),
+        '>' => try w.writeAll("&gt;"),
+        '&' => try w.writeAll("&amp;"),
+        '"' => try w.writeAll("&quot;"),
+        else => try w.writeByte(b),
+    };
 }

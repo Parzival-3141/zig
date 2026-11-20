@@ -23,20 +23,24 @@ pub fn suggestVectorLengthForCpu(comptime T: type, comptime cpu: std.Target.Cpu)
         } else if (cpu.arch.isArm()) {
             if (cpu.has(.arm, .neon)) break :blk 128;
         } else if (cpu.arch.isAARCH64()) {
-            // SVE allows up to 2048 bits in the specification, as of 2022 the most powerful machine has implemented 512-bit
-            // I think is safer to just be on 128 until is more common
-            // TODO: Check on this return when bigger values are more common
-            if (cpu.has(.aarch64, .sve)) break :blk 128;
+            // NVIDIA Grace supports 128-bit SVE
+            // AWS Graviton3 supports 256-bit SVE
+            // Fujitsu A64FX supports 512-bit SVE
+            // -> 256-bit seems like a good default for now.
+            if (cpu.has(.aarch64, .sve)) break :blk 256;
             if (cpu.has(.aarch64, .neon)) break :blk 128;
-        } else if (cpu.arch.isPowerPC()) {
-            if (cpu.has(.powerpc, .altivec)) break :blk 128;
+        } else if (cpu.arch == .hexagon) {
+            if (cpu.has(.hexagon, .hvx_length64b)) break :blk 512;
+            if (cpu.has(.hexagon, .hvx)) break :blk 1024;
+        } else if (cpu.arch.isLoongArch()) {
+            if (cpu.has(.loongarch, .lasx)) break :blk 256;
+            if (cpu.has(.loongarch, .lsx)) break :blk 128;
         } else if (cpu.arch.isMIPS()) {
             if (cpu.has(.mips, .msa)) break :blk 128;
-            // TODO: Test MIPS capability to handle bigger vectors
-            //       In theory MDMX and by extension mips3d have 32 registers of 64 bits which can use in parallel
-            //       for multiple processing, but I don't know what's optimal here, if using
-            //       the 2048 bits or using just 64 per vector or something in between
             if (cpu.has(.mips, .mips3d)) break :blk 64;
+        } else if (cpu.arch.isPowerPC()) {
+            if (cpu.has(.powerpc, .vsx)) break :blk 128;
+            if (cpu.has(.powerpc, .altivec)) break :blk 128;
         } else if (cpu.arch.isRISCV()) {
             // In RISC-V Vector Registers are length agnostic so there's no good way to determine the best size.
             // The usual vector length in most RISC-V cpus is 256 bits, however it can get to multiple kB.
@@ -60,12 +64,14 @@ pub fn suggestVectorLengthForCpu(comptime T: type, comptime cpu: std.Target.Cpu)
 
                 break :blk 256;
             }
+        } else if (cpu.arch == .s390x) {
+            if (cpu.has(.s390x, .vector)) break :blk 128;
         } else if (cpu.arch.isSPARC()) {
-            // TODO: Test Sparc capability to handle bigger vectors
-            //       In theory Sparc have 32 registers of 64 bits which can use in parallel
-            //       for multiple processing, but I don't know what's optimal here, if using
-            //       the 2048 bits or using just 64 per vector or something in between
             if (cpu.hasAny(.sparc, &.{ .vis, .vis2, .vis3 })) break :blk 64;
+        } else if (cpu.arch == .kvx) {
+            break :blk 1024;
+        } else if (cpu.arch == .ve) {
+            if (cpu.has(.ve, .vpu)) break :blk 2048;
         } else if (cpu.arch.isWasm()) {
             if (cpu.has(.wasm, .simd128)) break :blk 128;
         }
@@ -84,7 +90,7 @@ pub fn suggestVectorLength(comptime T: type) ?comptime_int {
 
 test "suggestVectorLengthForCpu works with signed and unsigned values" {
     comptime var cpu = std.Target.Cpu.baseline(std.Target.Cpu.Arch.x86_64, builtin.os);
-    comptime cpu.features.addFeature(@intFromEnum(std.Target.x86.Feature.avx512f));
+    comptime cpu.features.addFeature(@backingInt(std.Target.x86.Feature.avx512f));
     comptime cpu.features.populateDependencies(&std.Target.x86.all_features);
     const expected_len: usize = switch (builtin.zig_backend) {
         .stage2_x86_64 => 8,
@@ -151,13 +157,6 @@ pub fn join(a: anytype, b: anytype) @Vector(vectorLength(@TypeOf(a)) + vectorLen
 /// Returns a vector whose elements alternates between those of each input vector.
 /// For example, `interlace(.{[4]u32{11, 12, 13, 14}, [4]u32{21, 22, 23, 24}})` returns a vector containing `.{11, 21, 12, 22, 13, 23, 14, 24}`.
 pub fn interlace(vecs: anytype) @Vector(vectorLength(@TypeOf(vecs[0])) * vecs.len, std.meta.Child(@TypeOf(vecs[0]))) {
-    // interlace doesn't work on MIPS, for some reason.
-    // Notes from earlier debug attempt:
-    //  The indices are correct. The problem seems to be with the @shuffle builtin.
-    //  On MIPS, the test that interlaces small_base gives { 0, 2, 0, 0, 64, 255, 248, 200, 0, 0 }.
-    //  Calling this with two inputs seems to work fine, but I'll let the compile error trigger for all inputs, just to be safe.
-    if (builtin.cpu.arch.isMIPS()) @compileError("TODO: Find out why interlace() doesn't work on MIPS");
-
     const VecType = @TypeOf(vecs[0]);
     const vecs_arr = @as([vecs.len]VecType, vecs);
     const Child = std.meta.Child(@TypeOf(vecs_arr[0]));
@@ -224,6 +223,8 @@ pub fn extract(
 }
 
 test "vector patterns" {
+    if (builtin.cpu.arch == .hexagon) return error.SkipZigTest;
+
     const base = @Vector(4, u32){ 10, 20, 30, 40 };
     const other_base = @Vector(4, u32){ 55, 66, 77, 88 };
 
@@ -239,13 +240,11 @@ test "vector patterns" {
     try std.testing.expectEqual([8]u32{ 10, 20, 30, 40, 55, 66, 77, 88 }, join(base, other_base));
     try std.testing.expectEqual([2]u32{ 20, 30 }, extract(base, 1, 2));
 
-    if (!builtin.cpu.arch.isMIPS()) {
-        try std.testing.expectEqual([8]u32{ 10, 55, 20, 66, 30, 77, 40, 88 }, interlace(.{ base, other_base }));
+    try std.testing.expectEqual([8]u32{ 10, 55, 20, 66, 30, 77, 40, 88 }, interlace(.{ base, other_base }));
 
-        const small_braid = interlace(small_bases);
-        try std.testing.expectEqual([10]u8{ 0, 2, 4, 6, 8, 1, 3, 5, 7, 9 }, small_braid);
-        try std.testing.expectEqual(small_bases, deinterlace(small_bases.len, small_braid));
-    }
+    const small_braid = interlace(small_bases);
+    try std.testing.expectEqual([10]u8{ 0, 2, 4, 6, 8, 1, 3, 5, 7, 9 }, small_braid);
+    try std.testing.expectEqual(small_bases, deinterlace(small_bases.len, small_braid));
 }
 
 /// Joins two vectors, shifts them leftwards (towards lower indices) and extracts the leftmost elements into a vector the length of a and b.
@@ -376,9 +375,6 @@ pub fn prefixScanWithFunc(
     /// For example, this should be 0 for addition or 1 for multiplication.
     comptime identity: std.meta.Child(@TypeOf(vec)),
 ) if (ErrorType == void) @TypeOf(vec) else ErrorType!@TypeOf(vec) {
-    // I haven't debugged this, but it might be a cousin of sorts to what's going on with interlace.
-    if (builtin.cpu.arch.isMIPS()) @compileError("TODO: Find out why prefixScan doesn't work on MIPS");
-
     const len = vectorLength(@TypeOf(vec));
 
     if (hop == 0) @compileError("hop can not be 0; you'd be going nowhere forever!");
@@ -448,12 +444,6 @@ pub fn prefixScan(comptime op: std.builtin.ReduceOp, comptime hop: isize, vec: a
 }
 
 test "vector prefix scan" {
-    if ((builtin.cpu.arch == .armeb or builtin.cpu.arch == .thumbeb) and builtin.zig_backend == .stage2_llvm) return error.SkipZigTest; // https://github.com/ziglang/zig/issues/22060
-    if (builtin.cpu.arch == .aarch64_be and builtin.zig_backend == .stage2_llvm) return error.SkipZigTest; // https://github.com/ziglang/zig/issues/21893
-    if (builtin.zig_backend == .stage2_llvm and builtin.cpu.arch == .hexagon) return error.SkipZigTest;
-
-    if (builtin.cpu.arch.isMIPS()) return error.SkipZigTest;
-
     const int_base = @Vector(4, i32){ 11, 23, 9, -21 };
     const float_base = @Vector(4, f32){ 2, 0.5, -10, 6.54321 };
     const bool_base = @Vector(4, bool){ true, false, true, false };

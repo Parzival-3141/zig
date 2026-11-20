@@ -1,9 +1,9 @@
 const std = @import("std");
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const mem = std.mem;
 const log = std.log;
-const fs = std.fs;
-const path = fs.path;
+const path = std.Io.Dir.path;
 const assert = std.debug.assert;
 const Version = std.SemanticVersion;
 const Path = std.Build.Cache.Path;
@@ -12,7 +12,7 @@ const Compilation = @import("../Compilation.zig");
 const build_options = @import("build_options");
 const trace = @import("../tracy.zig").trace;
 const Cache = std.Build.Cache;
-const Module = @import("../Package/Module.zig");
+const Module = @import("../Module.zig");
 const link = @import("../link.zig");
 
 pub const Lib = struct {
@@ -37,13 +37,13 @@ pub const ABI = struct {
 // The order of the elements in this array defines the linking order.
 pub const libs = [_]Lib{
     .{ .name = "m", .sover = 6 },
-    .{ .name = "pthread", .sover = 0, .removed_in = .{ .major = 2, .minor = 34, .patch = 0 } },
     .{ .name = "c", .sover = 6 },
+    .{ .name = "ld", .sover = 2 },
+    .{ .name = "resolv", .sover = 2 },
+    .{ .name = "pthread", .sover = 0, .removed_in = .{ .major = 2, .minor = 34, .patch = 0 } },
     .{ .name = "dl", .sover = 2, .removed_in = .{ .major = 2, .minor = 34, .patch = 0 } },
     .{ .name = "rt", .sover = 1, .removed_in = .{ .major = 2, .minor = 34, .patch = 0 } },
-    .{ .name = "ld", .sover = 2 },
     .{ .name = "util", .sover = 1, .removed_in = .{ .major = 2, .minor = 34, .patch = 0 } },
-    .{ .name = "resolv", .sover = 2 },
 };
 
 pub const LoadMetaDataError = error{
@@ -189,11 +189,11 @@ pub fn buildCrtFile(comp: *Compilation, crt_file: CrtFile, prog_node: std.Progre
                 var args = std.array_list.Managed([]const u8).init(arena);
                 try add_include_dirs(comp, arena, &args);
                 try args.appendSlice(&[_][]const u8{
+                    "-w", // Disable all warnings.
                     "-D_LIBC_REENTRANT",
                     "-include",
                     try lib_path(comp, arena, lib_libc_glibc ++ "include" ++ path.sep_str ++ "libc-modules.h"),
                     "-DMODULE_NAME=libc",
-                    "-Wno-nonportable-include-path",
                     "-include",
                     try lib_path(comp, arena, lib_libc_glibc ++ "include" ++ path.sep_str ++ "libc-symbols.h"),
                     "-DPIC",
@@ -217,6 +217,7 @@ pub fn buildCrtFile(comp: *Compilation, crt_file: CrtFile, prog_node: std.Progre
                 });
                 try add_include_dirs(comp, arena, &args);
                 try args.appendSlice(&[_][]const u8{
+                    "-w", // Disable all warnings.
                     "-D_LIBC_REENTRANT",
                     "-DMODULE_NAME=libc",
                     "-DTOP_NAMESPACE=glibc",
@@ -229,9 +230,16 @@ pub fn buildCrtFile(comp: *Compilation, crt_file: CrtFile, prog_node: std.Progre
                     .owner = undefined,
                 };
             };
-            const init_o: Compilation.CSourceFile = .{
-                .src_path = try lib_path(comp, arena, lib_libc_glibc ++ "csu" ++ path.sep_str ++ "init.c"),
-                .owner = undefined,
+            const init_o: Compilation.CSourceFile = blk: {
+                var args = std.array_list.Managed([]const u8).init(arena);
+                try args.appendSlice(&[_][]const u8{
+                    "-w", // Disable all warnings.
+                });
+                break :blk .{
+                    .src_path = try lib_path(comp, arena, lib_libc_glibc ++ "csu" ++ path.sep_str ++ "init.c"),
+                    .cache_exempt_flags = args.items,
+                    .owner = undefined,
+                };
             };
             var files = [_]Compilation.CSourceFile{ start_o, abi_note_o, init_o };
             const basename = if (comp.config.output_mode == .Exe and !comp.config.pie) "crt1" else "Scrt1";
@@ -308,15 +316,14 @@ pub fn buildCrtFile(comp: *Compilation, crt_file: CrtFile, prog_node: std.Progre
 
                 var args = std.array_list.Managed([]const u8).init(arena);
                 try args.appendSlice(&[_][]const u8{
+                    "-w", // Disable all warnings.
                     "-std=gnu11",
                     "-fgnu89-inline",
                     "-fmerge-all-constants",
                     "-frounding-math",
-                    "-Wno-unsupported-floating-point-opt", // For targets that don't support -frounding-math.
                     "-fno-common",
                     "-fmath-errno",
                     "-ftls-model=initial-exec",
-                    "-Wno-ignored-attributes",
                     "-Qunused-arguments",
                 });
                 try add_include_dirs(comp, arena, &args);
@@ -335,7 +342,6 @@ pub fn buildCrtFile(comp: *Compilation, crt_file: CrtFile, prog_node: std.Progre
                     "-include",
                     try lib_path(comp, arena, lib_libc_glibc ++ "include" ++ path.sep_str ++ "libc-modules.h"),
                     "-DMODULE_NAME=libc",
-                    "-Wno-nonportable-include-path",
                     "-include",
                     try lib_path(comp, arena, lib_libc_glibc ++ "include" ++ path.sep_str ++ "libc-symbols.h"),
                     "-DPIC",
@@ -392,7 +398,7 @@ fn start_asm_path(comp: *Compilation, arena: Allocator, basename: []const u8) ![
             try result.appendSlice("powerpc" ++ s ++ "powerpc32");
         }
     } else if (arch == .s390x) {
-        try result.appendSlice("s390" ++ s ++ "s390-64");
+        try result.appendSlice("s390");
     } else if (arch.isLoongArch()) {
         try result.appendSlice("loongarch");
     } else if (arch == .m68k) {
@@ -602,8 +608,6 @@ fn add_include_dirs_arch(
             try args.append(try path.join(arena, &[_][]const u8{ dir, "s390", nptl }));
         } else {
             try args.append("-I");
-            try args.append(try path.join(arena, &[_][]const u8{ dir, "s390" ++ s ++ "s390-64" }));
-            try args.append("-I");
             try args.append(try path.join(arena, &[_][]const u8{ dir, "s390" }));
         }
     } else if (arch.isLoongArch()) {
@@ -640,8 +644,8 @@ pub const BuiltSharedObjects = struct {
     lock: Cache.Lock,
     dir_path: Path,
 
-    pub fn deinit(self: *BuiltSharedObjects, gpa: Allocator) void {
-        self.lock.release();
+    pub fn deinit(self: *BuiltSharedObjects, gpa: Allocator, io: Io) void {
+        self.lock.release(io);
         gpa.free(self.dir_path.sub_path);
         self.* = undefined;
     }
@@ -666,6 +670,7 @@ pub fn buildSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) anye
     }
 
     const gpa = comp.gpa;
+    const io = comp.io;
 
     var arena_allocator = std.heap.ArenaAllocator.init(gpa);
     defer arena_allocator.deinit();
@@ -677,12 +682,14 @@ pub fn buildSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) anye
     // Use the global cache directory.
     var cache: Cache = .{
         .gpa = gpa,
-        .manifest_dir = try comp.dirs.global_cache.handle.makeOpenPath("h", .{}),
+        .io = io,
+        .manifest_dir = try comp.dirs.global_cache.handle.createDirPathOpen(io, "h", .{}),
+        .cwd = comp.dirs.cwd,
     };
-    cache.addPrefix(.{ .path = null, .handle = fs.cwd() });
+    cache.addPrefix(.{ .path = null, .handle = Io.Dir.cwd() });
     cache.addPrefix(comp.dirs.zig_lib);
     cache.addPrefix(comp.dirs.global_cache);
-    defer cache.manifest_dir.close();
+    defer cache.manifest_dir.close(io);
 
     var man = cache.obtain();
     defer man.deinit();
@@ -691,31 +698,47 @@ pub fn buildSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) anye
     man.hash.add(target.abi);
     man.hash.add(target_version);
 
-    const full_abilists_path = try comp.dirs.zig_lib.join(arena, &.{abilists_path});
-    const abilists_index = try man.addFile(full_abilists_path, abilists_max_size);
+    const abilists_index = try man.addInputPath(.{
+        .root_dir = comp.dirs.zig_lib,
+        .sub_path = abilists_path,
+    }, .{
+        .request_contents = true,
+    });
 
-    if (try man.hit()) {
-        const digest = man.final();
-
+    var diag: Cache.Manifest.CheckDiagnostic = undefined;
+    const status = man.check(&diag, prog_node) catch |err| switch (err) {
+        error.OutOfMemory, error.Canceled => |e| return e,
+        error.CacheCheckFailed => {
+            comp.lockAndSetMiscFailure(
+                .glibc_shared_objects,
+                "compiling glibc shared objects: checking cache failed: {f}",
+                .{diag.fmt(&man)},
+            );
+            return error.AlreadyReported;
+        },
+    };
+    log.debug("glibc_shared_objects cache {f}", .{status.fmt(&man)});
+    if (status == .hit) {
+        const digest = man.hitDigestHex();
         return queueSharedObjects(comp, .{
             .lock = man.toOwnedLock(),
             .dir_path = .{
                 .root_dir = comp.dirs.global_cache,
-                .sub_path = try gpa.dupe(u8, "o" ++ fs.path.sep_str ++ digest),
+                .sub_path = try gpa.dupe(u8, "o" ++ path.sep_str ++ digest),
             },
         });
     }
 
-    const digest = man.final();
-    const o_sub_path = try path.join(arena, &[_][]const u8{ "o", &digest });
+    const digest = man.missDigestHex();
+    const o_sub_path = try path.join(arena, &.{ "o", &digest });
 
     var o_directory: Cache.Directory = .{
-        .handle = try comp.dirs.global_cache.handle.makeOpenPath(o_sub_path, .{}),
+        .handle = try comp.dirs.global_cache.handle.createDirPathOpen(io, o_sub_path, .{}),
         .path = try comp.dirs.global_cache.join(arena, &.{o_sub_path}),
     };
-    defer o_directory.handle.close();
+    defer o_directory.handle.close(io);
 
-    const abilists_contents = man.files.keys()[abilists_index].contents.?;
+    const abilists_contents = abilists_index.contents(&man);
     const metadata = try loadMetaData(gpa, abilists_contents);
     defer metadata.destroy(gpa);
 
@@ -752,12 +775,12 @@ pub fn buildSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) anye
         var map_contents = std.array_list.Managed(u8).init(arena);
         for (metadata.all_versions[0 .. target_ver_index + 1]) |ver| {
             if (ver.patch == 0) {
-                try map_contents.writer().print("GLIBC_{d}.{d} {{ }};\n", .{ ver.major, ver.minor });
+                try map_contents.print("GLIBC_{d}.{d} {{ }};\n", .{ ver.major, ver.minor });
             } else {
-                try map_contents.writer().print("GLIBC_{d}.{d}.{d} {{ }};\n", .{ ver.major, ver.minor, ver.patch });
+                try map_contents.print("GLIBC_{d}.{d}.{d} {{ }};\n", .{ ver.major, ver.minor, ver.patch });
             }
         }
-        try o_directory.handle.writeFile(.{ .sub_path = all_map_basename, .data = map_contents.items });
+        try o_directory.handle.writeFile(io, .{ .sub_path = all_map_basename, .data = map_contents.items });
         map_contents.deinit(); // The most recent allocation of an arena can be freed :)
     }
 
@@ -773,7 +796,7 @@ pub fn buildSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) anye
         try stubs_asm.appendSlice(".text\n");
 
         var sym_i: usize = 0;
-        var sym_name_buf = std.array_list.Managed(u8).init(arena);
+        var sym_name_buf: Io.Writer.Allocating = .init(arena);
         var opt_symbol_name: ?[]const u8 = null;
         var versions_buffer: [32]u8 = undefined;
         var versions_len: usize = undefined;
@@ -792,26 +815,27 @@ pub fn buildSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) anye
         //
         // If we don't handle this, we end up writing the default `lgammal` symbol for version 2.33
         // twice, which causes a "duplicate symbol" assembler error.
-        var versions_written = std.AutoArrayHashMap(Version, void).init(arena);
+        var versions_written: std.array_hash_map.Auto(Version, void) = .empty;
 
-        var inc_fbs = std.io.fixedBufferStream(metadata.inclusions);
-        var inc_reader = inc_fbs.reader();
+        var inc_reader: Io.Reader = .fixed(metadata.inclusions);
 
-        const fn_inclusions_len = try inc_reader.readInt(u16, .little);
+        const fn_inclusions_len = try inc_reader.takeInt(u16, .little);
 
         while (sym_i < fn_inclusions_len) : (sym_i += 1) {
             const sym_name = opt_symbol_name orelse n: {
                 sym_name_buf.clearRetainingCapacity();
-                try inc_reader.streamUntilDelimiter(sym_name_buf.writer(), 0, null);
+                _ = try inc_reader.streamDelimiter(&sym_name_buf.writer, 0);
+                assert(inc_reader.buffered()[0] == 0); // TODO change streamDelimiter API
+                inc_reader.toss(1);
 
-                opt_symbol_name = sym_name_buf.items;
+                opt_symbol_name = sym_name_buf.written();
                 versions_buffer = undefined;
                 versions_len = 0;
 
-                break :n sym_name_buf.items;
+                break :n sym_name_buf.written();
             };
-            const targets = try std.leb.readUleb128(u64, inc_reader);
-            var lib_index = try inc_reader.readByte();
+            const targets = try inc_reader.takeLeb128(u64);
+            var lib_index = try inc_reader.takeByte();
 
             const is_terminal = (lib_index & (1 << 7)) != 0;
             if (is_terminal) {
@@ -825,7 +849,7 @@ pub fn buildSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) anye
                 ((targets & (@as(u64, 1) << @as(u6, @intCast(target_targ_index)))) != 0);
 
             while (true) {
-                const byte = try inc_reader.readByte();
+                const byte = try inc_reader.takeByte();
                 const last = (byte & 0b1000_0000) != 0;
                 const ver_i = @as(u7, @truncate(byte));
                 if (ok_lib_and_target and ver_i <= target_ver_index) {
@@ -855,7 +879,7 @@ pub fn buildSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) anye
             }
 
             versions_written.clearRetainingCapacity();
-            try versions_written.ensureTotalCapacity(versions_len);
+            try versions_written.ensureTotalCapacity(arena, versions_len);
 
             {
                 var ver_buf_i: u8 = 0;
@@ -880,7 +904,7 @@ pub fn buildSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) anye
                             "{s}_{d}_{d}",
                             .{ sym_name, ver.major, ver.minor },
                         );
-                        try stubs_asm.writer().print(
+                        try stubs_asm.print(
                             \\.balign {d}
                             \\.globl {s}
                             \\.type {s}, %function
@@ -905,7 +929,7 @@ pub fn buildSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) anye
                             "{s}_{d}_{d}_{d}",
                             .{ sym_name, ver.major, ver.minor, ver.patch },
                         );
-                        try stubs_asm.writer().print(
+                        try stubs_asm.print(
                             \\.balign {d}
                             \\.globl {s}
                             \\.type {s}, %function
@@ -950,7 +974,7 @@ pub fn buildSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) anye
         // versions where the symbol didn't exist. We only care about modern glibc versions, so use
         // a strong reference.
         if (std.mem.eql(u8, lib.name, "c")) {
-            try stubs_asm.writer().print(
+            try stubs_asm.print(
                 \\.balign {d}
                 \\.globl _IO_stdin_used
                 \\{s} _IO_stdin_used
@@ -963,7 +987,7 @@ pub fn buildSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) anye
 
         try stubs_asm.appendSlice(".data\n");
 
-        const obj_inclusions_len = try inc_reader.readInt(u16, .little);
+        const obj_inclusions_len = try inc_reader.takeInt(u16, .little);
 
         var sizes = try arena.alloc(u16, metadata.all_versions.len);
 
@@ -974,17 +998,19 @@ pub fn buildSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) anye
         while (sym_i < obj_inclusions_len) : (sym_i += 1) {
             const sym_name = opt_symbol_name orelse n: {
                 sym_name_buf.clearRetainingCapacity();
-                try inc_reader.streamUntilDelimiter(sym_name_buf.writer(), 0, null);
+                _ = try inc_reader.streamDelimiter(&sym_name_buf.writer, 0);
+                assert(inc_reader.buffered()[0] == 0); // TODO change streamDelimiter API
+                inc_reader.toss(1);
 
-                opt_symbol_name = sym_name_buf.items;
+                opt_symbol_name = sym_name_buf.written();
                 versions_buffer = undefined;
                 versions_len = 0;
 
-                break :n sym_name_buf.items;
+                break :n sym_name_buf.written();
             };
-            const targets = try std.leb.readUleb128(u64, inc_reader);
-            const size = try std.leb.readUleb128(u16, inc_reader);
-            var lib_index = try inc_reader.readByte();
+            const targets = try inc_reader.takeLeb128(u64);
+            const size = try inc_reader.takeLeb128(u16);
+            var lib_index = try inc_reader.takeByte();
 
             const is_terminal = (lib_index & (1 << 7)) != 0;
             if (is_terminal) {
@@ -998,7 +1024,7 @@ pub fn buildSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) anye
                 ((targets & (@as(u64, 1) << @as(u6, @intCast(target_targ_index)))) != 0);
 
             while (true) {
-                const byte = try inc_reader.readByte();
+                const byte = try inc_reader.takeByte();
                 const last = (byte & 0b1000_0000) != 0;
                 const ver_i = @as(u7, @truncate(byte));
                 if (ok_lib_and_target and ver_i <= target_ver_index) {
@@ -1029,7 +1055,7 @@ pub fn buildSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) anye
             }
 
             versions_written.clearRetainingCapacity();
-            try versions_written.ensureTotalCapacity(versions_len);
+            try versions_written.ensureTotalCapacity(arena, versions_len);
 
             {
                 var ver_buf_i: u8 = 0;
@@ -1055,7 +1081,7 @@ pub fn buildSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) anye
                             "{s}_{d}_{d}",
                             .{ sym_name, ver.major, ver.minor },
                         );
-                        try stubs_asm.writer().print(
+                        try stubs_asm.print(
                             \\.balign {d}
                             \\.globl {s}
                             \\.type {s}, %object
@@ -1083,7 +1109,7 @@ pub fn buildSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) anye
                             "{s}_{d}_{d}_{d}",
                             .{ sym_name, ver.major, ver.minor, ver.patch },
                         );
-                        try stubs_asm.writer().print(
+                        try stubs_asm.print(
                             \\.balign {d}
                             \\.globl {s}
                             \\.type {s}, %object
@@ -1112,25 +1138,24 @@ pub fn buildSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) anye
         }
 
         var lib_name_buf: [32]u8 = undefined; // Larger than each of the names "c", "pthread", etc.
-        const asm_file_basename = std.fmt.bufPrint(&lib_name_buf, "{s}.s", .{lib.name}) catch unreachable;
-        try o_directory.handle.writeFile(.{ .sub_path = asm_file_basename, .data = stubs_asm.items });
+        const asm_file_basename = std.mem.print(&lib_name_buf, "{s}.s", .{lib.name}) catch unreachable;
+        try o_directory.handle.writeFile(io, .{ .sub_path = asm_file_basename, .data = stubs_asm.items });
         try buildSharedLib(comp, arena, o_directory, asm_file_basename, lib, prog_node);
     }
 
-    man.writeManifest() catch |err| {
-        log.warn("failed to write cache manifest for glibc stubs: {s}", .{@errorName(err)});
-    };
+    man.finalize() catch |err| log.warn("failed to write cache manifest for glibc stubs: {t}", .{err});
 
     return queueSharedObjects(comp, .{
         .lock = man.toOwnedLock(),
         .dir_path = .{
             .root_dir = comp.dirs.global_cache,
-            .sub_path = try gpa.dupe(u8, "o" ++ fs.path.sep_str ++ digest),
+            .sub_path = try gpa.dupe(u8, "o" ++ path.sep_str ++ digest),
         },
     });
 }
 
-fn queueSharedObjects(comp: *Compilation, so_files: BuiltSharedObjects) void {
+fn queueSharedObjects(comp: *Compilation, so_files: BuiltSharedObjects) std.Io.Cancelable!void {
+    const io = comp.io;
     const target_version = comp.getTarget().os.versionRange().gnuLibCVersion().?;
 
     assert(comp.glibc_so_files == null);
@@ -1140,8 +1165,8 @@ fn queueSharedObjects(comp: *Compilation, so_files: BuiltSharedObjects) void {
     var task_buffer_i: usize = 0;
 
     {
-        comp.mutex.lock(); // protect comp.arena
-        defer comp.mutex.unlock();
+        comp.mutex.lockUncancelable(io); // protect comp.arena
+        defer comp.mutex.unlock(io);
 
         for (libs) |lib| {
             if (lib.removed_in) |rem_in| {
@@ -1150,7 +1175,7 @@ fn queueSharedObjects(comp: *Compilation, so_files: BuiltSharedObjects) void {
             const so_path: Path = .{
                 .root_dir = so_files.dir_path.root_dir,
                 .sub_path = std.fmt.allocPrint(comp.arena, "{s}{c}lib{s}.so.{d}", .{
-                    so_files.dir_path.sub_path, fs.path.sep, lib.name, lib.sover,
+                    so_files.dir_path.sub_path, path.sep, lib.name, lib.sover,
                 }) catch return comp.setAllocFailure(),
             };
             task_buffer[task_buffer_i] = .{ .load_dso = so_path };
@@ -1158,7 +1183,7 @@ fn queueSharedObjects(comp: *Compilation, so_files: BuiltSharedObjects) void {
         }
     }
 
-    comp.queuePrelinkTasks(task_buffer[0..task_buffer_i]);
+    try comp.queuePrelinkTasks(task_buffer[0..task_buffer_i]);
 }
 
 fn buildSharedLib(
@@ -1172,11 +1197,11 @@ fn buildSharedLib(
     const tracy = trace(@src());
     defer tracy.end();
 
+    const io = comp.io;
     const basename = try std.fmt.allocPrint(arena, "lib{s}.so.{d}", .{ lib.name, lib.sover });
     const version: Version = .{ .major = lib.sover, .minor = 0, .patch = 0 };
     const ld_basename = path.basename(comp.getTarget().standardDynamicLinkerPath().get().?);
     const soname = if (mem.eql(u8, lib.name, "ld")) ld_basename else basename;
-    const map_file_path = try path.join(arena, &.{ bin_directory.path.?, all_map_basename });
 
     const optimize_mode = comp.compilerRtOptMode();
     const strip = comp.compilerRtStrip();
@@ -1209,7 +1234,6 @@ fn buildSharedLib(
             .omit_frame_pointer = comp.root_mod.omit_frame_pointer,
             .valgrind = false,
             .optimize_mode = optimize_mode,
-            .structured_cfg = comp.root_mod.structured_cfg,
         },
         .global = config,
         .cc_argv = &.{},
@@ -1226,9 +1250,9 @@ fn buildSharedLib(
     const misc_task: Compilation.MiscTask = .@"glibc shared object";
 
     var sub_create_diag: Compilation.CreateDiagnostic = undefined;
-    const sub_compilation = Compilation.create(comp.gpa, arena, &sub_create_diag, .{
+    const sub_compilation = Compilation.create(comp.gpa, arena, io, &sub_create_diag, .{
+        .thread_limit = comp.thread_limit,
         .dirs = comp.dirs.withoutLocalCache(),
-        .thread_pool = comp.thread_pool,
         .self_exe_path = comp.self_exe_path,
         // Because we manually cache the whole set of objects, we don't cache the individual objects
         // within it. In fact, we *can't* do that, because we need `emit_bin` to specify the path.
@@ -1243,14 +1267,17 @@ fn buildSharedLib(
         .verbose_air = comp.verbose_air,
         .verbose_llvm_ir = comp.verbose_llvm_ir,
         .verbose_llvm_bc = comp.verbose_llvm_bc,
-        .verbose_cimport = comp.verbose_cimport,
         .verbose_llvm_cpu_features = comp.verbose_llvm_cpu_features,
         .clang_passthrough_mode = comp.clang_passthrough_mode,
         .version = version,
-        .version_script = map_file_path,
+        .version_script = .{
+            .root_dir = bin_directory,
+            .sub_path = all_map_basename,
+        },
         .soname = soname,
         .c_source_files = &c_source_files,
         .skip_linker_dependencies = true,
+        .environ_map = comp.environ_map,
     }) catch |err| switch (err) {
         error.CreateFail => {
             comp.lockAndSetMiscFailure(misc_task, "sub-compilation of {t} failed: {f}", .{ misc_task, sub_create_diag });
@@ -1263,7 +1290,7 @@ fn buildSharedLib(
     try comp.updateSubCompilation(sub_compilation, misc_task, prog_node);
 }
 
-pub fn needsCrt0(output_mode: std.builtin.OutputMode) ?CrtFile {
+pub fn needsCrt0(output_mode: std.lang.OutputMode) ?CrtFile {
     return switch (output_mode) {
         .Obj, .Lib => null,
         .Exe => .scrt1_o,

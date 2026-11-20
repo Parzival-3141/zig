@@ -1,12 +1,15 @@
 //! The standard memory allocation interface.
+const Allocator = @This();
+
+const builtin = @import("builtin");
 
 const std = @import("../std.zig");
 const assert = std.debug.assert;
 const math = std.math;
 const mem = std.mem;
-const Allocator = @This();
-const builtin = @import("builtin");
 const Alignment = std.mem.Alignment;
+const Slice = std.meta.Slice;
+const AbsorbSentinel = std.meta.AbsorbSentinel;
 
 pub const Error = error{OutOfMemory};
 pub const Log2Align = math.Log2Int(usize);
@@ -22,6 +25,8 @@ vtable: *const VTable,
 pub const VTable = struct {
     /// Return a pointer to `len` bytes with specified `alignment`, or return
     /// `null` indicating the allocation failed.
+    ///
+    /// `new_len` must be greater than zero.
     ///
     /// `ret_addr` is optionally provided as the first return address of the
     /// allocation call stack. If the value is `0` it means no return address
@@ -80,6 +85,19 @@ pub const VTable = struct {
     /// has been provided.
     free: *const fn (*anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void,
 };
+
+pub fn noAlloc(
+    self: *anyopaque,
+    len: usize,
+    alignment: Alignment,
+    ret_addr: usize,
+) ?[*]u8 {
+    _ = self;
+    _ = len;
+    _ = alignment;
+    _ = ret_addr;
+    return null;
+}
 
 pub fn noResize(
     self: *anyopaque,
@@ -150,11 +168,31 @@ pub inline fn rawFree(a: Allocator, memory: []u8, alignment: Alignment, ret_addr
 /// Returns a pointer to undefined memory.
 /// Call `destroy` with the result to free the memory.
 pub fn create(a: Allocator, comptime T: type) Error!*T {
+    return a.createAdvancedWithRetAddr(T, null, @returnAddress());
+}
+
+pub fn alignedCreate(
+    self: Allocator,
+    comptime T: type,
+    /// null means naturally aligned
+    comptime alignment: ?Alignment,
+) Error!*align(if (alignment) |a| a.toByteUnits() else @alignOf(T)) T {
+    return self.createAdvancedWithRetAddr(T, alignment, @returnAddress());
+}
+
+pub inline fn createAdvancedWithRetAddr(
+    self: Allocator,
+    comptime T: type,
+    /// null means naturally aligned
+    comptime alignment: ?Alignment,
+    return_address: usize,
+) Error!*align(if (alignment) |a| a.toByteUnits() else @alignOf(T)) T {
     if (@sizeOf(T) == 0) {
         const ptr = comptime std.mem.alignBackward(usize, math.maxInt(usize), @alignOf(T));
         return @ptrFromInt(ptr);
     }
-    const ptr: *T = @ptrCast(try a.allocBytesWithAlignment(.of(T), @sizeOf(T), @returnAddress()));
+    const a: Alignment = alignment orelse comptime .of(T);
+    const ptr: *align(a.toByteUnits()) T = @ptrCast(try self.allocBytesAligned(a, @sizeOf(T), return_address));
     return ptr;
 }
 
@@ -166,7 +204,11 @@ pub fn destroy(self: Allocator, ptr: anytype) void {
     const T = info.child;
     if (@sizeOf(T) == 0) return;
     const non_const_ptr = @as([*]u8, @ptrCast(@constCast(ptr)));
-    self.rawFree(non_const_ptr[0..@sizeOf(T)], .fromByteUnits(info.alignment), @returnAddress());
+    self.rawFree(
+        non_const_ptr[0..@sizeOf(T)],
+        .fromByteUnits(info.attrs.@"align" orelse @alignOf(T)),
+        @returnAddress(),
+    );
 }
 
 /// Allocates an array of `n` items of type `T` and sets all the
@@ -253,7 +295,7 @@ pub inline fn allocAdvancedWithRetAddr(
     n: usize,
     return_address: usize,
 ) Error![]align(if (alignment) |a| a.toByteUnits() else @alignOf(T)) T {
-    const a = comptime (alignment orelse Alignment.of(T));
+    const a: Alignment = alignment orelse comptime .of(T);
     const ptr: [*]align(a.toByteUnits()) T = @ptrCast(try self.allocWithSizeAndAlignment(@sizeOf(T), a, n, return_address));
     return ptr[0..n];
 }
@@ -265,11 +307,11 @@ fn allocWithSizeAndAlignment(
     n: usize,
     return_address: usize,
 ) Error![*]align(alignment.toByteUnits()) u8 {
-    const byte_count = math.mul(usize, size, n) catch return Error.OutOfMemory;
-    return self.allocBytesWithAlignment(alignment, byte_count, return_address);
+    const byte_count = math.mul(usize, size, n) catch return error.OutOfMemory;
+    return self.allocBytesAligned(alignment, byte_count, return_address);
 }
 
-fn allocBytesWithAlignment(
+pub fn allocBytesAligned(
     self: Allocator,
     comptime alignment: Alignment,
     byte_count: usize,
@@ -280,7 +322,7 @@ fn allocBytesWithAlignment(
         return @as([*]align(alignment.toByteUnits()) u8, @ptrFromInt(ptr));
     }
 
-    const byte_ptr = self.rawAlloc(byte_count, alignment, return_address) orelse return Error.OutOfMemory;
+    const byte_ptr = self.rawAlloc(byte_count, alignment, return_address) orelse return error.OutOfMemory;
     @memset(byte_ptr[0..byte_count], undefined);
     return @alignCast(byte_ptr);
 }
@@ -290,13 +332,16 @@ fn allocBytesWithAlignment(
 /// It is guaranteed to not move the pointer, however the allocator
 /// implementation may refuse the resize request by returning `false`.
 ///
-/// `allocation` may be an empty slice, in which case a new allocation is made.
+/// `allocation` may be an empty slice, in which case `false` is returned,
+/// unless `new_len` is also 0, in which case `true` is returned.
 ///
 /// `new_len` may be zero, in which case the allocation is freed.
 pub fn resize(self: Allocator, allocation: anytype, new_len: usize) bool {
-    const Slice = @typeInfo(@TypeOf(allocation)).pointer;
-    const T = Slice.child;
-    const alignment = Slice.alignment;
+    const slice_info = @typeInfo(@TypeOf(allocation)).pointer;
+    const T = if (slice_info.size != .slice) comptime T: {
+        assert(slice_info.size == .one);
+        break :T @typeInfo(slice_info.child).array.child;
+    } else slice_info.child;
     if (new_len == 0) {
         self.free(allocation);
         return true;
@@ -304,12 +349,14 @@ pub fn resize(self: Allocator, allocation: anytype, new_len: usize) bool {
     if (allocation.len == 0) {
         return false;
     }
-    const old_memory = mem.sliceAsBytes(allocation);
-    // I would like to use saturating multiplication here, but LLVM cannot lower it
-    // on WebAssembly: https://github.com/ziglang/zig/issues/9660
-    //const new_len_bytes = new_len *| @sizeOf(T);
+    const old_memory: []u8 = @ptrCast(@constCast(mem.absorbSentinel(allocation)));
     const new_len_bytes = math.mul(usize, @sizeOf(T), new_len) catch return false;
-    return self.rawResize(old_memory, .fromByteUnits(alignment), new_len_bytes, @returnAddress());
+    return self.rawResize(
+        old_memory,
+        .fromByteUnits(slice_info.attrs.@"align" orelse @alignOf(T)),
+        new_len_bytes,
+        @returnAddress(),
+    );
 }
 
 /// Request to modify the size of an allocation, allowing relocation.
@@ -328,14 +375,13 @@ pub fn resize(self: Allocator, allocation: anytype, new_len: usize) bool {
 /// `new_len` may be zero, in which case the allocation is freed.
 ///
 /// If the allocation's elements' type is zero bytes sized, `allocation.len` is set to `new_len`.
-pub fn remap(self: Allocator, allocation: anytype, new_len: usize) t: {
-    const Slice = @typeInfo(@TypeOf(allocation)).pointer;
-    break :t ?[]align(Slice.alignment) Slice.child;
-} {
-    const Slice = @typeInfo(@TypeOf(allocation)).pointer;
-    const T = Slice.child;
+pub fn remap(self: Allocator, allocation: anytype, new_len: usize) ?Slice(AbsorbSentinel(@TypeOf(allocation))) {
+    const slice_info = @typeInfo(@TypeOf(allocation)).pointer;
+    const T = if (slice_info.size != .slice) comptime T: {
+        assert(slice_info.size == .one);
+        break :T @typeInfo(slice_info.child).array.child;
+    } else slice_info.child;
 
-    const alignment = Slice.alignment;
     if (new_len == 0) {
         self.free(allocation);
         return allocation[0..0];
@@ -348,14 +394,15 @@ pub fn remap(self: Allocator, allocation: anytype, new_len: usize) t: {
         new_memory.len = new_len;
         return new_memory;
     }
-    const old_memory = mem.sliceAsBytes(allocation);
-    // I would like to use saturating multiplication here, but LLVM cannot lower it
-    // on WebAssembly: https://github.com/ziglang/zig/issues/9660
-    //const new_len_bytes = new_len *| @sizeOf(T);
+    const old_memory: []u8 = @ptrCast(@constCast(mem.absorbSentinel(allocation)));
     const new_len_bytes = math.mul(usize, @sizeOf(T), new_len) catch return null;
-    const new_ptr = self.rawRemap(old_memory, .fromByteUnits(alignment), new_len_bytes, @returnAddress()) orelse return null;
-    const new_memory: []align(alignment) u8 = @alignCast(new_ptr[0..new_len_bytes]);
-    return mem.bytesAsSlice(T, new_memory);
+    const new_ptr = self.rawRemap(
+        old_memory,
+        .fromByteUnits(slice_info.attrs.@"align" orelse @alignOf(T)),
+        new_len_bytes,
+        @returnAddress(),
+    ) orelse return null;
+    return @ptrCast(@alignCast(new_ptr[0..new_len_bytes]));
 }
 
 /// This function requests a new size for an existing allocation, which
@@ -372,10 +419,7 @@ pub fn remap(self: Allocator, allocation: anytype, new_len: usize) t: {
 ///   do the realloc more efficiently than the caller
 /// * `resize` which returns `false` when the `Allocator` implementation cannot
 ///   change the size without relocating the allocation.
-pub fn realloc(self: Allocator, old_mem: anytype, new_n: usize) t: {
-    const Slice = @typeInfo(@TypeOf(old_mem)).pointer;
-    break :t Error![]align(Slice.alignment) Slice.child;
-} {
+pub fn realloc(self: Allocator, old_mem: anytype, new_n: usize) Error!Slice(AbsorbSentinel(@TypeOf(old_mem))) {
     return self.reallocAdvanced(old_mem, new_n, @returnAddress());
 }
 
@@ -384,51 +428,52 @@ pub fn reallocAdvanced(
     old_mem: anytype,
     new_n: usize,
     return_address: usize,
-) t: {
-    const Slice = @typeInfo(@TypeOf(old_mem)).pointer;
-    break :t Error![]align(Slice.alignment) Slice.child;
-} {
-    const Slice = @typeInfo(@TypeOf(old_mem)).pointer;
-    const T = Slice.child;
+) Error!Slice(AbsorbSentinel(@TypeOf(old_mem))) {
+    const slice_info = @typeInfo(@TypeOf(old_mem)).pointer;
+    const T = if (slice_info.size != .slice) comptime T: {
+        assert(slice_info.size == .one);
+        break :T @typeInfo(slice_info.child).array.child;
+    } else slice_info.child;
     if (old_mem.len == 0) {
-        return self.allocAdvancedWithRetAddr(T, .fromByteUnits(Slice.alignment), new_n, return_address);
+        return self.allocAdvancedWithRetAddr(T, .fromByteUnitsOptional(slice_info.attrs.@"align"), new_n, return_address);
     }
     if (new_n == 0) {
         self.free(old_mem);
-        const ptr = comptime std.mem.alignBackward(usize, math.maxInt(usize), Slice.alignment);
-        return @as([*]align(Slice.alignment) T, @ptrFromInt(ptr))[0..0];
+        const alignment = slice_info.attrs.@"align" orelse @alignOf(T);
+        const addr = comptime std.mem.alignBackward(usize, math.maxInt(usize), alignment);
+        const ptr: *align(alignment) [0]T = @ptrFromInt(addr);
+        return ptr;
     }
 
-    const old_byte_slice = mem.sliceAsBytes(old_mem);
-    const byte_count = math.mul(usize, @sizeOf(T), new_n) catch return Error.OutOfMemory;
+    const old_byte_slice: []u8 = @ptrCast(@constCast(mem.absorbSentinel(old_mem)));
+    const byte_count = math.mul(usize, @sizeOf(T), new_n) catch return error.OutOfMemory;
     // Note: can't set shrunk memory to undefined as memory shouldn't be modified on realloc failure
-    if (self.rawRemap(old_byte_slice, .fromByteUnits(Slice.alignment), byte_count, return_address)) |p| {
-        const new_bytes: []align(Slice.alignment) u8 = @alignCast(p[0..byte_count]);
-        return mem.bytesAsSlice(T, new_bytes);
+    if (self.rawRemap(old_byte_slice, .fromByteUnits(slice_info.attrs.@"align" orelse @alignOf(T)), byte_count, return_address)) |p| {
+        return @ptrCast(@alignCast(p[0..byte_count]));
     }
 
-    const new_mem = self.rawAlloc(byte_count, .fromByteUnits(Slice.alignment), return_address) orelse
+    const new_mem = self.rawAlloc(byte_count, .fromByteUnits(slice_info.attrs.@"align" orelse @alignOf(T)), return_address) orelse
         return error.OutOfMemory;
     const copy_len = @min(byte_count, old_byte_slice.len);
     @memcpy(new_mem[0..copy_len], old_byte_slice[0..copy_len]);
     @memset(old_byte_slice, undefined);
-    self.rawFree(old_byte_slice, .fromByteUnits(Slice.alignment), return_address);
+    self.rawFree(old_byte_slice, .fromByteUnits(slice_info.attrs.@"align" orelse @alignOf(T)), return_address);
 
-    const new_bytes: []align(Slice.alignment) u8 = @alignCast(new_mem[0..byte_count]);
-    return mem.bytesAsSlice(T, new_bytes);
+    return @ptrCast(@alignCast(new_mem[0..byte_count]));
 }
 
 /// Free an array allocated with `alloc`.
 /// If memory has length 0, free is a no-op.
 /// To free a single item, see `destroy`.
 pub fn free(self: Allocator, memory: anytype) void {
-    const Slice = @typeInfo(@TypeOf(memory)).pointer;
-    const bytes = mem.sliceAsBytes(memory);
-    const bytes_len = bytes.len + if (Slice.sentinel() != null) @sizeOf(Slice.child) else 0;
-    if (bytes_len == 0) return;
-    const non_const_ptr = @constCast(bytes.ptr);
-    @memset(non_const_ptr[0..bytes_len], undefined);
-    self.rawFree(non_const_ptr[0..bytes_len], .fromByteUnits(Slice.alignment), @returnAddress());
+    const slice_info = @typeInfo(@TypeOf(memory)).pointer;
+    if (slice_info.size != .slice) {
+        comptime assert(slice_info.size == .one and @typeInfo(slice_info.child) == .array);
+    }
+    const bytes: []u8 = @ptrCast(@constCast(mem.absorbSentinel(memory)));
+    if (bytes.len == 0) return;
+    @memset(bytes, undefined);
+    self.rawFree(bytes, .fromByteUnits(slice_info.attrs.@"align" orelse @alignOf(slice_info.child)), @returnAddress());
 }
 
 /// Copies `m` to newly allocated memory. Caller owns the memory.
@@ -438,10 +483,168 @@ pub fn dupe(allocator: Allocator, comptime T: type, m: []const T) Error![]T {
     return new_buf;
 }
 
-/// Copies `m` to newly allocated memory, with a null-terminated element. Caller owns the memory.
-pub fn dupeZ(allocator: Allocator, comptime T: type, m: []const T) Error![:0]T {
+/// Copies `m` to newly allocated memory, with a sentinel-terminated element. Caller owns the memory.
+pub fn dupeSentinel(
+    allocator: Allocator,
+    comptime T: type,
+    m: []const T,
+    comptime sentinel: T,
+) Error![:sentinel]T {
     const new_buf = try allocator.alloc(T, m.len + 1);
     @memcpy(new_buf[0..m.len], m);
-    new_buf[m.len] = 0;
-    return new_buf[0..m.len :0];
+    new_buf[m.len] = sentinel;
+    return new_buf[0..m.len :sentinel];
+}
+
+/// Allocates a formatted string which is returned on success.
+///
+/// Returned slice can be deallocated with `free`. If an arena-style allocator
+/// is used instead, such as `std.heap.ArenaAllocator`, then no call to `free`
+/// is necessary.
+///
+/// See `std.Io.Writer.print`.
+pub fn print(a: Allocator, comptime format: []const u8, args: anytype) Error![]u8 {
+    var aw = try std.Io.Writer.Allocating.initCapacity(a, format.len);
+    defer aw.deinit();
+    aw.writer.print(format, args) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+    };
+    return aw.toOwnedSlice();
+}
+
+test print {
+    const x: i32 = -1;
+    const y: []const u8 = "hi";
+    const a = std.testing.allocator;
+    const s = try print(a, "{d}={s}", .{ x, y });
+    defer free(a, s);
+    try std.testing.expectEqualStrings("-1=hi", s);
+}
+
+/// Like `print` but returned slice has the provided sentinel.
+///
+/// Returned slice can be deallocated with `free`. If an arena-style allocator
+/// is used instead, such as `std.heap.ArenaAllocator`, then no call to `free`
+/// is necessary. Illegal behavior occurs if the returned slice is type-coerced
+/// to a slice without the sentinel and then passed to `free`.
+pub fn printSentinel(
+    a: Allocator,
+    comptime format: []const u8,
+    args: anytype,
+    comptime sentinel: u8,
+) Allocator.Error![:sentinel]u8 {
+    var aw = try std.Io.Writer.Allocating.initCapacity(a, format.len);
+    defer aw.deinit();
+    aw.writer.print(format, args) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+    };
+    return aw.toOwnedSliceSentinel(sentinel);
+}
+
+test printSentinel {
+    const x: i32 = -1;
+    const y: []const u8 = "hi";
+    const a = std.testing.allocator;
+    const s = try printSentinel(a, "{d}={s}", .{ x, y }, 0);
+    defer free(a, s);
+    try std.testing.expectEqualStrings("-1=hi", s);
+    try std.testing.expectEqual(0, s[s.len]);
+}
+
+/// An allocator that always fails to allocate.
+pub const failing: Allocator = .{
+    .ptr = undefined,
+    .vtable = &.{
+        .alloc = noAlloc,
+        .resize = unreachableResize,
+        .remap = unreachableRemap,
+        .free = unreachableFree,
+    },
+};
+
+fn unreachableResize(
+    self: *anyopaque,
+    memory: []u8,
+    alignment: Alignment,
+    new_len: usize,
+    ret_addr: usize,
+) bool {
+    _ = self;
+    _ = memory;
+    _ = alignment;
+    _ = new_len;
+    _ = ret_addr;
+    unreachable;
+}
+
+fn unreachableRemap(
+    self: *anyopaque,
+    memory: []u8,
+    alignment: Alignment,
+    new_len: usize,
+    ret_addr: usize,
+) ?[*]u8 {
+    _ = self;
+    _ = memory;
+    _ = alignment;
+    _ = new_len;
+    _ = ret_addr;
+    unreachable;
+}
+
+fn unreachableFree(
+    self: *anyopaque,
+    memory: []u8,
+    alignment: Alignment,
+    ret_addr: usize,
+) void {
+    _ = self;
+    _ = memory;
+    _ = alignment;
+    _ = ret_addr;
+    unreachable;
+}
+
+test failing {
+    const f: Allocator = .failing;
+    try std.testing.expectError(error.OutOfMemory, f.alloc(u8, 123));
+    // Expect very large allocations to fail at the implementation level and not in the interface
+    try std.testing.expectError(error.OutOfMemory, f.alloc(u8, std.math.maxInt(usize)));
+    try std.testing.expectError(error.OutOfMemory, f.allocSentinel(u8, std.math.maxInt(usize) - 1, 0));
+}
+
+test "free single-pointer to array" {
+    const allocator = std.testing.allocator;
+    {
+        const allocation = try allocator.alloc(u32, 128);
+        allocation[127] = 0;
+        const ptr: *[127:0]u32 = allocation[0..127 :0];
+        allocator.free(ptr);
+    }
+    {
+        const allocation = try allocator.alloc(u32, 128);
+        allocation[127] = 0;
+        const ptr: *[127:0]u32 = allocation[0..127 :0];
+        if (allocator.resize(ptr, 16)) {
+            allocator.free(ptr[0..16]);
+        } else allocator.free(ptr);
+    }
+    {
+        const allocation = try allocator.alloc(u32, 128);
+        allocation[127] = 0;
+        const ptr: *[127:0]u32 = allocation[0..127 :0];
+        if (allocator.remap(ptr, 16)) |new| {
+            allocator.free(new);
+        } else allocator.free(ptr);
+    }
+    {
+        const allocation = try allocator.alloc(u32, 128);
+        allocation[127] = 0;
+        const ptr: *[127:0]u32 = allocation[0..127 :0];
+        if (allocator.realloc(ptr, 16)) |new| {
+            allocator.free(new);
+        } else |_| {
+            allocator.free(allocation);
+        }
+    }
 }

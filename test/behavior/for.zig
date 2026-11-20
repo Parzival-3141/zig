@@ -69,7 +69,11 @@ test "basic for loop" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
-    const expected_result = [_]u8{ 9, 8, 7, 6, 0, 1, 2, 3 } ** 3;
+    const expected_result: [24]u8 = .{
+        9, 8, 7, 6, 0, 1, 2, 3,
+        9, 8, 7, 6, 0, 1, 2, 3,
+        9, 8, 7, 6, 0, 1, 2, 3,
+    };
 
     var buffer: [expected_result.len]u8 = undefined;
     var buf_index: usize = 0;
@@ -387,6 +391,7 @@ test "raw pointer and counter" {
 test "inline for with slice as the comptime-known" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const comptime_slice = "hello";
     var runtime_i: usize = 3;
@@ -448,7 +453,6 @@ test "inline for with counter as the comptime-known" {
 test "inline for on tuple pointer" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const S = struct { u32, u32, u32 };
     var s: S = .{ 100, 200, 300 };
@@ -523,4 +527,38 @@ test "for loop 0 length range" {
         _ = j;
         comptime unreachable;
     }
+}
+
+test "labeled break from else" {
+    const S = struct {
+        fn doTheTest(x: u32) !void {
+            var y: u32 = 0;
+            const ok = label: while (y < x) : (y += 1) {
+                if (y == 10) break :label false;
+            } else {
+                break :label true;
+            };
+            try expect(ok);
+        }
+    };
+
+    try S.doTheTest(5);
+    try comptime S.doTheTest(5);
+}
+
+test "value break from inline for" {
+    const S = struct {
+        fn doTheTest() !void {
+            const x = inline for (0..2) |_| {
+                if (true) {
+                    var idx: u32 = 0;
+                    idx += 1;
+                    break idx;
+                }
+            };
+            try expect(x == 1);
+        }
+    };
+    try S.doTheTest();
+    try comptime S.doTheTest();
 }

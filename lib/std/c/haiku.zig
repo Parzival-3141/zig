@@ -1,14 +1,8 @@
 const std = @import("../std.zig");
-const assert = std.debug.assert;
 const builtin = @import("builtin");
-const maxInt = std.math.maxInt;
-const iovec = std.posix.iovec;
-const iovec_const = std.posix.iovec_const;
-const socklen_t = std.c.socklen_t;
+const assert = std.debug.assert;
 const fd_t = std.c.fd_t;
-const PATH_MAX = std.c.PATH_MAX;
-const uid_t = std.c.uid_t;
-const gid_t = std.c.gid_t;
+const off_t = std.c.off_t;
 const dev_t = std.c.dev_t;
 const ino_t = std.c.ino_t;
 
@@ -16,50 +10,27 @@ comptime {
     assert(builtin.os.tag == .haiku); // Prevent access of std.c symbols on wrong OS.
 }
 
-pub extern "root" fn _errnop() *i32;
-pub extern "root" fn find_directory(which: directory_which, volume: i32, createIt: bool, path_ptr: [*]u8, length: i32) u64;
-pub extern "root" fn find_thread(thread_name: ?*anyopaque) i32;
-pub extern "root" fn get_system_info(system_info: *system_info) usize;
-pub extern "root" fn _get_team_info(team: i32, team_info: *team_info, size: usize) i32;
-pub extern "root" fn _get_next_area_info(team: i32, cookie: *i64, area_info: *area_info, size: usize) i32;
-pub extern "root" fn _get_next_image_info(team: i32, cookie: *i32, image_info: *image_info, size: usize) i32;
-pub extern "root" fn _kern_get_current_team() team_id;
+pub const B_OS_NAME_LENGTH = 32;
+pub const B_ABSOLUTE_TIMEOUT = 0x10;
+pub const B_TIMEOUT_REAL_TIME_BASE = 0x40;
+
+pub extern "root" fn _kern_create_sem(count: c_int, name: ?[*:0]const u8) sem_id;
+pub extern "root" fn _kern_delete_sem(id: sem_id) status_t;
+pub extern "root" fn _kern_acquire_sem_etc(id: sem_id, count: u32, flags: u32, timeout: i64) status_t;
+pub extern "root" fn _kern_release_sem_etc(id: sem_id, count: u32, flags: u32) status_t;
 pub extern "root" fn _kern_open_dir(fd: fd_t, path: [*:0]const u8) fd_t;
 pub extern "root" fn _kern_read_dir(fd: fd_t, buffer: [*]u8, bufferSize: usize, maxCount: u32) isize;
 pub extern "root" fn _kern_rewind_dir(fd: fd_t) status_t;
 pub extern "root" fn _kern_read_stat(fd: fd_t, path: [*:0]const u8, traverseLink: bool, stat: *std.c.Stat, statSize: usize) status_t;
 
-pub const area_info = extern struct {
-    area: u32,
-    name: [32]u8,
-    size: usize,
-    lock: u32,
-    protection: u32,
-    team_id: i32,
-    ram_size: u32,
-    copy_count: u32,
-    in_count: u32,
-    out_count: u32,
-    address: *anyopaque,
-};
+pub extern "root" fn on_exit_thread(callback: *const fn (?*anyopaque) callconv(.c) void, data: ?*anyopaque) status_t;
+pub extern "root" fn find_thread(name: ?[*:0]const u8) thread_id;
+pub extern "root" fn get_system_info(info: *system_info) status_t;
 
-pub const image_info = extern struct {
-    id: u32,
-    image_type: u32,
-    sequence: i32,
-    init_order: i32,
-    init_routine: *anyopaque,
-    term_routine: *anyopaque,
-    device: i32,
-    node: i64,
-    name: [PATH_MAX]u8,
-    text: *anyopaque,
-    data: *anyopaque,
-    text_size: i32,
-    data_size: i32,
-    api_version: i32,
-    abi: i32,
-};
+pub extern "root" fn _errnop() *i32;
+
+pub extern "root" fn readv_pos(fd: fd_t, pos: off_t, vec: [*]const std.c.iovec, count: i32) isize;
+pub extern "root" fn writev_pos(fd: fd_t, pos: off_t, vec: [*]const std.c.iovec_const, count: i32) isize;
 
 pub const system_info = extern struct {
     boot_time: i64,
@@ -83,29 +54,10 @@ pub const system_info = extern struct {
     max_teams: u32,
     used_teams: u32,
     kernel_name: [256]u8,
-    kernel_build_date: [32]u8,
-    kernel_build_time: [32]u8,
+    kernel_build_date: [B_OS_NAME_LENGTH]u8,
+    kernel_build_time: [B_OS_NAME_LENGTH]u8,
     kernel_version: i64,
     abi: u32,
-};
-
-pub const team_info = extern struct {
-    team_id: i32,
-    thread_count: i32,
-    image_count: i32,
-    area_count: i32,
-    debugger_nub_thread: i32,
-    debugger_nub_port: i32,
-    argc: i32,
-    args: [64]u8,
-    uid: uid_t,
-    gid: gid_t,
-};
-
-pub const directory_which = enum(i32) {
-    B_USER_SETTINGS_DIRECTORY = 0xbbe,
-
-    _,
 };
 
 pub const area_id = i32;
@@ -273,269 +225,6 @@ pub const E = enum(i32) {
 
 pub const status_t = i32;
 
-pub const mcontext_t = switch (builtin.cpu.arch) {
-    .arm, .thumb => extern struct {
-        r0: u32,
-        r1: u32,
-        r2: u32,
-        r3: u32,
-        r4: u32,
-        r5: u32,
-        r6: u32,
-        r7: u32,
-        r8: u32,
-        r9: u32,
-        r10: u32,
-        r11: u32,
-        r12: u32,
-        r13: u32,
-        r14: u32,
-        r15: u32,
-        cpsr: u32,
-    },
-    .aarch64 => extern struct {
-        x: [10]u64,
-        lr: u64,
-        sp: u64,
-        elr: u64,
-        spsr: u64,
-        fp_q: [32]u128,
-        fpsr: u32,
-        fpcr: u32,
-    },
-    .m68k => extern struct {
-        pc: u32,
-        d0: u32,
-        d1: u32,
-        d2: u32,
-        d3: u32,
-        d4: u32,
-        d5: u32,
-        d6: u32,
-        d7: u32,
-        a0: u32,
-        a1: u32,
-        a2: u32,
-        a3: u32,
-        a4: u32,
-        a5: u32,
-        a6: u32,
-        a7: u32,
-        ccr: u8,
-        f0: f64,
-        f1: f64,
-        f2: f64,
-        f3: f64,
-        f4: f64,
-        f5: f64,
-        f6: f64,
-        f7: f64,
-        f8: f64,
-        f9: f64,
-        f10: f64,
-        f11: f64,
-        f12: f64,
-        f13: f64,
-    },
-    .mipsel => extern struct {
-        r0: u32,
-    },
-    .powerpc => extern struct {
-        pc: u32,
-        r0: u32,
-        r1: u32,
-        r2: u32,
-        r3: u32,
-        r4: u32,
-        r5: u32,
-        r6: u32,
-        r7: u32,
-        r8: u32,
-        r9: u32,
-        r10: u32,
-        r11: u32,
-        r12: u32,
-        f0: f64,
-        f1: f64,
-        f2: f64,
-        f3: f64,
-        f4: f64,
-        f5: f64,
-        f6: f64,
-        f7: f64,
-        f8: f64,
-        f9: f64,
-        f10: f64,
-        f11: f64,
-        f12: f64,
-        f13: f64,
-        reserved: u32,
-        fpscr: u32,
-        ctr: u32,
-        xer: u32,
-        cr: u32,
-        msr: u32,
-        lr: u32,
-    },
-    .riscv64 => extern struct {
-        x: [31]u64,
-        pc: u64,
-        f: [32]f64,
-        fcsr: u64,
-    },
-    .sparc64 => extern struct {
-        g1: u64,
-        g2: u64,
-        g3: u64,
-        g4: u64,
-        g5: u64,
-        g6: u64,
-        g7: u64,
-        o0: u64,
-        o1: u64,
-        o2: u64,
-        o3: u64,
-        o4: u64,
-        o5: u64,
-        sp: u64,
-        o7: u64,
-        l0: u64,
-        l1: u64,
-        l2: u64,
-        l3: u64,
-        l4: u64,
-        l5: u64,
-        l6: u64,
-        l7: u64,
-        i0: u64,
-        i1: u64,
-        i2: u64,
-        i3: u64,
-        i4: u64,
-        i5: u64,
-        fp: u64,
-        i7: u64,
-    },
-    .x86 => extern struct {
-        pub const old_extended_regs = extern struct {
-            control: u16,
-            reserved1: u16,
-            status: u16,
-            reserved2: u16,
-            tag: u16,
-            reserved3: u16,
-            eip: u32,
-            cs: u16,
-            opcode: u16,
-            datap: u32,
-            ds: u16,
-            reserved4: u16,
-            fp_mmx: [8][10]u8,
-        };
-
-        pub const fp_register = extern struct { value: [10]u8, reserved: [6]u8 };
-
-        pub const xmm_register = extern struct { value: [16]u8 };
-
-        pub const new_extended_regs = extern struct {
-            control: u16,
-            status: u16,
-            tag: u16,
-            opcode: u16,
-            eip: u32,
-            cs: u16,
-            reserved1: u16,
-            datap: u32,
-            ds: u16,
-            reserved2: u16,
-            mxcsr: u32,
-            reserved3: u32,
-            fp_mmx: [8]fp_register,
-            xmmx: [8]xmm_register,
-            reserved4: [224]u8,
-        };
-
-        pub const extended_regs = extern struct {
-            state: extern union {
-                old_format: old_extended_regs,
-                new_format: new_extended_regs,
-            },
-            format: u32,
-        };
-
-        eip: u32,
-        eflags: u32,
-        eax: u32,
-        ecx: u32,
-        edx: u32,
-        esp: u32,
-        ebp: u32,
-        reserved: u32,
-        xregs: extended_regs,
-        edi: u32,
-        esi: u32,
-        ebx: u32,
-    },
-    .x86_64 => extern struct {
-        pub const fp_register = extern struct {
-            value: [10]u8,
-            reserved: [6]u8,
-        };
-
-        pub const xmm_register = extern struct {
-            value: [16]u8,
-        };
-
-        pub const fpu_state = extern struct {
-            control: u16,
-            status: u16,
-            tag: u16,
-            opcode: u16,
-            rip: u64,
-            rdp: u64,
-            mxcsr: u32,
-            mscsr_mask: u32,
-
-            fp_mmx: [8]fp_register,
-            xmm: [16]xmm_register,
-            reserved: [96]u8,
-        };
-
-        pub const xstate_hdr = extern struct {
-            bv: u64,
-            xcomp_bv: u64,
-            reserved: [48]u8,
-        };
-
-        pub const savefpu = extern struct {
-            fxsave: fpu_state,
-            xstate: xstate_hdr,
-            ymm: [16]xmm_register,
-        };
-
-        rax: u64,
-        rbx: u64,
-        rcx: u64,
-        rdx: u64,
-        rdi: u64,
-        rsi: u64,
-        rbp: u64,
-        r8: u64,
-        r9: u64,
-        r10: u64,
-        r11: u64,
-        r12: u64,
-        r13: u64,
-        r14: u64,
-        r15: u64,
-        rsp: u64,
-        rip: u64,
-        rflags: u64,
-        fpu: savefpu,
-    },
-    else => void,
-};
-
 pub const DirEnt = extern struct {
     /// device
     dev: dev_t,
@@ -552,4 +241,59 @@ pub const DirEnt = extern struct {
     pub fn getName(dirent: *const DirEnt) [*:0]const u8 {
         return @ptrCast(&dirent.name);
     }
+};
+
+// https://github.com/haiku/haiku/blob/2aab5f5f14aeb3f34c3a3d9a9064cc3c0d914bea/headers/posix/netinet/in.h#L122
+pub const IP = struct {
+    pub const OPTIONS = 1;
+    pub const HDRINCL = 2;
+    pub const TOS = 3;
+    pub const TTL = 4;
+    pub const RECVOPTS = 5;
+    pub const RECVRETOPTS = 6;
+    pub const RECVDSTADDR = 7;
+    pub const RETOPTS = 8;
+    pub const MULTICAST_IF = 9;
+    pub const MULTICAST_TTL = 10;
+    pub const MULTICAST_LOOP = 11;
+    pub const ADD_MEMBERSHIP = 12;
+    pub const DROP_MEMBERSHIP = 13;
+    pub const BLOCK_SOURCE = 14;
+    pub const UNBLOCK_SOURCE = 15;
+    pub const ADD_SOURCE_MEMBERSHIP = 16;
+    pub const DROP_SOURCE_MEMBERSHIP = 17;
+    pub const DONTFRAG = 38;
+};
+
+// https://github.com/haiku/haiku/blob/2aab5f5f14aeb3f34c3a3d9a9064cc3c0d914bea/headers/posix/netinet/in.h#L150
+pub const IPV6 = struct {
+    pub const MULTICAST_IF = 24;
+    pub const MULTICAST_HOPS = 25;
+    pub const MULTICAST_LOOP = 26;
+    pub const UNICAST_HOPS = 27;
+    pub const JOIN_GROUP = 28;
+    pub const LEAVE_GROUP = 29;
+    pub const V6ONLY = 30;
+    pub const PKTINFO = 31;
+    pub const RECVPKTINFO = 32;
+    pub const HOPLIMIT = 33;
+    pub const RECVHOPLIMIT = 34;
+    pub const HOPOPTS = 35;
+    pub const DSTOPTS = 36;
+    pub const RTHDR = 37;
+};
+
+// https://github.com/haiku/haiku/blob/2aab5f5f14aeb3f34c3a3d9a9064cc3c0d914bea/headers/posix/netinet/ip.h#L36
+pub const IPTOS = struct {
+    pub const RELIABILITY = 0x04;
+    pub const THROUGHPUT = 0x08;
+    pub const LOWDELAY = 0x10;
+};
+
+// https://github.com/haiku/haiku/blob/2ffb9aef511dde272ab57d545a5d8631705a5ec8/headers/posix/netinet/tcp.h#L74
+pub const TCP = struct {
+    pub const NODELAY = 0x01;
+    pub const MAXSEG = 0x02;
+    pub const NOPUSH = 0x04;
+    pub const NOOPT = 0x08;
 };

@@ -1,5 +1,6 @@
-//! Uniform Resource Identifier (URI) parsing roughly adhering to <https://tools.ietf.org/html/rfc3986>.
-//! Does not do perfect grammar and character class checking, but should be robust against URIs in the wild.
+//! Uniform Resource Identifier (URI) parsing roughly adhering to
+//! <https://tools.ietf.org/html/rfc3986>. Does not do perfect grammar and
+//! character class checking, but should be robust against URIs in the wild.
 
 const std = @import("std.zig");
 const testing = std.testing;
@@ -16,31 +17,8 @@ path: Component = Component.empty,
 query: ?Component = null,
 fragment: ?Component = null,
 
-pub const host_name_max = 255;
-
-/// Returned value may point into `buffer` or be the original string.
-///
-/// Suggested buffer length: `host_name_max`.
-///
-/// See also:
-/// * `getHostAlloc`
-pub fn getHost(uri: Uri, buffer: []u8) error{ UriMissingHost, UriHostTooLong }![]const u8 {
-    const component = uri.host orelse return error.UriMissingHost;
-    return component.toRaw(buffer) catch |err| switch (err) {
-        error.NoSpaceLeft => return error.UriHostTooLong,
-    };
-}
-
-/// Returned value may point into `buffer` or be the original string.
-///
-/// See also:
-/// * `getHost`
-pub fn getHostAlloc(uri: Uri, arena: Allocator) error{ UriMissingHost, UriHostTooLong, OutOfMemory }![]const u8 {
-    const component = uri.host orelse return error.UriMissingHost;
-    const result = try component.toRawMaybeAlloc(arena);
-    if (result.len > host_name_max) return error.UriHostTooLong;
-    return result;
-}
+pub const getHost = @compileError("This function has been moved to std.Io.net.HostName.fromUri");
+pub const getHostAlloc = @compileError("This function has been deleted. See std.Io.net.HostName.fromUri instead");
 
 pub const Component = union(enum) {
     /// Invalid characters in this component must be percent encoded
@@ -62,8 +40,8 @@ pub const Component = union(enum) {
     pub fn toRaw(component: Component, buffer: []u8) error{NoSpaceLeft}![]const u8 {
         return switch (component) {
             .raw => |raw| raw,
-            .percent_encoded => |percent_encoded| if (std.mem.indexOfScalar(u8, percent_encoded, '%')) |_|
-                try std.fmt.bufPrint(buffer, "{f}", .{std.fmt.alt(component, .formatRaw)})
+            .percent_encoded => |percent_encoded| if (std.mem.findScalar(u8, percent_encoded, '%')) |_|
+                try std.mem.print(buffer, "{f}", .{std.fmt.alt(component, .formatRaw)})
             else
                 percent_encoded,
         };
@@ -73,8 +51,8 @@ pub const Component = union(enum) {
     pub fn toRawMaybeAlloc(component: Component, arena: Allocator) Allocator.Error![]const u8 {
         return switch (component) {
             .raw => |raw| raw,
-            .percent_encoded => |percent_encoded| if (std.mem.indexOfScalar(u8, percent_encoded, '%')) |_|
-                try std.fmt.allocPrint(arena, "{f}", .{std.fmt.alt(component, .formatRaw)})
+            .percent_encoded => |percent_encoded| if (std.mem.findScalar(u8, percent_encoded, '%')) |_|
+                try arena.print("{f}", .{std.fmt.alt(component, .formatRaw)})
             else
                 percent_encoded,
         };
@@ -86,7 +64,7 @@ pub const Component = union(enum) {
             .percent_encoded => |percent_encoded| {
                 var start: usize = 0;
                 var index: usize = 0;
-                while (std.mem.indexOfScalarPos(u8, percent_encoded, index, '%')) |percent| {
+                while (std.mem.findScalarPos(u8, percent_encoded, index, '%')) |percent| {
                     index = percent + 1;
                     if (percent_encoded.len - index < 2) continue;
                     const percent_encoded_char =
@@ -194,7 +172,7 @@ pub fn percentDecodeInPlace(buffer: []u8) []u8 {
     return percentDecodeBackwards(buffer, buffer);
 }
 
-pub const ParseError = error{ UnexpectedCharacter, InvalidFormat, InvalidPort };
+pub const ParseError = error{ UnexpectedCharacter, InvalidFormat, InvalidPort, InvalidHostName };
 
 /// Parses the URI or returns an error. This function is not compliant, but is required to parse
 /// some forms of URIs in the wild, such as HTTP Location headers.
@@ -205,7 +183,7 @@ pub fn parseAfterScheme(scheme: []const u8, text: []const u8) ParseError!Uri {
     var i: usize = 0;
 
     if (std.mem.startsWith(u8, text, "//")) a: {
-        i = std.mem.indexOfAnyPos(u8, text, 2, &authority_sep) orelse text.len;
+        i = std.mem.findAnyPos(u8, text, 2, &authority_sep) orelse text.len;
         const authority = text[2..i];
         if (authority.len == 0) {
             if (!std.mem.startsWith(u8, text[2..], "/")) return error.InvalidFormat;
@@ -213,11 +191,15 @@ pub fn parseAfterScheme(scheme: []const u8, text: []const u8) ParseError!Uri {
         }
 
         var start_of_host: usize = 0;
-        if (std.mem.indexOf(u8, authority, "@")) |index| {
+        // Use findLast to handle unencoded @ in userinfo gracefully,
+        // e.g. scheme://user:p@ssword@hostname. This deviates from RFC3986
+        // (which requires @ to be percent-encoded as %40 in userinfo) but
+        // is more robust against URIs in the wild.
+        if (std.mem.findLast(u8, authority, "@")) |index| {
             start_of_host = index + 1;
             const user_info = authority[0..index];
 
-            if (std.mem.indexOf(u8, user_info, ":")) |idx| {
+            if (std.mem.find(u8, user_info, ":")) |idx| {
                 uri.user = .{ .percent_encoded = user_info[0..idx] };
                 if (idx < user_info.len - 1) { // empty password is also "no password"
                     uri.password = .{ .percent_encoded = user_info[idx + 1 ..] };
@@ -239,16 +221,16 @@ pub fn parseAfterScheme(scheme: []const u8, text: []const u8) ParseError!Uri {
         }
 
         if (authority.len > start_of_host and authority[start_of_host] == '[') { // IPv6
-            end_of_host = std.mem.lastIndexOf(u8, authority, "]") orelse return error.InvalidFormat;
+            end_of_host = std.mem.findLast(u8, authority, "]") orelse return error.InvalidFormat;
             end_of_host += 1;
 
-            if (std.mem.lastIndexOf(u8, authority, ":")) |index| {
+            if (std.mem.findLast(u8, authority, ":")) |index| {
                 if (index >= end_of_host) { // if not part of the V6 address field
                     end_of_host = @min(end_of_host, index);
                     uri.port = std.fmt.parseInt(u16, authority[index + 1 ..], 10) catch return error.InvalidPort;
                 }
             }
-        } else if (std.mem.lastIndexOf(u8, authority, ":")) |index| {
+        } else if (std.mem.findLast(u8, authority, ":")) |index| {
             if (index >= start_of_host) { // if not part of the userinfo field
                 end_of_host = @min(end_of_host, index);
                 uri.port = std.fmt.parseInt(u16, authority[index + 1 ..], 10) catch return error.InvalidPort;
@@ -256,16 +238,18 @@ pub fn parseAfterScheme(scheme: []const u8, text: []const u8) ParseError!Uri {
         }
 
         if (start_of_host >= end_of_host) return error.InvalidFormat;
-        uri.host = .{ .percent_encoded = authority[start_of_host..end_of_host] };
+        const host = authority[start_of_host..end_of_host];
+        if (host.len > std.Io.net.HostName.max_len) return error.InvalidHostName;
+        uri.host = .{ .percent_encoded = host };
     }
 
     const path_start = i;
-    i = std.mem.indexOfAnyPos(u8, text, path_start, &path_sep) orelse text.len;
+    i = std.mem.findAnyPos(u8, text, path_start, &path_sep) orelse text.len;
     uri.path = .{ .percent_encoded = text[path_start..i] };
 
     if (std.mem.startsWith(u8, text[i..], "?")) {
         const query_start = i + 1;
-        i = std.mem.indexOfScalarPos(u8, text, query_start, '#') orelse text.len;
+        i = std.mem.findScalarPos(u8, text, query_start, '#') orelse text.len;
         uri.query = .{ .percent_encoded = text[query_start..i] };
     }
 
@@ -359,20 +343,18 @@ pub const Format = struct {
     }
 };
 
-pub fn fmt(uri: *const Uri, flags: Format.Flags) std.fmt.Formatter(Format, Format.default) {
+pub fn fmt(uri: *const Uri, flags: Format.Flags) std.fmt.Alt(Format, Format.default) {
     return .{ .data = .{ .uri = uri, .flags = flags } };
 }
 
 /// The return value will contain strings pointing into the original `text`.
 /// Each component that is provided will be non-`null`.
 pub fn parse(text: []const u8) ParseError!Uri {
-    const end = for (text, 0..) |byte, i| {
-        if (!isSchemeChar(byte)) break i;
-    } else text.len;
-    // After the scheme, a ':' must appear.
-    if (end >= text.len) return error.InvalidFormat;
-    if (text[end] != ':') return error.UnexpectedCharacter;
-    return parseAfterScheme(text[0..end], text[end + 1 ..]);
+    const scheme, const rest = std.mem.cutScalar(u8, text, ':') orelse
+        return error.InvalidFormat;
+    if (!isValidScheme(scheme))
+        return error.UnexpectedCharacter;
+    return parseAfterScheme(scheme, rest);
 }
 
 pub const ResolveInPlaceError = ParseError || error{NoSpaceLeft};
@@ -493,7 +475,7 @@ fn merge_paths(base: Component, new: []u8, aux_buf: *[]u8) error{NoSpaceLeft}!Co
     var aux: Writer = .fixed(aux_buf.*);
     if (!base.isEmpty()) {
         base.formatPath(&aux) catch return error.NoSpaceLeft;
-        aux.end = std.mem.lastIndexOfScalar(u8, aux.buffered(), '/') orelse return remove_dot_segments(new);
+        aux.end = std.mem.findScalarLast(u8, aux.buffered(), '/') orelse return remove_dot_segments(new);
     }
     aux.print("/{s}", .{new}) catch return error.NoSpaceLeft;
     const merged_path = remove_dot_segments(aux.buffered());
@@ -502,11 +484,16 @@ fn merge_paths(base: Component, new: []u8, aux_buf: *[]u8) error{NoSpaceLeft}!Co
 }
 
 /// scheme      = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
-fn isSchemeChar(c: u8) bool {
-    return switch (c) {
-        'A'...'Z', 'a'...'z', '0'...'9', '+', '-', '.' => true,
-        else => false,
-    };
+fn isValidScheme(scheme: []const u8) bool {
+    if (scheme.len == 0) return false;
+    if (!std.ascii.isAlphabetic(scheme[0])) return false;
+    for (scheme[1..]) |byte| {
+        switch (byte) {
+            'A'...'Z', 'a'...'z', '0'...'9', '+', '-', '.' => continue,
+            else => return false,
+        }
+    }
+    return true;
 }
 
 /// sub-delims  = "!" / "$" / "&" / "'" / "(" / ")"
@@ -571,6 +558,11 @@ test "should fail gracefully" {
     try std.testing.expectError(error.InvalidFormat, parse("foobar://"));
 }
 
+test "parse name too long" {
+    const uri = "http://" ++ @as([std.Io.net.HostName.max_len + 1]u8, @splat('Z'));
+    try std.testing.expectError(error.InvalidHostName, parse(uri));
+}
+
 test "file" {
     const parsed = try parse("file:///");
     try std.testing.expectEqualStrings("file", parsed.scheme);
@@ -586,6 +578,11 @@ test "file" {
     try std.testing.expectEqualStrings("file", parsed3.scheme);
     try std.testing.expectEqualStrings("localhost", parsed3.host.?.percent_encoded);
     try std.testing.expectEqualStrings("/an/absolute/path/to/another/thing/", parsed3.path.percent_encoded);
+
+    const parsed4 = try parse("file:/an/absolute/path");
+    try std.testing.expectEqualStrings("file", parsed4.scheme);
+    try std.testing.expectEqual(@as(?Component, null), parsed4.host);
+    try std.testing.expectEqualStrings("/an/absolute/path", parsed4.path.percent_encoded);
 }
 
 test "scheme" {
@@ -595,6 +592,13 @@ test "scheme" {
     try std.testing.expectEqualStrings("ab+", (try parse("ab+:_")).scheme);
     try std.testing.expectEqualStrings("X+++", (try parse("X+++:_")).scheme);
     try std.testing.expectEqualStrings("Y+-.", (try parse("Y+-.:_")).scheme);
+
+    try std.testing.expectError(error.InvalidFormat, parse(""));
+    try std.testing.expectError(error.UnexpectedCharacter, parse(":"));
+    try std.testing.expectError(error.UnexpectedCharacter, parse("-:"));
+    try std.testing.expectError(error.UnexpectedCharacter, parse("+hTTp:"));
+    try std.testing.expectError(error.UnexpectedCharacter, parse("$:"));
+    try std.testing.expectError(error.UnexpectedCharacter, parse("h$:"));
 }
 
 test "authority" {
@@ -621,6 +625,23 @@ test "authority" {
     try std.testing.expectEqual(@as(u16, 1234), (try parse("scheme://user:password@hostname:1234")).port.?);
     try std.testing.expectEqualStrings("user", (try parse("scheme://user:password@hostname:1234")).user.?.percent_encoded);
     try std.testing.expectEqualStrings("password", (try parse("scheme://user:password@hostname:1234")).password.?.percent_encoded);
+
+    try std.testing.expectEqualStrings("user", (try parse("scheme://user:p@ssword@hostname:1234")).user.?.percent_encoded);
+    try std.testing.expectEqualStrings("p@ssword", (try parse("scheme://user:p@ssword@hostname:1234")).password.?.percent_encoded);
+    try std.testing.expectEqualStrings("hostname", (try parse("scheme://user:p@ssword@hostname:1234")).host.?.percent_encoded);
+
+    try std.testing.expectEqualStrings("user", (try parse("scheme://user:p@@@word@hostname:1234")).user.?.percent_encoded);
+    try std.testing.expectEqualStrings("p@@@word", (try parse("scheme://user:p@@@word@hostname:1234")).password.?.percent_encoded);
+    try std.testing.expectEqualStrings("hostname", (try parse("scheme://user:p@@@word@hostname:1234")).host.?.percent_encoded);
+
+    try std.testing.expectEqualStrings("user@name", (try parse("scheme://user@name@hostname")).user.?.percent_encoded);
+    try std.testing.expectEqual(@as(?Component, null), (try parse("scheme://user@name@hostname")).password);
+    try std.testing.expectEqualStrings("hostname", (try parse("scheme://user@name@hostname")).host.?.percent_encoded);
+
+    try std.testing.expectEqualStrings("user@name", (try parse("scheme://user@name@hostname:1234")).user.?.percent_encoded);
+    try std.testing.expectEqual(@as(?Component, null), (try parse("scheme://user@name@hostname:1234")).password);
+    try std.testing.expectEqualStrings("hostname", (try parse("scheme://user@name@hostname:1234")).host.?.percent_encoded);
+    try std.testing.expectEqual(@as(u16, 1234), (try parse("scheme://user@name@hostname:1234")).port.?);
 }
 
 test "authority.password" {

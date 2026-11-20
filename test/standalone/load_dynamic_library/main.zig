@@ -1,19 +1,18 @@
 const std = @import("std");
 
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const args = try std.process.argsAlloc(gpa.allocator());
-    defer std.process.argsFree(gpa.allocator(), args);
+pub fn main(init: std.process.Init) !void {
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     const dynlib_name = args[1];
 
     var lib = try std.DynLib.open(dynlib_name);
     defer lib.close();
 
-    const Add = *const fn (i32, i32) callconv(.c) i32;
-    const addFn = lib.lookup(Add, "add") orelse return error.SymbolNotFound;
+    const AddInts = *const fn (i32, i32) callconv(.c) i32;
+    const addInts = lib.lookup(AddInts, "addInts").?;
+    std.debug.assert(addInts(12, 34) == 46);
 
-    const result = addFn(12, 34);
-    std.debug.assert(result == 46);
+    const FortyTwo = *const fn () callconv(.c) i32;
+    const fortyTwo = lib.lookup(FortyTwo, "fortyTwo").?;
+    std.debug.assert(fortyTwo() == 42);
 }

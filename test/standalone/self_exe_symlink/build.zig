@@ -6,12 +6,11 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Test it");
     b.default_step = test_step;
 
-    const optimize: std.builtin.OptimizeMode = .Debug;
+    const optimize: std.builtin.Optimize = .debug;
     const target = b.graph.host;
 
-    // The test requires getFdPath in order to to get the path of the
-    // File returned by openSelfExe
-    if (!std.os.isGetFdPathSupportedOnTarget(target.result.os)) return;
+    if (target.result.os.tag == .netbsd) return; // F_GETPATH not reliable
+    if (target.result.os.tag == .openbsd) return; // F_GETPATH not supported
 
     const main = b.addExecutable(.{
         .name = "main",

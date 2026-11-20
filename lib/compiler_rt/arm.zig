@@ -4,46 +4,58 @@ const std = @import("std");
 const builtin = @import("builtin");
 const target = builtin.target;
 const arch = builtin.cpu.arch;
-const common = @import("common.zig");
-
-pub const panic = common.panic;
+const compiler_rt = @import("../compiler_rt.zig");
+const symbol = compiler_rt.symbol;
 
 comptime {
     if (!builtin.is_test) {
         if (arch.isArm()) {
-            @export(&__aeabi_unwind_cpp_pr0, .{ .name = "__aeabi_unwind_cpp_pr0", .linkage = common.linkage, .visibility = common.visibility });
-            @export(&__aeabi_unwind_cpp_pr1, .{ .name = "__aeabi_unwind_cpp_pr1", .linkage = common.linkage, .visibility = common.visibility });
-            @export(&__aeabi_unwind_cpp_pr2, .{ .name = "__aeabi_unwind_cpp_pr2", .linkage = common.linkage, .visibility = common.visibility });
+            symbol(&__aeabi_unwind_cpp_pr0, "__aeabi_unwind_cpp_pr0");
+            symbol(&__aeabi_unwind_cpp_pr1, "__aeabi_unwind_cpp_pr1");
+            symbol(&__aeabi_unwind_cpp_pr2, "__aeabi_unwind_cpp_pr2");
 
-            @export(&__aeabi_ldivmod, .{ .name = if (common.want_windows_arm_abi) "__rt_sdiv64" else "__aeabi_ldivmod", .linkage = common.linkage, .visibility = common.visibility });
-            @export(&__aeabi_uldivmod, .{ .name = if (common.want_windows_arm_abi) "__rt_udiv64" else "__aeabi_uldivmod", .linkage = common.linkage, .visibility = common.visibility });
+            if (compiler_rt.want_windows_arm_abi) {
+                symbol(&__aeabi_ldivmod, "__rt_sdiv64");
+                symbol(&__aeabi_uldivmod, "__rt_udiv64");
+                symbol(&__aeabi_idivmod, "__rt_sdiv");
+                symbol(&__aeabi_uidivmod, "__rt_udiv");
+            }
+            symbol(&__aeabi_ldivmod, "__aeabi_ldivmod");
+            symbol(&__aeabi_uldivmod, "__aeabi_uldivmod");
+            symbol(&__aeabi_idivmod, "__aeabi_idivmod");
+            symbol(&__aeabi_uidivmod, "__aeabi_uidivmod");
 
-            @export(&__aeabi_idivmod, .{ .name = if (common.want_windows_arm_abi) "__rt_sdiv" else "__aeabi_idivmod", .linkage = common.linkage, .visibility = common.visibility });
-            @export(&__aeabi_uidivmod, .{ .name = if (common.want_windows_arm_abi) "__rt_udiv" else "__aeabi_uidivmod", .linkage = common.linkage, .visibility = common.visibility });
+            symbol(&__aeabi_memcpy, "__aeabi_memcpy");
+            symbol(&__aeabi_memcpy4, "__aeabi_memcpy4");
+            symbol(&__aeabi_memcpy8, "__aeabi_memcpy8");
 
-            @export(&__aeabi_memcpy, .{ .name = "__aeabi_memcpy", .linkage = common.linkage, .visibility = common.visibility });
-            @export(&__aeabi_memcpy4, .{ .name = "__aeabi_memcpy4", .linkage = common.linkage, .visibility = common.visibility });
-            @export(&__aeabi_memcpy8, .{ .name = "__aeabi_memcpy8", .linkage = common.linkage, .visibility = common.visibility });
+            symbol(&__aeabi_memmove, "__aeabi_memmove");
+            symbol(&__aeabi_memmove4, "__aeabi_memmove4");
+            symbol(&__aeabi_memmove8, "__aeabi_memmove8");
 
-            @export(&__aeabi_memmove, .{ .name = "__aeabi_memmove", .linkage = common.linkage, .visibility = common.visibility });
-            @export(&__aeabi_memmove4, .{ .name = "__aeabi_memmove4", .linkage = common.linkage, .visibility = common.visibility });
-            @export(&__aeabi_memmove8, .{ .name = "__aeabi_memmove8", .linkage = common.linkage, .visibility = common.visibility });
+            symbol(&__aeabi_memset, "__aeabi_memset");
+            symbol(&__aeabi_memset4, "__aeabi_memset4");
+            symbol(&__aeabi_memset8, "__aeabi_memset8");
 
-            @export(&__aeabi_memset, .{ .name = "__aeabi_memset", .linkage = common.linkage, .visibility = common.visibility });
-            @export(&__aeabi_memset4, .{ .name = "__aeabi_memset4", .linkage = common.linkage, .visibility = common.visibility });
-            @export(&__aeabi_memset8, .{ .name = "__aeabi_memset8", .linkage = common.linkage, .visibility = common.visibility });
-
-            @export(&__aeabi_memclr, .{ .name = "__aeabi_memclr", .linkage = common.linkage, .visibility = common.visibility });
-            @export(&__aeabi_memclr4, .{ .name = "__aeabi_memclr4", .linkage = common.linkage, .visibility = common.visibility });
-            @export(&__aeabi_memclr8, .{ .name = "__aeabi_memclr8", .linkage = common.linkage, .visibility = common.visibility });
+            symbol(&__aeabi_memclr, "__aeabi_memclr");
+            symbol(&__aeabi_memclr4, "__aeabi_memclr4");
+            symbol(&__aeabi_memclr8, "__aeabi_memclr8");
 
             if (builtin.os.tag == .linux or builtin.os.tag == .freebsd) {
-                @export(&__aeabi_read_tp, .{ .name = "__aeabi_read_tp", .linkage = common.linkage, .visibility = common.visibility });
+                symbol(&__aeabi_read_tp, "__aeabi_read_tp");
+            }
+
+            if (builtin.target.cpu.has(.arm, .has_v4t)) {
+                symbol(&__gnu_thumb1_case_sqi, "__gnu_thumb1_case_sqi");
+                symbol(&__gnu_thumb1_case_uqi, "__gnu_thumb1_case_uqi");
+                symbol(&__gnu_thumb1_case_shi, "__gnu_thumb1_case_shi");
+                symbol(&__gnu_thumb1_case_uhi, "__gnu_thumb1_case_uhi");
+                symbol(&__gnu_thumb1_case_si, "__gnu_thumb1_case_si");
             }
 
             // floating-point helper functions (single+double-precision reverse subtraction, y – x), see subdf3.zig
-            @export(&__aeabi_frsub, .{ .name = "__aeabi_frsub", .linkage = common.linkage, .visibility = common.visibility });
-            @export(&__aeabi_drsub, .{ .name = "__aeabi_drsub", .linkage = common.linkage, .visibility = common.visibility });
+            symbol(&__aeabi_frsub, "__aeabi_frsub");
+            symbol(&__aeabi_drsub, "__aeabi_drsub");
         }
     }
 }
@@ -53,9 +65,9 @@ const __udivmodsi4 = @import("int.zig").__udivmodsi4;
 const __divmoddi4 = @import("int.zig").__divmoddi4;
 const __udivmoddi4 = @import("int.zig").__udivmoddi4;
 
-extern fn memset(dest: ?[*]u8, c: i32, n: usize) ?[*]u8;
-extern fn memcpy(noalias dest: ?[*]u8, noalias src: ?[*]const u8, n: usize) ?[*]u8;
-extern fn memmove(dest: ?[*]u8, src: ?[*]const u8, n: usize) ?[*]u8;
+extern fn memset(dest: ?*anyopaque, c: i32, n: usize) ?*anyopaque;
+extern fn memcpy(noalias dest: ?*anyopaque, noalias src: ?*const anyopaque, n: usize) ?*anyopaque;
+extern fn memmove(dest: ?*anyopaque, src: ?*const anyopaque, n: usize) ?*anyopaque;
 
 pub fn __aeabi_memcpy(dest: [*]u8, src: [*]u8, n: usize) callconv(.{ .arm_aapcs = .{} }) void {
     @setRuntimeSafety(false);
@@ -199,6 +211,83 @@ pub fn __aeabi_ldivmod() callconv(.naked) void {
         : [__divmoddi4] "X" (&__divmoddi4),
         : .{ .memory = true });
     unreachable;
+}
+
+// GCC Thumb1 compressed switch tables: <https://gcc.gnu.org/legacy-ml/gcc-patches/2009-06/msg01698.html>
+
+pub fn __gnu_thumb1_case_sqi() callconv(.naked) noreturn {
+    asm volatile (
+        \\ push {r1}
+        \\ mov r1, lr
+        \\ lsrs r1, r1, #1
+        \\ lsls r1, r1, #1
+        \\ ldrsb r1, [r1, r0]
+        \\ lsls r1, r1, #1
+        \\ add lr, lr, r1
+        \\ pop {r1}
+        \\ bx lr
+    );
+}
+
+pub fn __gnu_thumb1_case_uqi() callconv(.naked) noreturn {
+    asm volatile (
+        \\ push {r1}
+        \\ mov r1, lr
+        \\ lsrs r1, r1, #1
+        \\ lsls r1, r1, #1
+        \\ ldrb r1, [r1, r0]
+        \\ lsls r1, r1, #1
+        \\ add lr, lr, r1
+        \\ pop {r1}
+        \\ bx lr
+    );
+}
+
+pub fn __gnu_thumb1_case_shi() callconv(.naked) noreturn {
+    asm volatile (
+        \\ push {r0, r1}
+        \\ mov r1, lr
+        \\ lsrs r1, r1, #1
+        \\ lsls r0, r0, #1
+        \\ lsls r1, r1, #1
+        \\ ldrsh r1, [r1, r0]
+        \\ lsls r1, r1, #1
+        \\ add lr, lr, r1
+        \\ pop {r0, r1}
+        \\ bx lr
+    );
+}
+
+pub fn __gnu_thumb1_case_uhi() callconv(.naked) noreturn {
+    asm volatile (
+        \\ push {r0, r1}
+        \\ mov r1, lr
+        \\ lsrs r1, r1, #1
+        \\ lsls r0, r0, #1
+        \\ lsls r1, r1, #1
+        \\ ldrh r1, [r1, r0]
+        \\ lsls r1, r1, #1
+        \\ add lr, lr, r1
+        \\ pop {r0, r1}
+        \\ bx lr
+    );
+}
+
+pub fn __gnu_thumb1_case_si() callconv(.naked) noreturn {
+    asm volatile (
+        \\ push {r0, r1}
+        \\ mov r1, lr
+        \\ adds r1, r1, #2
+        \\ lsrs r1, r1, #2
+        \\ lsls r0, r0, #2
+        \\ lsls r1, r1, #2
+        \\ ldr r0, [r1, r0]
+        \\ adds r0, r0, r1
+        \\ adds r0, r0, #1
+        \\ mov lr, r0
+        \\ pop {r0, r1}
+        \\ bx lr
+    );
 }
 
 // Float Arithmetic

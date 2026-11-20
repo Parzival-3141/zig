@@ -149,7 +149,6 @@ test "nested optional field in struct" {
 }
 
 test "equality compare optionals and non-optionals" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
@@ -209,7 +208,6 @@ test "equality compare optionals and non-optionals" {
 }
 
 test "compare optionals with modified payloads" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
     var lhs: ?bool = false;
@@ -321,7 +319,6 @@ test "assigning to an unwrapped optional field in an inline loop" {
 test "coerce an anon struct literal to optional struct" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const S = struct {
         const Struct = struct {
@@ -340,7 +337,6 @@ test "coerce an anon struct literal to optional struct" {
 test "0-bit child type coerced to optional return ptr result location" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-
     const S = struct {
         fn doTheTest() !void {
             var y = Foo{};
@@ -366,7 +362,6 @@ test "0-bit child type coerced to optional" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
-
     const S = struct {
         fn doTheTest() !void {
             var it: Foo = .{
@@ -392,7 +387,6 @@ test "0-bit child type coerced to optional" {
 test "array of optional unaligned types" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const Enum = enum { one, two, three };
 
@@ -481,6 +475,7 @@ const NoReturn = struct {
 };
 
 test "optional of noreturn used with if" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     NoReturn.a = 64;
@@ -492,6 +487,7 @@ test "optional of noreturn used with if" {
 }
 
 test "optional of noreturn used with orelse" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     NoReturn.a = 64;
@@ -524,7 +520,6 @@ test "alignment of wrapping an optional payload" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
     const S = struct {
@@ -623,7 +618,7 @@ test "copied optional doesn't alias source" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
-    var opt_x: ?[3]f32 = [_]f32{0.0} ** 3;
+    var opt_x: ?[3]f32 = @splat(0.0);
 
     const x = opt_x.?;
     opt_x.?[0] = 15.0;
@@ -665,4 +660,15 @@ test "global comptime only optional" {
         assert(S.null == null);
         assert(S.void.?.* == void);
     }
+}
+
+test "optional ptr payload alignment" {
+    const S = struct {
+        fn doTheTest(p: *align(1) ?u32) !void {
+            comptime assert(@TypeOf(&p.*.?) == *align(1) u32);
+            try expect(p.*.? == 10);
+        }
+    };
+    var x: ?u32 = 10;
+    try S.doTheTest(&x);
 }

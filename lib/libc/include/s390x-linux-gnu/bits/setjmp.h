@@ -1,4 +1,4 @@
-/* Copyright (C) 2000-2025 Free Software Foundation, Inc.
+/* Copyright (C) 2000-2026 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -33,13 +33,7 @@ typedef struct __s390_jmp_buf
   /* We save registers 6-15.  */
   long int __gregs[10];
 
-# if __WORDSIZE == 64
-  /* We save fpu registers f8 - f15.  */
   long __fpregs[8];
-# else
-  /* We save fpu registers 4 and 6.  */
-  long __fpregs[4];
-# endif
 } __jmp_buf[1];
 
 #endif

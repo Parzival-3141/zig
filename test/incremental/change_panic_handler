@@ -1,7 +1,8 @@
-#target=x86_64-linux-cbe
-#target=x86_64-windows-cbe
-#update=initial version
-#file=main.zig
+#exe {
+-Mroot=main.zig
+#}
+
+#write main.zig {
 pub fn main() !u8 {
     var a: u8 = undefined;
     a = 255;
@@ -10,15 +11,19 @@ pub fn main() !u8 {
 }
 pub const panic = std.debug.FullPanic(myPanic);
 fn myPanic(msg: []const u8, _: ?usize) noreturn {
-    var stdout_writer = std.fs.File.stdout().writerStreaming(&.{});
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
     stdout_writer.interface.print("panic message: {s}\n", .{msg}) catch {};
     std.process.exit(0);
 }
 const std = @import("std");
-#expect_stdout="panic message: integer overflow\n"
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update
+#check stdout {
+panic message: integer overflow
+#}
 
-#update=change the panic handler body
-#file=main.zig
+#write main.zig {
 pub fn main() !u8 {
     var a: u8 = undefined;
     a = 255;
@@ -27,15 +32,20 @@ pub fn main() !u8 {
 }
 pub const panic = std.debug.FullPanic(myPanic);
 fn myPanic(msg: []const u8, _: ?usize) noreturn {
-    var stdout_writer = std.fs.File.stdout().writerStreaming(&.{});
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
     stdout_writer.interface.print("new panic message: {s}\n", .{msg}) catch {};
     std.process.exit(0);
 }
 const std = @import("std");
-#expect_stdout="new panic message: integer overflow\n"
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+change the panic handler body#}
+#check stdout {
+new panic message: integer overflow
+#}
 
-#update=change the panic handler function value
-#file=main.zig
+#write main.zig {
 pub fn main() !u8 {
     var a: u8 = undefined;
     a = 255;
@@ -44,9 +54,15 @@ pub fn main() !u8 {
 }
 pub const panic = std.debug.FullPanic(myPanicNew);
 fn myPanicNew(msg: []const u8, _: ?usize) noreturn {
-    var stdout_writer = std.fs.File.stdout().writerStreaming(&.{});
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
     stdout_writer.interface.print("third panic message: {s}\n", .{msg}) catch {};
     std.process.exit(0);
 }
 const std = @import("std");
-#expect_stdout="third panic message: integer overflow\n"
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+change the panic handler function value#}
+#check stdout {
+third panic message: integer overflow
+#}

@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Test it");
     b.default_step = test_step;
 
-    const optimize: std.builtin.OptimizeMode = .Debug;
+    const optimize: std.builtin.Optimize = .debug;
     const target = b.graph.host;
 
     if (builtin.os.tag != .windows) return;
@@ -30,6 +30,7 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(main);
     run.addArtifactArg(hello);
+    run.addDirectoryArg(b.tmpPath());
     run.expectExitCode(0);
     run.skip_foreign_checks = true;
 

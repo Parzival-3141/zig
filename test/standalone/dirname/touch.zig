@@ -7,33 +7,26 @@
 //! Path must be absolute.
 
 const std = @import("std");
+const Io = std.Io;
 
-pub fn main() !void {
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    const arena = arena_state.allocator();
-    defer arena_state.deinit();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
 
-    try run(arena);
-}
-
-fn run(allocator: std.mem.Allocator) !void {
-    var args = try std.process.argsWithAllocator(allocator);
+    var args = try init.minimal.args.iterateAllocator(init.gpa);
     defer args.deinit();
-    _ = args.next() orelse unreachable; // skip binary name
+    _ = args.next().?; // skip binary name
 
     const path = args.next() orelse {
         std.log.err("missing <path> argument", .{});
         return error.BadUsage;
     };
 
-    const dir_path = std.fs.path.dirname(path) orelse unreachable;
-    const basename = std.fs.path.basename(path);
+    const dir_path = Io.Dir.path.dirname(path).?;
+    const basename = Io.Dir.path.basename(path);
 
-    var dir = try std.fs.cwd().openDir(dir_path, .{});
-    defer dir.close();
+    var dir = try Io.Dir.cwd().openDir(io, dir_path, .{});
+    defer dir.close(io);
 
-    _ = dir.statFile(basename) catch {
-        var file = try dir.createFile(basename, .{});
-        file.close();
-    };
+    var file = try dir.createFile(io, basename, .{ .truncate = false });
+    file.close(io);
 }

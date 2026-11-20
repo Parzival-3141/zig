@@ -175,7 +175,7 @@ test "generic fn keeps non-generic parameter types" {
 
     const S = struct {
         fn f(comptime T: type, s: []T) !void {
-            try expect(A != @typeInfo(@TypeOf(s)).pointer.alignment);
+            try expect(A != @typeInfo(@TypeOf(s)).pointer.attrs.@"align");
         }
     };
 
@@ -255,23 +255,18 @@ test "generic function instantiation turns into comptime call" {
         }
 
         pub fn fieldInfo(comptime T: type, comptime field: FieldEnum(T)) switch (@typeInfo(T)) {
-            .@"enum" => std.builtin.Type.EnumField,
+            .@"enum" => struct { name: [:0]const u8, value: comptime_int },
             else => void,
         } {
-            return @typeInfo(T).@"enum".fields[@intFromEnum(field)];
+            return .{
+                .name = @typeInfo(T).@"enum".field_names[@backingInt(field)],
+                .value = @typeInfo(T).@"enum".field_values[@backingInt(field)],
+            };
         }
 
         pub fn FieldEnum(comptime T: type) type {
             _ = T;
-            var enumFields: [1]std.builtin.Type.EnumField = .{.{ .name = "A", .value = 0 }};
-            return @Type(.{
-                .@"enum" = .{
-                    .tag_type = u0,
-                    .fields = &enumFields,
-                    .decls = &.{},
-                    .is_exhaustive = true,
-                },
-            });
+            return @Enum(u0, .exhaustive, &.{"A"}, &.{0});
         }
     };
     try S.doTheTest();
@@ -313,8 +308,6 @@ test "generic function instantiation non-duplicates" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
-    if (builtin.os.tag == .wasi) return error.SkipZigTest;
-
     const S = struct {
         fn copy(comptime T: type, dest: []T, source: []const T) void {
             @export(&foo, .{ .name = "test_generic_instantiation_non_dupe" });
@@ -331,8 +324,6 @@ test "generic function instantiation non-duplicates" {
 test "generic instantiation of tagged union with only one field" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
 
-    if (builtin.os.tag == .wasi) return error.SkipZigTest;
-
     const S = struct {
         const U = union(enum) {
             s: []const u8,
@@ -347,7 +338,7 @@ test "generic instantiation of tagged union with only one field" {
     try expect(S.foo(.{ .s = "ab" }) == 2);
 }
 
-test "nested generic function" {
+test "generic parameter type is function type" {
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const S = struct {
@@ -357,10 +348,7 @@ test "nested generic function" {
         fn bar(a: u32) anyerror!void {
             try expect(a == 123);
         }
-
-        fn g(_: *const fn (anytype) void) void {}
     };
-    try expect(@typeInfo(@TypeOf(S.g)).@"fn".is_generic);
     try S.foo(u32, S.bar, 123);
 }
 
@@ -498,8 +486,6 @@ test "union in struct captures argument" {
 
 test "function argument tuple used as struct field" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
-
     const S = struct {
         fn DeleagateWithContext(comptime Function: type) type {
             const ArgArgs = std.meta.ArgsTuple(Function);
@@ -530,6 +516,7 @@ test "comptime callconv(.c) function ptr uses comptime type argument" {
 }
 
 test "call generic function with from function called by the generic function" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -573,7 +560,6 @@ fn StructCapture(comptime T: type) type {
 
 test "call generic function that uses capture from function declaration's scope" {
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const S = StructCapture(f64);
     const s = S.foo(123);

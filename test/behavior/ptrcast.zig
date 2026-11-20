@@ -6,6 +6,7 @@ const native_endian = builtin.target.cpu.arch.endian();
 
 test "reinterpret bytes as integer with nonzero offset" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     try testReinterpretBytesAsInteger();
     try comptime testReinterpretBytesAsInteger();
@@ -23,7 +24,6 @@ fn testReinterpretBytesAsInteger() !void {
 test "reinterpret an array over multiple elements, with no well-defined layout" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     try testReinterpretWithOffsetAndNoWellDefinedLayout();
     try comptime testReinterpretWithOffsetAndNoWellDefinedLayout();
@@ -39,6 +39,7 @@ fn testReinterpretWithOffsetAndNoWellDefinedLayout() !void {
 
 test "reinterpret bytes inside auto-layout struct as integer with nonzero offset" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     try testReinterpretStructWrappedBytesAsInteger();
     try comptime testReinterpretStructWrappedBytesAsInteger();
@@ -193,6 +194,7 @@ const Bytes = struct {
 
 test "ptrcast of const integer has the correct object size" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const is_value = ~@as(isize, @intCast(std.math.minInt(isize)));
     const is_bytes = @as([*]const u8, @ptrCast(&is_value))[0..@sizeOf(isize)];
@@ -330,6 +332,8 @@ test "@ptrCast restructures comptime-only array" {
 }
 
 test "@ptrCast restructures sliced comptime-only array" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const a3a2: [4][2]comptime_int = .{
         .{ 1, 2 },
         .{ 3, 4 },
@@ -515,7 +519,6 @@ test "@ptrCast single-item pointer to slice with length 1" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
 
     const S = struct {
         fn doTheTest(comptime T: type, ptr: *const T) !void {
@@ -536,7 +539,6 @@ test "@ptrCast single-item pointer to slice of bytes" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
 
     const S = struct {
         fn doTheTest(comptime T: type, ptr: *const T) !void {
@@ -561,4 +563,12 @@ test "@ptrCast array pointer removing sentinel" {
     comptime assert(out[1] == 2);
     comptime assert(out[2] == 3);
     comptime assert(out[3] == 4);
+}
+
+test "@ptrcast larger type to smaller one" {
+    const T = packed struct { x: u17 };
+    const a: u32 = 0;
+    const b: *const T = @ptrCast(&a);
+    const c = b.x;
+    _ = c;
 }

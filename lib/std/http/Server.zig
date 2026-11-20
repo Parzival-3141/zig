@@ -30,6 +30,7 @@ pub fn init(in: *Reader, out: *Writer) Server {
             // Populated when `http.Reader.bodyReader` is called.
             .interface = undefined,
             .max_head_len = in.buffer.len,
+            .side = .request,
         },
         .out = out,
     };
@@ -96,13 +97,13 @@ pub const Request = struct {
             if (first_line.len < 10)
                 return error.HttpHeadersInvalid;
 
-            const method_end = mem.indexOfScalar(u8, first_line, ' ') orelse
+            const method_end = mem.findScalar(u8, first_line, ' ') orelse
                 return error.HttpHeadersInvalid;
 
             const method = std.meta.stringToEnum(http.Method, first_line[0..method_end]) orelse
                 return error.UnknownHttpMethod;
 
-            const version_start = mem.lastIndexOfScalar(u8, first_line, ' ') orelse
+            const version_start = mem.findScalarLast(u8, first_line, ' ') orelse
                 return error.HttpHeadersInvalid;
             if (version_start == method_end) return error.HttpHeadersInvalid;
 
@@ -253,6 +254,7 @@ pub const Request = struct {
                 .state = .received_head,
                 .interface = undefined,
                 .max_head_len = 4096,
+                .side = .request,
             },
             .out = undefined,
         };
@@ -338,9 +340,9 @@ pub const Request = struct {
         if (std.debug.runtime_safety) {
             for (options.extra_headers) |header| {
                 assert(header.name.len != 0);
-                assert(std.mem.indexOfScalar(u8, header.name, ':') == null);
-                assert(std.mem.indexOfPosLinear(u8, header.name, 0, "\r\n") == null);
-                assert(std.mem.indexOfPosLinear(u8, header.value, 0, "\r\n") == null);
+                assert(std.mem.findScalar(u8, header.name, ':') == null);
+                assert(std.mem.findPosLinear(u8, header.name, 0, "\r\n") == null);
+                assert(std.mem.findPosLinear(u8, header.value, 0, "\r\n") == null);
             }
         }
         try writeExpectContinue(request);
@@ -353,7 +355,7 @@ pub const Request = struct {
 
         const out = request.server.out;
         try out.print("{s} {d} {s}\r\n", .{
-            @tagName(options.version), @intFromEnum(options.status), phrase,
+            @tagName(options.version), @backingInt(options.status), phrase,
         });
 
         switch (options.version) {
@@ -424,7 +426,7 @@ pub const Request = struct {
         const out = request.server.out;
 
         try out.print("{s} {d} {s}\r\n", .{
-            @tagName(o.version), @intFromEnum(o.status), phrase,
+            @tagName(o.version), @backingInt(o.status), phrase,
         });
 
         switch (o.version) {
@@ -544,7 +546,7 @@ pub const Request = struct {
         sha1.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
         var digest: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
         sha1.final(&digest);
-        try out.print("{s} {d} {s}\r\n", .{ @tagName(version), @intFromEnum(status), phrase });
+        try out.print("{s} {d} {s}\r\n", .{ @tagName(version), @backingInt(status), phrase });
         try out.writeAll("connection: upgrade\r\nupgrade: websocket\r\nsec-websocket-accept: ");
         const base64_digest = try out.writableArray(28);
         assert(std.base64.standard.Encoder.encode(base64_digest, &digest).len == base64_digest.len);
@@ -592,7 +594,7 @@ pub const Request = struct {
         assert(request.server.reader.state == .received_head);
         assert(request.head.expect == null);
         request.head.invalidateStrings();
-        if (!request.head.method.requestHasBody()) return .ending;
+        if (request.head.method == .HEAD) return .ending;
         return request.server.reader.bodyReader(buffer, request.head.transfer_encoding, request.head.content_length);
     }
 
@@ -627,8 +629,7 @@ pub const Request = struct {
         const r = &request.server.reader;
         if (keep_alive and request.head.keep_alive) switch (r.state) {
             .received_head => {
-                if (request.head.method.requestHasBody()) {
-                    assert(request.head.transfer_encoding != .none or request.head.content_length != null);
+                if (request.head.transfer_encoding != .none or request.head.content_length != null) {
                     const reader_interface = request.readerExpectContinue(&.{}) catch return false;
                     _ = reader_interface.discardRemaining() catch return false;
                     assert(r.state == .ready);
@@ -688,7 +689,7 @@ pub const WebSocket = struct {
     pub const ReadSmallTextMessageError = error{
         ConnectionClose,
         UnexpectedOpCode,
-        MessageTooBig,
+        MessageOversize,
         MissingMaskBit,
         ReadFailed,
         EndOfStream,
@@ -717,16 +718,16 @@ pub const WebSocket = struct {
                 _ => return error.UnexpectedOpCode,
             }
 
-            if (!h0.fin) return error.MessageTooBig;
+            if (!h0.fin) return error.MessageOversize;
             if (!h1.mask) return error.MissingMaskBit;
 
             const len: usize = switch (h1.payload_len) {
                 .len16 => try in.takeInt(u16, .big),
-                .len64 => std.math.cast(usize, try in.takeInt(u64, .big)) orelse return error.MessageTooBig,
-                else => @intFromEnum(h1.payload_len),
+                .len64 => std.math.cast(usize, try in.takeInt(u64, .big)) orelse return error.MessageOversize,
+                else => @backingInt(h1.payload_len),
             };
-            if (len > in.buffer.len) return error.MessageTooBig;
-            const mask: u32 = @bitCast((try in.takeArray(4)).*);
+            if (len > in.buffer.len) return error.MessageOversize;
+            const mask: [4]u8 = (try in.takeArray(4)).*;
             const payload = try in.take(len);
 
             // Skip pongs.
@@ -734,11 +735,16 @@ pub const WebSocket = struct {
 
             // The last item may contain a partial word of unused data.
             const floored_len = (payload.len / 4) * 4;
-            const u32_payload: []align(1) u32 = @ptrCast(payload[0..floored_len]);
-            for (u32_payload) |*elem| elem.* ^= mask;
-            const mask_bytes: []const u8 = @ptrCast(&mask);
-            for (payload[floored_len..], mask_bytes[0 .. payload.len - floored_len]) |*leftover, m|
+
+            const payload_chunks: [][4]u8 = @ptrCast(payload[0..floored_len]);
+            for (payload_chunks) |*chunk| {
+                const mask_i: u32 = @bitCast(mask);
+                const chunk_i: u32 = @bitCast(chunk.*);
+                chunk.* = @bitCast(chunk_i ^ mask_i);
+            }
+            for (payload[floored_len..], mask[0 .. payload.len - floored_len]) |*leftover, m| {
                 leftover.* ^= m;
+            }
 
             return .{
                 .opcode = h0.opcode,
@@ -776,7 +782,7 @@ pub const WebSocket = struct {
         })));
         switch (total_len) {
             0...125 => try out.writeByte(@bitCast(@as(Header1, .{
-                .payload_len = @enumFromInt(total_len),
+                .payload_len = @fromBackingInt(@intCast(total_len)),
                 .mask = false,
             }))),
             126...0xffff => {

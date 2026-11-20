@@ -4,7 +4,7 @@ const mem = std.mem;
 const testing = std.testing;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const Allocator = std.mem.Allocator;
-const Writer = std.io.Writer;
+const Writer = std.Io.Writer;
 
 const ObjectMap = @import("dynamic.zig").ObjectMap;
 const Array = @import("dynamic.zig").Array;
@@ -220,14 +220,15 @@ test "Value with duplicate fields" {
 }
 
 test "Value.jsonStringify" {
+    const gpa = testing.allocator;
     var vals = [_]Value{
         .{ .integer = 1 },
         .{ .integer = 2 },
         .{ .number_string = "3" },
     };
-    var obj = ObjectMap.init(testing.allocator);
-    defer obj.deinit();
-    try obj.putNoClobber("a", .{ .string = "b" });
+    var obj: ObjectMap = .empty;
+    defer obj.deinit(gpa);
+    try obj.putNoClobber(gpa, "a", .{ .string = "b" });
     const array = [_]Value{
         .null,
         .{ .bool = true },

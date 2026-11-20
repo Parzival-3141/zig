@@ -11,8 +11,8 @@ pub fn build(b: *std.Build) !void {
         .{ .linux, &.{ .aarch64, .aarch64_be, .loongarch64, .powerpc64, .powerpc64le, .riscv64, .x86_64 } },
         .{ .macos, &.{ .aarch64, .x86_64 } },
 
-        // https://github.com/ziglang/zig/issues/24841
-        // .{ .freebsd, &.{ .aarch64, .powerpc64, .powerpc64le, .riscv64, .x86_64 } },
+        // powerpc64, powerpc64le, and riscv64 are not supported by TSan yet.
+        .{ .freebsd, &.{ .aarch64, .x86_64 } },
 
         .{ .netbsd, &.{.x86_64} },
 
@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) !void {
                     .root_module = b.createModule(.{
                         .root_source_file = b.path("main.zig"),
                         .target = target,
-                        .optimize = .Debug,
+                        .optimize = .debug,
                         .sanitize_thread = true,
                     }),
                 });
@@ -46,7 +46,7 @@ pub fn build(b: *std.Build) !void {
                     .root_module = b.createModule(.{
                         .root_source_file = b.path("main.zig"),
                         .target = target,
-                        .optimize = .Debug,
+                        .optimize = .debug,
                         .sanitize_thread = true,
                     }),
                 });

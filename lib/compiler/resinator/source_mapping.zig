@@ -10,7 +10,7 @@ pub const ParseLineCommandsResult = struct {
 
 const CurrentMapping = struct {
     line_num: usize = 1,
-    filename: std.ArrayListUnmanaged(u8) = .empty,
+    filename: std.ArrayList(u8) = .empty,
     pending: bool = true,
     ignore_contents: bool = false,
 };
@@ -538,7 +538,7 @@ pub fn handleLineCommand(allocator: Allocator, line_command: []const u8, current
     defer allocator.free(filename);
 
     // \x00 bytes in the filename is incompatible with how StringTable works
-    if (std.mem.indexOfScalar(u8, filename, '\x00') != null) return error.InvalidLineCommand;
+    if (std.mem.findScalar(u8, filename, '\x00') != null) return error.InvalidLineCommand;
 
     current_mapping.line_num = linenum;
     current_mapping.filename.clearRetainingCapacity();
@@ -574,8 +574,8 @@ fn parseFilename(allocator: Allocator, str: []const u8) error{ OutOfMemory, Inva
         escape_u,
     };
 
-    var filename = try std.array_list.Managed(u8).initCapacity(allocator, str.len);
-    errdefer filename.deinit();
+    var filename = try std.ArrayList(u8).initCapacity(allocator, str.len);
+    errdefer filename.deinit(allocator);
     var state: State = .string;
     var index: usize = 0;
     var escape_len: usize = undefined;
@@ -636,6 +636,10 @@ fn parseFilename(allocator: Allocator, str: []const u8) error{ OutOfMemory, Inva
                     if (escape_val != 0) escape_val = std.math.mul(u8, @as(u8, @intCast(escape_val)), 16) catch return error.InvalidString;
                     escape_val = std.math.add(u8, @as(u8, @intCast(escape_val)), digit) catch return error.InvalidString;
                     escape_len += 1;
+                    if (escape_len == 2) {
+                        filename.appendAssumeCapacity(@intCast(escape_val));
+                        state = .string;
+                    }
                 },
                 else => {
                     if (escape_len == 0) return error.InvalidString;
@@ -693,7 +697,7 @@ fn parseFilename(allocator: Allocator, str: []const u8) error{ OutOfMemory, Inva
         }
     }
 
-    return filename.toOwnedSlice();
+    return filename.toOwnedSlice(allocator);
 }
 
 fn testParseFilename(expected: []const u8, input: []const u8) !void {
@@ -706,6 +710,7 @@ fn testParseFilename(expected: []const u8, input: []const u8) !void {
 test parseFilename {
     try testParseFilename("'\"?\\\t\n\r\x11", "\\'\\\"\\?\\\\\\t\\n\\r\\x11");
     try testParseFilename("\xABz\x53", "\\xABz\\123");
+    try testParseFilename("\xABCDEF", "\\xABCDEF");
     try testParseFilename("⚡⚡", "\\u26A1\\U000026A1");
     try std.testing.expectError(error.InvalidString, parseFilename(std.testing.allocator, "\""));
     try std.testing.expectError(error.InvalidString, parseFilename(std.testing.allocator, "\\"));
@@ -713,7 +718,6 @@ test parseFilename {
     try std.testing.expectError(error.InvalidString, parseFilename(std.testing.allocator, "\\U"));
     try std.testing.expectError(error.InvalidString, parseFilename(std.testing.allocator, "\\x"));
     try std.testing.expectError(error.InvalidString, parseFilename(std.testing.allocator, "\\xZZ"));
-    try std.testing.expectError(error.InvalidString, parseFilename(std.testing.allocator, "\\xABCDEF"));
     try std.testing.expectError(error.InvalidString, parseFilename(std.testing.allocator, "\\777"));
 }
 
@@ -723,7 +727,7 @@ pub const SourceMappings = struct {
     /// The default assumes that the first filename added is the root file.
     /// The value should be set to the correct offset if that assumption does not hold.
     root_filename_offset: u32 = 0,
-    source_node_pool: std.heap.MemoryPool(Sources.Node) = std.heap.MemoryPool(Sources.Node).init(std.heap.page_allocator),
+    source_node_pool: std.heap.MemoryPool(Sources.Node) = .empty,
     end_line: usize = 0,
 
     const sourceCompare = struct {
@@ -742,7 +746,7 @@ pub const SourceMappings = struct {
 
     pub fn deinit(self: *SourceMappings, allocator: Allocator) void {
         self.files.deinit(allocator);
-        self.source_node_pool.deinit();
+        self.source_node_pool.deinit(std.heap.page_allocator);
     }
 
     /// Find the node that 'contains' the `line`, i.e. the node's start_line is
@@ -823,7 +827,7 @@ pub const SourceMappings = struct {
                 .filename_offset = filename_offset,
             };
             var entry = self.sources.getEntryFor(key);
-            var new_node = try self.source_node_pool.create();
+            var new_node = try self.source_node_pool.create(std.heap.page_allocator);
             new_node.key = key;
             entry.set(new_node);
         }
@@ -869,7 +873,7 @@ pub const SourceMappings = struct {
                 .filename_offset = node.key.filename_offset,
             };
             var entry = self.sources.getEntryFor(key);
-            var new_node = try self.source_node_pool.create();
+            var new_node = try self.source_node_pool.create(std.heap.page_allocator);
             new_node.key = key;
             entry.set(new_node);
             node = new_node;
@@ -927,7 +931,7 @@ test "SourceMappings collapse" {
 
 /// Same thing as StringTable in Zig's src/Wasm.zig
 pub const StringTable = struct {
-    data: std.ArrayListUnmanaged(u8) = .empty,
+    data: std.ArrayList(u8) = .empty,
     map: std.HashMapUnmanaged(u32, void, std.hash_map.StringIndexContext, std.hash_map.default_max_load_percentage) = .empty,
 
     pub fn deinit(self: *StringTable, allocator: Allocator) void {

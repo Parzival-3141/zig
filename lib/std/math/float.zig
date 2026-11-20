@@ -4,6 +4,68 @@ const assert = std.debug.assert;
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 
+/// A namespace for functions that deal with floats that provide greater than
+/// double precision (`f80`, `f128`, `c_longdouble`). Commonly referred to as
+/// `long double` in C.
+pub const long_double = struct {
+    const U80 = @Int(.unsigned, 80);
+
+    inline fn bitWidth(x: anytype) u16 {
+        const T = @TypeOf(x);
+        return switch (T) {
+            f80, f128, c_longdouble => @typeInfo(T).float.bits,
+            else => @compileError("Unsupported type: " ++ @typeName(T) ++ "\nPass a `f80`, `f128`, or `c_longdouble`."),
+        };
+    }
+
+    /// Returns the sign + exponent bits of a `long double`.
+    pub fn signExponent(x: anytype) u16 {
+        const bit_width = bitWidth(x);
+        switch (bit_width) {
+            80 => {
+                const bits: U80 = @bitCast(x);
+                return @intCast(bits >> 64);
+            },
+            128 => {
+                const bits: u128 = @bitCast(x);
+                return @intCast(bits >> 112);
+            },
+            // `c_longdouble` can have <80 bits on some targets, we want to error on that
+            else => @compileError(std.fmt.comptimePrint("`signExponent` supports floats of only `80` and `128` bit width, got bit width: {d}", .{bit_width})),
+        }
+    }
+
+    test "signExponent" {
+        try expectEqual(signExponent(@as(f80, -0.0)), 0x8000);
+        try expectEqual(signExponent(@as(f128, 0.0)), 0x0000);
+        try expectEqual(signExponent(@as(f128, 42.0)), 0x4004);
+        try expectEqual(signExponent(nan(c_longdouble)), 0x7FFF);
+    }
+
+    /// Takes the top 16 bits of a `long double`'s mantissa.
+    pub fn mantissaTop(x: anytype) u16 {
+        const bit_width = bitWidth(x);
+        switch (bit_width) {
+            80 => {
+                const bits: U80 = @bitCast(x);
+                return @intCast((bits >> 48) & 0xFFFF);
+            },
+            128 => {
+                const bits: u128 = @bitCast(x);
+                return @intCast((bits >> 96) & 0xFFFF);
+            },
+            // `c_longdouble` can have <80 bits on some targets, we want to error on that
+            else => @compileError(std.fmt.comptimePrint("`mantissaTop` supports floats of only `80` and `128` bit width, got bit width: {d}", .{bit_width})),
+        }
+    }
+
+    test "mantissaTop" {
+        try expectEqual(mantissaTop(@as(f80, -0.0)), 0x0000);
+        try expectEqual(mantissaTop(nan(f128)), 0x8000);
+        try expectEqual(mantissaTop(@as(f128, 42.0)), 0x5000);
+    }
+};
+
 pub fn FloatRepr(comptime Float: type) type {
     const fractional_bits = floatFractionalBits(Float);
     const exponent_bits = floatExponentBits(Float);
@@ -14,22 +76,10 @@ pub fn FloatRepr(comptime Float: type) type {
         exponent: BiasedExponent,
         sign: std.math.Sign,
 
-        pub const StoredMantissa = @Type(.{ .int = .{
-            .signedness = .unsigned,
-            .bits = floatMantissaBits(Float),
-        } });
-        pub const Mantissa = @Type(.{ .int = .{
-            .signedness = .unsigned,
-            .bits = 1 + fractional_bits,
-        } });
-        pub const Exponent = @Type(.{ .int = .{
-            .signedness = .signed,
-            .bits = exponent_bits,
-        } });
-        pub const BiasedExponent = enum(@Type(.{ .int = .{
-            .signedness = .unsigned,
-            .bits = exponent_bits,
-        } })) {
+        pub const StoredMantissa = @Int(.unsigned, floatMantissaBits(Float));
+        pub const Mantissa = @Int(.unsigned, 1 + fractional_bits);
+        pub const Exponent = @Int(.signed, exponent_bits);
+        pub const BiasedExponent = enum(@Int(.unsigned, exponent_bits)) {
             denormal = 0,
             min_normal = 1,
             zero = (1 << (exponent_bits - 1)) - 1,
@@ -42,13 +92,13 @@ pub fn FloatRepr(comptime Float: type) type {
             pub fn unbias(biased: BiasedExponent) Exponent {
                 switch (biased) {
                     .denormal => unreachable,
-                    else => return @bitCast(@intFromEnum(biased) -% @intFromEnum(BiasedExponent.zero)),
+                    else => return @bitCast(@backingInt(biased) -% @backingInt(BiasedExponent.zero)),
                     .infinite => unreachable,
                 }
             }
 
             pub fn bias(unbiased: Exponent) BiasedExponent {
-                return @enumFromInt(@intFromEnum(BiasedExponent.zero) +% @as(Int, @bitCast(unbiased)));
+                return @fromBackingInt(@intCast(@backingInt(BiasedExponent.zero) +% @as(Int, @bitCast(unbiased))));
             }
         };
 
@@ -56,29 +106,23 @@ pub fn FloatRepr(comptime Float: type) type {
             fraction: Fraction,
             exponent: Normalized.Exponent,
 
-            pub const Fraction = @Type(.{ .int = .{
-                .signedness = .unsigned,
-                .bits = fractional_bits,
-            } });
-            pub const Exponent = @Type(.{ .int = .{
-                .signedness = .signed,
-                .bits = 1 + exponent_bits,
-            } });
+            pub const Fraction = @Int(.unsigned, fractional_bits);
+            pub const Exponent = @Int(.signed, 1 + exponent_bits);
 
             /// This currently truncates denormal values, which needs to be fixed before this can be used to
             /// produce a rounded value.
             pub fn reconstruct(normalized: Normalized, sign: std.math.Sign) Float {
-                if (normalized.exponent > BiasedExponent.max_normal.unbias()) return @bitCast(Repr{
+                if (normalized.exponent > comptime BiasedExponent.max_normal.unbias()) return @bitCast(Repr{
                     .mantissa = 0,
                     .exponent = .infinite,
                     .sign = sign,
                 });
                 const mantissa = @as(Mantissa, 1 << fractional_bits) | normalized.fraction;
-                if (normalized.exponent < BiasedExponent.min_normal.unbias()) return @bitCast(Repr{
+                if (normalized.exponent < comptime BiasedExponent.min_normal.unbias()) return @bitCast(Repr{
                     .mantissa = @truncate(std.math.shr(
                         Mantissa,
                         mantissa,
-                        BiasedExponent.min_normal.unbias() - normalized.exponent,
+                        (comptime BiasedExponent.min_normal.unbias()) - normalized.exponent,
                     )),
                     .exponent = .denormal,
                     .sign = sign,
@@ -122,7 +166,7 @@ inline fn mantissaOne(comptime T: type) comptime_int {
 
 /// Creates floating point type T from an unbiased exponent and raw mantissa.
 inline fn reconstructFloat(comptime T: type, comptime exponent: comptime_int, comptime mantissa: comptime_int) T {
-    const TBits = @Type(.{ .int = .{ .signedness = .unsigned, .bits = @bitSizeOf(T) } });
+    const TBits = @Int(.unsigned, @bitSizeOf(T));
     const biased_exponent = @as(TBits, exponent + floatExponentMax(T));
     return @as(T, @bitCast((biased_exponent << floatMantissaBits(T)) | @as(TBits, mantissa)));
 }
@@ -209,7 +253,7 @@ pub inline fn floatEps(comptime T: type) T {
 pub inline fn floatEpsAt(comptime T: type, x: T) T {
     switch (@typeInfo(T)) {
         .float => |F| {
-            const U: type = @Type(.{ .int = .{ .signedness = .unsigned, .bits = F.bits } });
+            const U: type = @Int(.unsigned, F.bits);
             const u: U = @bitCast(x);
             const y: T = @bitCast(u ^ 1);
             return @abs(x - y);

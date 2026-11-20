@@ -6,7 +6,7 @@ const target_util = @import("../target.zig");
 const Compilation = @import("../Compilation.zig");
 const build_options = @import("build_options");
 const trace = @import("../tracy.zig").trace;
-const Module = @import("../Package/Module.zig");
+const Module = @import("../Module.zig");
 
 const libcxxabi_files = [_][]const u8{
     "src/cxa_aux_runtime.cpp",
@@ -79,9 +79,6 @@ const libcxx_base_files = [_][]const u8{
     "src/stdexcept.cpp",
     "src/string.cpp",
     "src/strstream.cpp",
-    "src/support/ibm/mbsnrtowcs.cpp",
-    "src/support/ibm/wcsnrtombs.cpp",
-    "src/support/ibm/xlocale_zos.cpp",
     "src/support/win32/locale_win32.cpp",
     "src/support/win32/support.cpp",
     "src/system_error.cpp",
@@ -109,7 +106,7 @@ pub const BuildError = error{
     OutOfMemory,
     AlreadyReported,
     ZigCompilerNotBuiltWithLLVMExtensions,
-};
+} || std.Io.Cancelable;
 
 pub fn buildLibCxx(comp: *Compilation, prog_node: std.Progress.Node) BuildError!void {
     if (!build_options.have_llvm) {
@@ -123,6 +120,7 @@ pub fn buildLibCxx(comp: *Compilation, prog_node: std.Progress.Node) BuildError!
     defer arena_allocator.deinit();
     const arena = arena_allocator.allocator();
 
+    const io = comp.io;
     const root_name = "c++";
     const output_mode = .Lib;
     const link_mode = .static;
@@ -174,7 +172,6 @@ pub fn buildLibCxx(comp: *Compilation, prog_node: std.Progress.Node) BuildError!
             .omit_frame_pointer = comp.root_mod.omit_frame_pointer,
             .valgrind = false,
             .optimize_mode = optimize_mode,
-            .structured_cfg = comp.root_mod.structured_cfg,
             .pic = if (target_util.supports_fpic(target)) true else null,
             .code_model = comp.root_mod.code_model,
         },
@@ -203,13 +200,12 @@ pub fn buildLibCxx(comp: *Compilation, prog_node: std.Progress.Node) BuildError!
             continue;
         if (std.mem.startsWith(u8, cxx_src, "src/support/win32/") and target.os.tag != .windows)
             continue;
-        if (std.mem.startsWith(u8, cxx_src, "src/support/ibm/") and target.os.tag != .zos)
-            continue;
 
         var cflags = std.array_list.Managed([]const u8).init(arena);
 
         try addCxxArgs(comp, arena, &cflags);
 
+        try cflags.append("-w"); // Disable all warnings.
         try cflags.append("-DNDEBUG");
         try cflags.append("-DLIBC_NAMESPACE=__llvm_libc_common_utils");
         try cflags.append("-D_LIBCPP_BUILDING_LIBRARY");
@@ -223,17 +219,10 @@ pub fn buildLibCxx(comp: *Compilation, prog_node: std.Progress.Node) BuildError!
         try cflags.append("-fvisibility=hidden");
         try cflags.append("-fvisibility-inlines-hidden");
 
-        if (target.os.tag == .zos) {
-            try cflags.append("-fno-aligned-allocation");
-        } else {
-            try cflags.append("-faligned-allocation");
-        }
+        try cflags.append("-faligned-allocation");
 
         try cflags.append("-nostdinc++");
         try cflags.append("-std=c++23");
-        try cflags.append("-Wno-user-defined-literals");
-        try cflags.append("-Wno-covered-switch-default");
-        try cflags.append("-Wno-suggest-override");
 
         // These depend on only the zig lib directory file path, which is
         // purposefully either in the cache or not in the cache. The decision
@@ -263,26 +252,28 @@ pub fn buildLibCxx(comp: *Compilation, prog_node: std.Progress.Node) BuildError!
     const misc_task: Compilation.MiscTask = .libcxx;
 
     var sub_create_diag: Compilation.CreateDiagnostic = undefined;
-    const sub_compilation = Compilation.create(comp.gpa, arena, &sub_create_diag, .{
+    const sub_compilation = Compilation.create(comp.gpa, arena, io, &sub_create_diag, .{
+        .thread_limit = comp.thread_limit,
         .dirs = comp.dirs.withoutLocalCache(),
         .self_exe_path = comp.self_exe_path,
         .cache_mode = .whole,
         .config = config,
         .root_mod = root_mod,
         .root_name = root_name,
-        .thread_pool = comp.thread_pool,
         .libc_installation = comp.libc_installation,
         .emit_bin = .yes_cache,
+        .function_sections = true,
+        .data_sections = true,
         .c_source_files = c_source_files.items,
         .verbose_cc = comp.verbose_cc,
         .verbose_link = comp.verbose_link,
         .verbose_air = comp.verbose_air,
         .verbose_llvm_ir = comp.verbose_llvm_ir,
         .verbose_llvm_bc = comp.verbose_llvm_bc,
-        .verbose_cimport = comp.verbose_cimport,
         .verbose_llvm_cpu_features = comp.verbose_llvm_cpu_features,
         .clang_passthrough_mode = comp.clang_passthrough_mode,
         .skip_linker_dependencies = true,
+        .environ_map = comp.environ_map,
     }) catch |err| {
         switch (err) {
             else => comp.lockAndSetMiscFailure(misc_task, "unable to build libc++: create compilation failed: {t}", .{err}),
@@ -293,7 +284,7 @@ pub fn buildLibCxx(comp: *Compilation, prog_node: std.Progress.Node) BuildError!
     defer sub_compilation.destroy();
 
     comp.updateSubCompilation(sub_compilation, misc_task, prog_node) catch |err| switch (err) {
-        error.AlreadyReported => return error.AlreadyReported,
+        error.AlreadyReported => |e| return e,
         else => |e| {
             comp.lockAndSetMiscFailure(misc_task, "unable to build libc++: compilation failed: {t}", .{e});
             return error.AlreadyReported;
@@ -303,7 +294,7 @@ pub fn buildLibCxx(comp: *Compilation, prog_node: std.Progress.Node) BuildError!
     assert(comp.libcxx_static_lib == null);
     const crt_file = try sub_compilation.toCrtFile();
     comp.libcxx_static_lib = crt_file;
-    comp.queuePrelinkTaskMode(crt_file.full_object_path, &config);
+    try comp.queuePrelinkTaskMode(crt_file.full_object_path, false, &config);
 }
 
 pub fn buildLibCxxAbi(comp: *Compilation, prog_node: std.Progress.Node) BuildError!void {
@@ -318,6 +309,7 @@ pub fn buildLibCxxAbi(comp: *Compilation, prog_node: std.Progress.Node) BuildErr
     defer arena_allocator.deinit();
     const arena = arena_allocator.allocator();
 
+    const io = comp.io;
     const root_name = "c++abi";
     const output_mode = .Lib;
     const link_mode = .static;
@@ -331,8 +323,8 @@ pub fn buildLibCxxAbi(comp: *Compilation, prog_node: std.Progress.Node) BuildErr
     const strip = comp.compilerRtStrip();
     // See the `-fno-exceptions` logic for WASI.
     // The old 32-bit x86 variant of SEH doesn't use tables.
-    const unwind_tables: std.builtin.UnwindTables =
-        if (target.os.tag == .wasi or (target.cpu.arch == .x86 and target.os.tag == .windows)) .none else .async;
+    const unwind_tables: std.lang.UnwindTables =
+        if (target.cpu.arch == .x86 and target.os.tag == .windows) .none else .async;
 
     const config = Compilation.Config.resolve(.{
         .output_mode = output_mode,
@@ -373,7 +365,6 @@ pub fn buildLibCxxAbi(comp: *Compilation, prog_node: std.Progress.Node) BuildErr
             .omit_frame_pointer = comp.root_mod.omit_frame_pointer,
             .valgrind = false,
             .optimize_mode = optimize_mode,
-            .structured_cfg = comp.root_mod.structured_cfg,
             .unwind_tables = unwind_tables,
             .pic = if (target_util.supports_fpic(target)) true else null,
             .code_model = comp.root_mod.code_model,
@@ -405,6 +396,7 @@ pub fn buildLibCxxAbi(comp: *Compilation, prog_node: std.Progress.Node) BuildErr
 
         try addCxxArgs(comp, arena, &cflags);
 
+        try cflags.append("-w"); // Disable all warnings.
         try cflags.append("-DNDEBUG");
         try cflags.append("-D_LIBCPP_BUILDING_LIBRARY");
         try cflags.append("-D_LIBCXXABI_BUILDING_LIBRARY");
@@ -426,9 +418,6 @@ pub fn buildLibCxxAbi(comp: *Compilation, prog_node: std.Progress.Node) BuildErr
         try cflags.append("-nostdinc++");
         try cflags.append("-fstrict-aliasing");
         try cflags.append("-std=c++23");
-        try cflags.append("-Wno-user-defined-literals");
-        try cflags.append("-Wno-covered-switch-default");
-        try cflags.append("-Wno-suggest-override");
 
         // These depend on only the zig lib directory file path, which is
         // purposefully either in the cache or not in the cache. The decision
@@ -455,26 +444,28 @@ pub fn buildLibCxxAbi(comp: *Compilation, prog_node: std.Progress.Node) BuildErr
     const misc_task: Compilation.MiscTask = .libcxxabi;
 
     var sub_create_diag: Compilation.CreateDiagnostic = undefined;
-    const sub_compilation = Compilation.create(comp.gpa, arena, &sub_create_diag, .{
+    const sub_compilation = Compilation.create(comp.gpa, arena, io, &sub_create_diag, .{
+        .thread_limit = comp.thread_limit,
         .dirs = comp.dirs.withoutLocalCache(),
         .self_exe_path = comp.self_exe_path,
         .cache_mode = .whole,
         .config = config,
         .root_mod = root_mod,
         .root_name = root_name,
-        .thread_pool = comp.thread_pool,
         .libc_installation = comp.libc_installation,
         .emit_bin = .yes_cache,
+        .function_sections = true,
+        .data_sections = true,
         .c_source_files = c_source_files.items,
         .verbose_cc = comp.verbose_cc,
         .verbose_link = comp.verbose_link,
         .verbose_air = comp.verbose_air,
         .verbose_llvm_ir = comp.verbose_llvm_ir,
         .verbose_llvm_bc = comp.verbose_llvm_bc,
-        .verbose_cimport = comp.verbose_cimport,
         .verbose_llvm_cpu_features = comp.verbose_llvm_cpu_features,
         .clang_passthrough_mode = comp.clang_passthrough_mode,
         .skip_linker_dependencies = true,
+        .environ_map = comp.environ_map,
     }) catch |err| {
         switch (err) {
             else => comp.lockAndSetMiscFailure(misc_task, "unable to build libc++abi: create compilation failed: {t}", .{err}),
@@ -485,7 +476,7 @@ pub fn buildLibCxxAbi(comp: *Compilation, prog_node: std.Progress.Node) BuildErr
     defer sub_compilation.destroy();
 
     comp.updateSubCompilation(sub_compilation, misc_task, prog_node) catch |err| switch (err) {
-        error.AlreadyReported => return error.AlreadyReported,
+        error.AlreadyReported => |e| return e,
         else => |e| {
             comp.lockAndSetMiscFailure(
                 .libcxxabi,
@@ -499,7 +490,7 @@ pub fn buildLibCxxAbi(comp: *Compilation, prog_node: std.Progress.Node) BuildErr
     assert(comp.libcxxabi_static_lib == null);
     const crt_file = try sub_compilation.toCrtFile();
     comp.libcxxabi_static_lib = crt_file;
-    comp.queuePrelinkTaskMode(crt_file.full_object_path, &config);
+    try comp.queuePrelinkTaskMode(crt_file.full_object_path, false, &config);
 }
 
 pub fn addCxxArgs(
@@ -545,16 +536,24 @@ pub fn addCxxArgs(
     // Compilation.addCCArgs. This option makes it use serial backend which
     // is simple and works everywhere.
     try cflags.append("-D_LIBCPP_PSTL_BACKEND_SERIAL");
-    try cflags.append(switch (optimize_mode) {
-        .Debug => "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG",
-        .ReleaseFast, .ReleaseSmall => "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE",
-        .ReleaseSafe => "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST",
-    });
+    switch (optimize_mode) {
+        .debug => {
+            try cflags.append("-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG");
+            try cflags.append("-D_LIBCPP_ASSERTION_SEMANTIC_DEFAULT=_LIBCPP_ASSERTION_SEMANTIC_ENFORCE");
+        },
+        .fast, .small => {
+            try cflags.append("-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE");
+            try cflags.append("-D_LIBCPP_ASSERTION_SEMANTIC_DEFAULT=_LIBCPP_ASSERTION_SEMANTIC_IGNORE");
+        },
+        .safe => {
+            try cflags.append("-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST");
+            try cflags.append("-D_LIBCPP_ASSERTION_SEMANTIC_DEFAULT=_LIBCPP_ASSERTION_SEMANTIC_ENFORCE");
+        },
+    }
     if (target.isGnuLibC()) {
         // glibc 2.16 introduced aligned_alloc
         if (target.os.versionRange().gnuLibCVersion().?.order(.{ .major = 2, .minor = 16, .patch = 0 }) == .lt) {
             try cflags.append("-D_LIBCPP_HAS_LIBRARY_ALIGNED_ALLOCATION=0");
         }
     }
-    try cflags.append("-D_LIBCPP_ENABLE_CXX17_REMOVED_UNEXPECTED_FUNCTIONS");
 }

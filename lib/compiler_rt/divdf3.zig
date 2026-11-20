@@ -3,34 +3,31 @@
 //! https://github.com/llvm/llvm-project/commit/d674d96bc56c0f377879d01c9d8dfdaaa7859cdb/compiler-rt/lib/builtins/divdf3.c
 
 const std = @import("std");
-const builtin = @import("builtin");
-const arch = builtin.cpu.arch;
-const common = @import("common.zig");
+const compiler_rt = @import("../compiler_rt.zig");
+const symbol = compiler_rt.symbol;
 
-const normalize = common.normalize;
-const wideMultiply = common.wideMultiply;
-
-pub const panic = common.panic;
+const normalize = compiler_rt.normalize;
+const wideMultiply = compiler_rt.wideMultiply;
 
 comptime {
-    if (common.want_aeabi) {
-        @export(&__aeabi_ddiv, .{ .name = "__aeabi_ddiv", .linkage = common.linkage, .visibility = common.visibility });
+    if (compiler_rt.want_aeabi) {
+        symbol(&__aeabi_ddiv, "__aeabi_ddiv");
     } else {
-        @export(&__divdf3, .{ .name = "__divdf3", .linkage = common.linkage, .visibility = common.visibility });
+        symbol(&__divdf3, "__divdf3");
     }
 }
 
-pub fn __divdf3(a: f64, b: f64) callconv(.c) f64 {
-    return div(a, b);
+fn __divdf3(a: compiler_rt.f64.Abi, b: compiler_rt.f64.Abi) callconv(.c) compiler_rt.f64.Abi {
+    return compiler_rt.f64.toAbi(div_f64(compiler_rt.f64.fromAbi(a), compiler_rt.f64.fromAbi(b)));
 }
 
 fn __aeabi_ddiv(a: f64, b: f64) callconv(.{ .arm_aapcs = .{} }) f64 {
-    return div(a, b);
+    return div_f64(a, b);
 }
 
-inline fn div(a: f64, b: f64) f64 {
-    const Z = std.meta.Int(.unsigned, 64);
-    const SignedZ = std.meta.Int(.signed, 64);
+pub fn div_f64(a: f64, b: f64) f64 {
+    const Z = @Int(.unsigned, 64);
+    const SignedZ = @Int(.signed, 64);
 
     const significandBits = std.math.floatMantissaBits(f64);
     const exponentBits = std.math.floatExponentBits(f64);
@@ -192,14 +189,13 @@ inline fn div(a: f64, b: f64) f64 {
 
     const writtenExponent = quotientExponent +% exponentBias;
 
+    const round = @intFromBool((residual << 1) >= bSignificand);
+
     if (writtenExponent >= maxExponent) {
         // If we have overflowed the exponent, return infinity.
         return @bitCast(infRep | quotientSign);
     } else if (writtenExponent < 1) {
         if (writtenExponent == 0) {
-            // Check whether the rounded result is normal.
-            const round = @intFromBool((residual << 1) > bSignificand);
-            // Clear the implicit bit.
             var absResult = quotient & significandMask;
             // Round.
             absResult += round;
@@ -208,11 +204,16 @@ inline fn div(a: f64, b: f64) f64 {
                 return @bitCast(absResult | quotientSign);
             }
         }
-        // Flush denormals to zero.  In the future, it would be nice to add
-        // code to round them correctly.
-        return @bitCast(quotientSign);
+
+        const roundedQuotient = quotient +% round;
+        const shiftAmount: u32 = @intCast(1 - writtenExponent);
+        if (shiftAmount > significandBits + 1) {
+            return @bitCast(quotientSign);
+        }
+
+        const denormQuotient = roundedQuotient >> @as(std.math.Log2Int(Z), @intCast(shiftAmount));
+        return @bitCast((denormQuotient & significandMask) | quotientSign);
     } else {
-        const round = @intFromBool((residual << 1) > bSignificand);
         // Clear the implicit bit
         var absResult = quotient & significandMask;
         // Insert the exponent

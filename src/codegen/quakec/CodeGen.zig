@@ -33,14 +33,6 @@ pub fn legalizeFeatures(_: *const std.Target) ?*const Air.Legalize.Features {
     // @Todo after the implementation here has stabalized, consider what features
     // can be enabled.
     return null;
-    // return comptime &.initMany(&.{
-    //     .expand_intcast_safe,
-    //     .expand_int_from_float_safe,
-    //     .expand_int_from_float_optimized_safe,
-    //     .expand_add_safe,
-    //     .expand_sub_safe,
-    //     .expand_mul_safe,
-    // });
 }
 
 // @Cleanup while our CodeGen is a file struct, it's never actually instantiated anywhere outside
@@ -110,12 +102,10 @@ const ValueSlot = union(enum) {
 pub fn generate(
     lf: *link.File,
     pt: Zcu.PerThread,
-    src_loc: Zcu.LazySrcLoc,
     func_index: InternPool.Index,
     air: *const Air,
     liveness: *const ?Air.Liveness,
-) codegen.CodeGenError!Mir {
-    _ = src_loc; // autofix
+) link.Error!Mir {
     assert(lf.tag == .quakec); // @Cleanup or do dev.check(.quakec_backend) instead?
     const zcu = pt.zcu;
 
@@ -180,10 +170,10 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
         log.debug("{f}", .{AirDump{ .cg = function, .inst = inst_idx }});
         // }
 
-        switch (air_tags[@intFromEnum(inst_idx)]) {
+        switch (air_tags[@backingInt(inst_idx)]) {
             else => |air_tag| return function.fail("unimplemented air: {f} {t}", .{ inst_idx, air_tag }),
             .alloc => {
-                const ty = air_data[@intFromEnum(inst_idx)].ty;
+                const ty = air_data[@backingInt(inst_idx)].ty;
                 const qc_ty = try function.getQCType(ty.childType(pt.zcu));
                 _ = try function.frameAllocLiveValue(inst_idx, qc_ty, .local);
             },
@@ -195,7 +185,7 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
 
                 // I can't construct global data here since codegen runs on individual functions. That needs to be handled by the linker. So, I need to generate MIR with enough metadata to reconstruct/allocate globals. That probably means working with the linker to keep global references in sync so they can be resolved at link time. Kinda like relocations.
 
-                const bin_op = air_data[@intFromEnum(inst_idx)].bin_op;
+                const bin_op = air_data[@backingInt(inst_idx)].bin_op;
                 const ptr_ty = air.typeOf(bin_op.lhs, ip);
                 const ptr_info = ptr_ty.ptrInfo(zcu);
 
@@ -216,15 +206,15 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
             },
             .load => {
                 // operand is a pointer to a local or global register
-                const ty_op = air_data[@intFromEnum(inst_idx)].ty_op;
+                const ty_op = air_data[@backingInt(inst_idx)].ty_op;
                 const ptr_ty = air.typeOf(ty_op.operand, ip);
                 const ptr_info = ptr_ty.ptrInfo(zcu);
                 // @Cleanup probably unecessary but for my own sanity
-                assert(Type.fromInterned(ptr_info.child).eql(ty_op.ty.toType(), zcu));
+                assert(Type.fromInterned(ptr_info.child).eql(ty_op.ty));
 
                 if (ptr_info.packed_offset.host_size != 0) return function.fail("QuakeC backend does not support non-ABI-aligned pointers", .{});
 
-                const qc_ty = try function.getQCType(ty_op.ty.toType());
+                const qc_ty = try function.getQCType(ty_op.ty);
 
                 const src = try function.resolvePtrOperand(ty_op.operand);
 
@@ -254,7 +244,7 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 // Both operands are the same type as the result (float for now).
                 // They are either the result of an air instruction or a constant,
                 // never pointers.
-                const bin_op = air_data[@intFromEnum(inst_idx)].bin_op;
+                const bin_op = air_data[@backingInt(inst_idx)].bin_op;
                 const qc_ty = try function.getQCType(air.typeOf(bin_op.lhs, ip));
 
                 const a = try function.resolveOperand(bin_op.lhs);
@@ -279,7 +269,7 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 });
             },
             .cmp_gt, .cmp_gte, .cmp_lt, .cmp_lte => |op| {
-                const bin_op = air_data[@intFromEnum(inst_idx)].bin_op;
+                const bin_op = air_data[@backingInt(inst_idx)].bin_op;
 
                 const a = try function.resolveOperand(bin_op.lhs);
                 const b = try function.resolveOperand(bin_op.rhs);
@@ -299,9 +289,9 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                     .args = .{ a, b, .{ .local = slot } },
                 });
             },
-            .bitcast => {
-                const ty_op = air_data[@intFromEnum(inst_idx)].ty_op;
-                const wanted_ty = ty_op.ty.toType();
+            .bit_cast => {
+                const ty_op = air_data[@backingInt(inst_idx)].ty_op;
+                const wanted_ty = ty_op.ty;
                 const wanted_bitsize = wanted_ty.bitSize(zcu);
                 if (wanted_bitsize > 32) return function.fail(
                     "@bitCast()-ing values greater than 32 bits is unsupported (size: {d})",
@@ -324,11 +314,11 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 });
             },
             .float_from_int => {
-                const ty_op = air_data[@intFromEnum(inst_idx)].ty_op;
-                const ty = ty_op.ty.toInterned().?;
+                const ty_op = air_data[@backingInt(inst_idx)].ty_op;
+                const ty = ty_op.ty.toIntern();
                 if (ty != .f32_type) return function.fail(
                     "only f32s are supported, got {f}",
-                    .{Type.fromInterned(ty).fmt(pt)},
+                    .{Type.fromInterned(ty).fmt(zcu)},
                 );
 
                 // @Todo the plan for ints is either to ban them outright (breaking a lot of the language)
@@ -338,13 +328,13 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 return function.fail("integers are not implemented yet: {f} {t}", .{ inst_idx, Air.Inst.Tag.float_from_int });
             },
             .block => {
-                const ty_pl = air_data[@intFromEnum(inst_idx)].ty_pl;
+                const ty_pl = air_data[@backingInt(inst_idx)].ty_pl;
                 const extra = air.extraData(Air.Block, ty_pl.payload);
-                const block_ty = ty_pl.ty.toType();
+                const block_ty = ty_pl.ty;
                 const block_body: []const Air.Inst.Index = @ptrCast(air.extra.items[extra.end..][0..extra.data.body_len]);
 
                 // The block may have a return value, which is filled by .br instructions in the body
-                const block_result_slot: ?u32 = if (!live.isUnused(inst_idx) and block_ty.hasRuntimeBitsIgnoreComptime(zcu))
+                const block_result_slot: ?u32 = if (!live.isUnused(inst_idx) and block_ty.hasRuntimeBits(zcu))
                     try function.frameAllocLiveValue(inst_idx, try function.getQCType(block_ty), .temp)
                 else
                     null;
@@ -368,7 +358,7 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 }
             },
             .br => {
-                const br = air_data[@intFromEnum(inst_idx)].br;
+                const br = air_data[@backingInt(inst_idx)].br;
                 const block = function.blocks.getPtr(br.block_inst).?;
 
                 if (block.result_slot) |frame_slot| {
@@ -392,7 +382,7 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 if (live.operandDies(inst_idx, 0)) try function.killValue(br.operand);
             },
             .cond_br => {
-                const pl_op = air_data[@intFromEnum(inst_idx)].pl_op;
+                const pl_op = air_data[@backingInt(inst_idx)].pl_op;
 
                 // ifnot condition +then_body_len
                 // then body
@@ -437,7 +427,7 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 function.branch_undo_stack.shrinkRetainingCapacity(undo_start);
             },
             .ret, .ret_safe => {
-                const un_op = air_data[@intFromEnum(inst_idx)].un_op;
+                const un_op = air_data[@backingInt(inst_idx)].un_op;
                 if (un_op != .void_value) return function.fail("@Todo handle return values", .{});
                 // Void functions end with `done`, matching qcc: a bare
                 // `return` copies 3 words from args[0] to OFS_RETURN, which is
@@ -454,7 +444,7 @@ fn getQCType(cg: CodeGen, ty: Type) !Mir.ValueType {
     return switch (ty.toIntern()) {
         .f32_type => .float,
         // @Todo handle all QC types
-        else => cg.fail("unsupported quakec backend type: {f}", .{ty.fmt(cg.pt)}),
+        else => cg.fail("unsupported quakec backend type: {f}", .{ty.fmt(cg.pt.zcu)}),
     };
 }
 
@@ -465,7 +455,7 @@ fn isValidQCType(ty: Type) bool {
     };
 }
 
-fn fail(cg: CodeGen, comptime fmt: []const u8, args: anytype) error{ OutOfMemory, CodegenFail } {
+fn fail(cg: CodeGen, comptime fmt: []const u8, args: anytype) Zcu.CodegenFailError {
     const zcu = cg.pt.zcu;
     // @Todo show the line we failed on, not just the function
     const func = zcu.funcInfo(cg.func_index);
@@ -477,7 +467,7 @@ fn fail(cg: CodeGen, comptime fmt: []const u8, args: anytype) error{ OutOfMemory
 fn resolveOperand(cg: *CodeGen, ref: Air.Inst.Ref) !Mir.Statement.Arg {
     if (ref.toIndex()) |inst_idx| {
         const in_flight = cg.live_values.get(inst_idx) orelse
-            return cg.fail("internal error: no live value for %{d}", .{@intFromEnum(inst_idx)});
+            return cg.fail("internal error: no live value for %{d}", .{@backingInt(inst_idx)});
         return toStmtArg(in_flight);
     }
     const zcu = cg.pt.zcu;
@@ -494,7 +484,7 @@ fn resolvePtrOperand(cg: *CodeGen, ref: Air.Inst.Ref) !Mir.Statement.Arg {
         const in_flight = cg.live_values.get(inst_idx) orelse
             return cg.fail(
                 "internal error: no live value for pointer operand %{d}",
-                .{@intFromEnum(inst_idx)},
+                .{@backingInt(inst_idx)},
             );
         return switch (in_flight) {
             .temp, .local => |slot| .{ .local = slot },
@@ -507,7 +497,7 @@ fn resolvePtrOperand(cg: *CodeGen, ref: Air.Inst.Ref) !Mir.Statement.Arg {
     assert(ptr_val.typeOf(zcu).isSinglePointer(zcu)); // @Todo is it possible to lower stores to other pointer types?
     const nav_idx = Value.pointerNav(ptr_val, zcu) orelse
         return cg.fail("@Todo pointer operand does not point to a global", .{});
-    _ = try cg.getQCType(.fromInterned(ip.getNav(nav_idx).typeOf(ip))); // @Todo handle all QC types
+    _ = try cg.getQCType(.fromInterned(ip.getNav(nav_idx).resolved.?.type)); // @Todo handle all QC types
     const gop = try cg.globals.getOrPut(zcu.gpa, nav_idx);
     return .{ .global = @intCast(gop.index) };
 }
@@ -641,8 +631,8 @@ const AirDump = struct {
     inst: ?Air.Inst.Index = null,
     pub fn format(d: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
         if (d.inst) |inst|
-            d.cg.air.writeInst(w, inst, d.cg.pt, d.cg.live)
+            d.cg.air.writeInst(w, inst, d.cg.pt.zcu, d.cg.live)
         else
-            d.cg.air.write(w, d.cg.pt, d.cg.live);
+            d.cg.air.write(w, d.cg.pt.zcu, d.cg.live) catch {};
     }
 };

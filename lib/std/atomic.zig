@@ -1,3 +1,10 @@
+const builtin = @import("builtin");
+
+const std = @import("std.zig");
+const AtomicOrder = std.builtin.AtomicOrder;
+const testing = std.testing;
+const assert = std.debug.assert;
+
 /// This is a thin wrapper around a primitive value to prevent accidental data races.
 pub fn Value(comptime T: type) type {
     return extern struct {
@@ -370,13 +377,16 @@ pub inline fn spinLoopHint() void {
         .aarch64_be,
         => asm volatile ("isb"),
 
-        // `yield` was introduced in v6k but is also available on v6m.
         // https://www.keil.com/support/man/docs/armasm/armasm_dom1361289926796.htm
         .arm,
         .armeb,
+        => if (comptime builtin.cpu.has(.arm, .has_v6k)) {
+            asm volatile ("yield");
+        },
+
         .thumb,
         .thumbeb,
-        => if (comptime builtin.cpu.hasAny(.arm, &.{ .has_v6k, .has_v6m })) {
+        => if (comptime builtin.cpu.hasAny(.arm, &.{ .has_v6m, .thumb2 })) {
             asm volatile ("yield");
         },
 
@@ -385,10 +395,26 @@ pub inline fn spinLoopHint() void {
         .hexagon,
         => asm volatile ("pause(#1)"),
 
+        .mips,
+        .mipsel,
+        .mips64,
+        .mips64el,
+        => if (comptime builtin.cpu.has(.mips, .mips32r2)) {
+            asm volatile ("pause");
+        },
+
         .riscv32,
+        .riscv32be,
         .riscv64,
+        .riscv64be,
         => if (comptime builtin.cpu.has(.riscv, .zihintpause)) {
             asm volatile ("pause");
+        },
+
+        .sparc,
+        .sparc64,
+        => if (comptime builtin.cpu.hasAny(.sparc, &.{ .v8plus, .v9 })) {
+            asm volatile ("rd %%ccr, %%g0");
         },
 
         else => {},
@@ -417,6 +443,7 @@ pub fn cacheLineForCpu(cpu: std.Target.Cpu) u16 {
         .aarch64,
         .aarch64_be,
         .arc,
+        .arceb,
         .powerpc64,
         .powerpc64le,
         => 128,
@@ -430,20 +457,33 @@ pub fn cacheLineForCpu(cpu: std.Target.Cpu) u16 {
         // - https://github.com/golang/go/blob/3dd58676054223962cd915bb0934d1f9f489d4d2/src/internal/cpu/cpu_mipsle.go#L7
         // - https://github.com/golang/go/blob/3dd58676054223962cd915bb0934d1f9f489d4d2/src/internal/cpu/cpu_mips64x.go#L9
         // - https://github.com/torvalds/linux/blob/3a7e02c040b130b5545e4b115aada7bacd80a2b6/arch/sparc/include/asm/cache.h#L14
+        // - https://github.com/torvalds/linux/blob/3a7e02c040b130b5545e4b115aada7bacd80a2b6/arch/microblaze/include/asm/cache.h#L15
+        // - https://github.com/torvalds/linux/blob/3a7e02c040b130b5545e4b115aada7bacd80a2b6/arch/sh/include/cpu-sh4/cpu/cache.h#L10
+        // - https://github.com/openbsd/src/blob/1957873d2063db11dab780eca75b5e629d1e838d/sys/arch/m88k/m88k/atomic.S#L22
         .arm,
         .armeb,
         .thumb,
         .thumbeb,
+        .m88k,
+        .microblaze,
+        .microblazeel,
         .mips,
         .mipsel,
         .mips64,
         .mips64el,
+        .sh,
+        .sheb,
         .sparc,
         .sparc64,
         => 32,
 
         // - https://github.com/torvalds/linux/blob/3a7e02c040b130b5545e4b115aada7bacd80a2b6/arch/m68k/include/asm/cache.h#L10
+        // - https://github.com/torvalds/linux/blob/3a7e02c040b130b5545e4b115aada7bacd80a2b6/arch/openrisc/include/asm/cache.h#L24
+        // - https://github.com/torvalds/linux/blob/3a7e02c040b130b5545e4b115aada7bacd80a2b6/arch/parisc/include/asm/cache.h#L16
+        .hppa,
+        .hppa64,
         .m68k,
+        .or1k,
         => 16,
 
         // - https://www.ti.com/lit/pdf/slaa498
@@ -464,6 +504,7 @@ pub fn cacheLineForCpu(cpu: std.Target.Cpu) u16 {
         // - https://github.com/golang/go/blob/19e923182e590ae6568c2c714f20f32512aeb3e3/src/internal/cpu/cpu_riscv64.go#L7
         // - https://github.com/torvalds/linux/blob/3a7e02c040b130b5545e4b115aada7bacd80a2b6/arch/xtensa/variants/csp/include/variant/core.h#L209
         // - https://github.com/torvalds/linux/blob/3a7e02c040b130b5545e4b115aada7bacd80a2b6/arch/csky/Kconfig#L183
+        // - https://github.com/torvalds/linux/blob/3a7e02c040b130b5545e4b115aada7bacd80a2b6/arch/alpha/include/asm/cache.h#L11
         // - https://www.xmos.com/download/The-XMOS-XS3-Architecture.pdf
         else => 64,
     };
@@ -481,7 +522,17 @@ test "current CPU has a cache line size" {
     _ = cache_line;
 }
 
-const std = @import("std.zig");
-const builtin = @import("builtin");
-const AtomicOrder = std.builtin.AtomicOrder;
-const testing = std.testing;
+/// A lock-free single-owner resource.
+pub const Mutex = enum(u8) {
+    unlocked,
+    locked,
+
+    pub fn tryLock(m: *Mutex) bool {
+        return @cmpxchgStrong(Mutex, m, .unlocked, .locked, .acquire, .monotonic) == null;
+    }
+
+    pub fn unlock(m: *Mutex) void {
+        assert(@atomicLoad(Mutex, m, .unordered) == .locked);
+        @atomicStore(Mutex, m, .unlocked, .release);
+    }
+};

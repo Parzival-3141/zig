@@ -1,36 +1,38 @@
-objects: std.ArrayListUnmanaged(Object) = .empty,
+objects: std.ArrayList(Object) = .empty,
 
 pub fn deinit(self: *Archive, allocator: Allocator) void {
     self.objects.deinit(allocator);
 }
 
 pub fn unpack(self: *Archive, macho_file: *MachO, path: Path, handle_index: File.HandleIndex, fat_arch: ?fat.Arch) !void {
-    const gpa = macho_file.base.comp.gpa;
-    const diags = &macho_file.base.comp.link_diags;
+    const comp = macho_file.base.comp;
+    const io = comp.io;
+    const gpa = comp.gpa;
+    const diags = &comp.link_diags;
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
     const handle = macho_file.getFileHandle(handle_index);
     const offset = if (fat_arch) |ar| ar.offset else 0;
-    const end_pos = if (fat_arch) |ar| offset + ar.size else (try handle.stat()).size;
+    const end_pos = if (fat_arch) |ar| offset + ar.size else (try handle.stat(io)).size;
 
-    var pos: usize = offset + SARMAG;
+    var pos: usize = offset + macho.ARMAG.len;
     while (true) {
         if (pos >= end_pos) break;
         if (!mem.isAligned(pos, 2)) pos += 1;
 
         var hdr_buffer: [@sizeOf(ar_hdr)]u8 = undefined;
         {
-            const amt = try handle.preadAll(&hdr_buffer, pos);
+            const amt = try handle.readPositionalAll(io, &hdr_buffer, pos);
             if (amt != @sizeOf(ar_hdr)) return error.InputOutput;
         }
         const hdr = @as(*align(1) const ar_hdr, @ptrCast(&hdr_buffer)).*;
         pos += @sizeOf(ar_hdr);
 
-        if (!mem.eql(u8, &hdr.ar_fmag, ARFMAG)) {
+        if (!mem.eql(u8, &hdr.ar_fmag, macho.ARFMAG)) {
             return diags.failParse(path, "invalid header delimiter: expected '{f}', found '{f}'", .{
-                std.ascii.hexEscape(ARFMAG, .lower), std.ascii.hexEscape(&hdr.ar_fmag, .lower),
+                std.ascii.hexEscape(macho.ARFMAG, .lower), std.ascii.hexEscape(&hdr.ar_fmag, .lower),
             });
         }
 
@@ -40,10 +42,10 @@ pub fn unpack(self: *Archive, macho_file: *MachO, path: Path, handle_index: File
             if (try hdr.nameLength()) |len| {
                 hdr_size -= len;
                 const buf = try arena.allocator().alloc(u8, len);
-                const amt = try handle.preadAll(buf, pos);
+                const amt = try handle.readPositionalAll(io, buf, pos);
                 if (amt != len) return error.InputOutput;
                 pos += len;
-                const actual_len = mem.indexOfScalar(u8, buf, @as(u8, 0)) orelse len;
+                const actual_len = mem.findScalar(u8, buf, @as(u8, 0)) orelse len;
                 break :name buf[0..actual_len];
             }
             unreachable;
@@ -55,23 +57,30 @@ pub fn unpack(self: *Archive, macho_file: *MachO, path: Path, handle_index: File
             mem.eql(u8, name, SYMDEF_SORTED) or
             mem.eql(u8, name, SYMDEF64_SORTED)) continue;
 
+        const abs_path = try std.fs.path.resolvePosix(gpa, &.{
+            comp.dirs.cwd,
+            path.root_dir.path orelse ".",
+            path.sub_path,
+        });
+        errdefer gpa.free(abs_path);
+
+        const o_basename = try gpa.dupe(u8, name);
+        errdefer gpa.free(o_basename);
+
         const object: Object = .{
             .offset = pos,
             .in_archive = .{
-                .path = .{
-                    .root_dir = path.root_dir,
-                    .sub_path = try gpa.dupe(u8, path.sub_path),
-                },
+                .path = abs_path,
                 .size = hdr_size,
             },
-            .path = Path.initCwd(try gpa.dupe(u8, name)),
+            .path = o_basename,
             .file_handle = handle_index,
             .index = undefined,
             .alive = false,
             .mtime = hdr.date() catch 0,
         };
 
-        log.debug("extracting object '{f}' from archive '{f}'", .{ object.path, path });
+        log.debug("extracting object '{s}' from archive '{f}'", .{ o_basename, path });
 
         try self.objects.append(gpa, object);
     }
@@ -80,35 +89,22 @@ pub fn unpack(self: *Archive, macho_file: *MachO, path: Path, handle_index: File
 pub fn writeHeader(
     object_name: []const u8,
     object_size: usize,
-    format: Format,
-    writer: anytype,
+    writer: *Writer,
 ) !void {
-    var hdr: ar_hdr = .{
-        .ar_name = undefined,
-        .ar_date = undefined,
-        .ar_uid = undefined,
-        .ar_gid = undefined,
-        .ar_mode = undefined,
-        .ar_size = undefined,
-        .ar_fmag = undefined,
-    };
-    @memset(mem.asBytes(&hdr), 0x20);
-    inline for (@typeInfo(ar_hdr).@"struct".fields) |field| {
-        var stream = std.io.fixedBufferStream(&@field(hdr, field.name));
-        stream.writer().print("0", .{}) catch unreachable;
-    }
-    @memcpy(&hdr.ar_fmag, ARFMAG);
+    var hdr: ar_hdr = .{};
 
-    const object_name_len = mem.alignForward(usize, object_name.len + 1, ptrWidth(format));
+    const object_name_start = writer.end + @sizeOf(ar_hdr);
+    const object_start = mem.alignForward(usize, object_name_start + object_name.len + 1, 8);
+    const object_name_len = object_start - object_name_start;
     const total_object_size = object_size + object_name_len;
 
     {
-        var stream = std.io.fixedBufferStream(&hdr.ar_name);
-        stream.writer().print("#1/{d}", .{object_name_len}) catch unreachable;
+        var stream: Writer = .fixed(&hdr.ar_name);
+        stream.print("#1/{d}", .{object_name_len}) catch unreachable;
     }
     {
-        var stream = std.io.fixedBufferStream(&hdr.ar_size);
-        stream.writer().print("{d}", .{total_object_size}) catch unreachable;
+        var stream: Writer = .fixed(&hdr.ar_size);
+        stream.print("{d}", .{total_object_size}) catch unreachable;
     }
 
     try writer.writeAll(mem.asBytes(&hdr));
@@ -116,20 +112,9 @@ pub fn writeHeader(
 
     const padding = object_name_len - object_name.len - 1;
     if (padding > 0) {
-        try writer.writeByteNTimes(0, padding);
+        try writer.splatByteAll(0, padding);
     }
 }
-
-// Archive files start with the ARMAG identifying string.  Then follows a
-// `struct ar_hdr', and as many bytes of member file data as its `ar_size'
-// member indicates, for each member file.
-/// String that begins an archive file.
-pub const ARMAG: *const [SARMAG:0]u8 = "!<arch>\n";
-/// Size of that string.
-pub const SARMAG: u4 = 8;
-
-/// String in ar_fmag at the end of each header.
-const ARFMAG: *const [2:0]u8 = "`\n";
 
 pub const SYMDEF = "__.SYMDEF";
 pub const SYMDEF64 = "__.SYMDEF_64";
@@ -138,25 +123,19 @@ pub const SYMDEF64_SORTED = "__.SYMDEF_64 SORTED";
 
 pub const ar_hdr = extern struct {
     /// Member file name, sometimes / terminated.
-    ar_name: [16]u8,
-
+    ar_name: [16]u8 = "0\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20".*,
     /// File date, decimal seconds since Epoch.
-    ar_date: [12]u8,
-
+    ar_date: [12]u8 = "0\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20".*,
     /// User ID, in ASCII format.
-    ar_uid: [6]u8,
-
+    ar_uid: [6]u8 = "0\x20\x20\x20\x20\x20".*,
     /// Group ID, in ASCII format.
-    ar_gid: [6]u8,
-
+    ar_gid: [6]u8 = "0\x20\x20\x20\x20\x20".*,
     /// File mode, in ASCII octal.
-    ar_mode: [8]u8,
-
+    ar_mode: [8]u8 = "0\x20\x20\x20\x20\x20\x20\x20".*,
     /// File size, in ASCII decimal.
-    ar_size: [10]u8,
-
+    ar_size: [10]u8 = "0\x20\x20\x20\x20\x20\x20\x20\x20\x20".*,
     /// Always contains ARFMAG.
-    ar_fmag: [2]u8,
+    ar_fmag: [2]u8 = macho.ARFMAG.*,
 
     fn date(self: ar_hdr) !u64 {
         const value = mem.trimEnd(u8, &self.ar_date, &[_]u8{@as(u8, 0x20)});
@@ -171,7 +150,7 @@ pub const ar_hdr = extern struct {
     fn name(self: *const ar_hdr) ?[]const u8 {
         const value = &self.ar_name;
         if (mem.startsWith(u8, value, "#1/")) return null;
-        const sentinel = mem.indexOfScalar(u8, value, '/') orelse value.len;
+        const sentinel = mem.findScalar(u8, value, '/') orelse value.len;
         return value[0..sentinel];
     }
 
@@ -184,7 +163,7 @@ pub const ar_hdr = extern struct {
 };
 
 pub const ArSymtab = struct {
-    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    entries: std.ArrayList(Entry) = .empty,
     strtab: StringTable = .{},
 
     pub fn deinit(ar: *ArSymtab, allocator: Allocator) void {
@@ -201,10 +180,10 @@ pub const ArSymtab = struct {
         return ptr_width + ar.entries.items.len * 2 * ptr_width + ptr_width + mem.alignForward(usize, ar.strtab.buffer.items.len, ptr_width);
     }
 
-    pub fn write(ar: ArSymtab, format: Format, macho_file: *MachO, writer: anytype) !void {
+    pub fn write(ar: ArSymtab, format: Format, macho_file: *MachO, writer: *Writer) !void {
         const ptr_width = ptrWidth(format);
         // Header
-        try writeHeader(SYMDEF, ar.size(format), format, writer);
+        try writeHeader(SYMDEF, ar.size(format), writer);
         // Symtab size
         try writeInt(format, ar.entries.items.len * 2 * ptr_width, writer);
         // Symtab entries
@@ -226,7 +205,7 @@ pub const ArSymtab = struct {
         // Strtab
         try writer.writeAll(ar.strtab.buffer.items);
         if (padding > 0) {
-            try writer.writeByteNTimes(0, padding);
+            try writer.splatByteAll(0, padding);
         }
     }
 
@@ -245,7 +224,7 @@ pub const ArSymtab = struct {
         }
     };
 
-    pub fn fmt(ar: ArSymtab, macho_file: *MachO) std.fmt.Formatter(PrintFormat, PrintFormat.default) {
+    pub fn fmt(ar: ArSymtab, macho_file: *MachO) std.fmt.Alt(PrintFormat, PrintFormat.default) {
         return .{ .data = .{ .ar = ar, .macho_file = macho_file } };
     }
 
@@ -275,7 +254,7 @@ pub fn ptrWidth(format: Format) usize {
     };
 }
 
-pub fn writeInt(format: Format, value: u64, writer: anytype) !void {
+pub fn writeInt(format: Format, value: u64, writer: *Writer) !void {
     switch (format) {
         .p32 => try writer.writeInt(u32, std.math.cast(u32, value) orelse return error.Overflow, .little),
         .p64 => try writer.writeInt(u64, value, .little),
@@ -299,7 +278,7 @@ const mem = std.mem;
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Path = std.Build.Cache.Path;
-const Writer = std.io.Writer;
+const Writer = std.Io.Writer;
 
 const Archive = @This();
 const File = @import("file.zig").File;

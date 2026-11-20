@@ -1,7 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const endian = builtin.cpu.arch.endian();
-const testing = @import("std").testing;
+const testing = std.testing;
+const assert = std.debug.assert;
 const ptr_size = @sizeOf(usize);
 
 test "type pun signed and unsigned as single pointer" {
@@ -118,8 +119,8 @@ fn shuffle(ptr: usize, comptime From: type, comptime To: type) usize {
     const pResult = @as(*align(1) [array_len]To, @ptrCast(&result));
     var i: usize = 0;
     while (i < array_len) : (i += 1) {
-        inline for (@typeInfo(To).@"struct".fields) |f| {
-            @field(pResult[i], f.name) = @field(pSource[i], f.name);
+        inline for (@typeInfo(To).@"struct".field_names) |f_name| {
+            @field(pResult[i], f_name) = @field(pSource[i], f_name);
         }
     }
     return result;
@@ -406,8 +407,6 @@ test "mutate entire slice at comptime" {
 }
 
 test "dereference undefined pointer to zero-bit type" {
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
-
     const p0: *void = undefined;
     try testing.expectEqual({}, p0.*);
 
@@ -423,8 +422,6 @@ test "type pun extern struct" {
 }
 
 test "type pun @ptrFromInt" {
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
-
     const p: *u8 = @ptrFromInt(42);
     // note that expectEqual hides the bug
     try testing.expect(@as(*const [*]u8, @ptrCast(&p)).* == @as([*]u8, @ptrFromInt(42)));
@@ -437,6 +434,8 @@ test "type pun null pointer-like optional" {
 }
 
 test "write empty array to end" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     comptime var array: [5]u8 = "hello".*;
     array[5..5].* = .{};
     array[5..5].* = [0]u8{};
@@ -516,7 +515,6 @@ fn fieldPtrTest() u32 {
 }
 test "pointer in aggregate field can mutate comptime state" {
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
-
     try comptime std.testing.expect(fieldPtrTest() == 2);
 }
 
@@ -581,4 +579,52 @@ test "comptime store to extern struct reinterpreted as byte array" {
     @memset(bytes, 0);
 
     comptime std.debug.assert(val.x == 0);
+}
+
+test "reinterpret sentinel-terminated array as packed struct" {
+    const S = packed struct(u16) { lo: u8, hi: u8 };
+    const data: [2:0]u8 = .{ 0x12, 0x34 };
+    const ptr: *align(1) const S = @ptrCast(&data);
+    switch (endian) {
+        .little => {
+            try testing.expect(ptr.lo == 0x12);
+            try testing.expect(ptr.hi == 0x34);
+        },
+        .big => {
+            try testing.expect(ptr.lo == 0x34);
+            try testing.expect(ptr.hi == 0x12);
+        },
+    }
+}
+
+test "reinterpret pointer as optional pointer via double-pointer coercion" {
+    const p0: *const *anyopaque = &@ptrFromInt(0x1000);
+    const p1: *const ?*anyopaque = p0;
+
+    const loaded = p1.*;
+
+    comptime assert(@TypeOf(loaded) == ?*anyopaque);
+    comptime assert(@intFromPtr(loaded) == 0x1000);
+}
+
+test "comptime store to sentinel-terminated array in an extern struct" {
+    comptime {
+        var x: extern struct {
+            a: [2:0]u8 = @splat(50),
+        } = .{};
+        x.a[0] = 100;
+        assert(x.a[0] == 100);
+        assert(x.a[1] == 50);
+        assert(x.a[2] == 0);
+    }
+}
+
+test "comptime store to repeated string bytes" {
+    comptime {
+        var x = "aa".*;
+        x[0] = 'b';
+        assert(x[0] == 'b');
+        assert(x[1] == 'a');
+        assert(x[2] == 0);
+    }
 }

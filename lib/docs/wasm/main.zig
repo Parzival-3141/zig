@@ -5,8 +5,11 @@ const Ast = std.zig.Ast;
 const Walk = @import("Walk");
 const markdown = @import("markdown.zig");
 const Decl = Walk.Decl;
+const ArrayList = std.ArrayList;
+const Writer = std.Io.Writer;
 
 const fileSourceHtml = @import("html_render.zig").fileSourceHtml;
+const fileSourceLineNumbersHtml = @import("html_render.zig").fileSourceLineNumbersHtml;
 const appendEscaped = @import("html_render.zig").appendEscaped;
 const resolveDeclLink = @import("html_render.zig").resolveDeclLink;
 const missing_feature_url_escape = @import("html_render.zig").missing_feature_url_escape;
@@ -39,13 +42,13 @@ pub fn panic(msg: []const u8, st: ?*std.builtin.StackTrace, addr: ?usize) noretu
 
 fn logFn(
     comptime message_level: log.Level,
-    comptime scope: @TypeOf(.enum_literal),
+    comptime scope: @EnumLiteral(),
     comptime format: []const u8,
     args: anytype,
 ) void {
     const prefix = if (scope == .default) "" else @tagName(scope) ++ ": ";
     var buf: [500]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, prefix ++ format, args) catch l: {
+    const line = std.mem.print(&buf, prefix ++ format, args) catch l: {
         buf[buf.len - 3 ..][0..3].* = "...".*;
         break :l &buf;
     };
@@ -66,8 +69,8 @@ export fn unpack(tar_ptr: [*]u8, tar_len: usize) void {
     };
 }
 
-var query_string: std.ArrayListUnmanaged(u8) = .empty;
-var query_results: std.ArrayListUnmanaged(Decl.Index) = .empty;
+var query_string: ArrayList(u8) = .empty;
+var query_results: ArrayList(Decl.Index) = .empty;
 
 /// Resizes the query string to be the correct length; returns the pointer to
 /// the query string.
@@ -87,7 +90,7 @@ export fn query_exec(ignore_case: bool) [*]Decl.Index {
     query_exec_fallible(query, ignore_case) catch |err| switch (err) {
         error.OutOfMemory => @panic("OOM"),
     };
-    query_results.items[0] = @enumFromInt(query_results.items.len - 1);
+    query_results.items[0] = @fromBackingInt(@intCast(query_results.items.len - 1));
     return query_results.items.ptr;
 }
 
@@ -99,11 +102,11 @@ fn query_exec_fallible(query: []const u8, ignore_case: bool) !void {
         segments: u16,
     };
     const g = struct {
-        var full_path_search_text: std.ArrayListUnmanaged(u8) = .empty;
-        var full_path_search_text_lower: std.ArrayListUnmanaged(u8) = .empty;
-        var doc_search_text: std.ArrayListUnmanaged(u8) = .empty;
+        var full_path_search_text: ArrayList(u8) = .empty;
+        var full_path_search_text_lower: ArrayList(u8) = .empty;
+        var doc_search_text: ArrayList(u8) = .empty;
         /// Each element matches a corresponding query_results element.
-        var scores: std.ArrayListUnmanaged(Score) = .empty;
+        var scores: ArrayList(Score) = .empty;
     };
 
     // First element stores the size of the list.
@@ -150,11 +153,11 @@ fn query_exec_fallible(query: []const u8, ignore_case: bool) !void {
                 continue;
             }
             // substring, case insensitive match of full decl path
-            if (std.mem.indexOf(u8, g.full_path_search_text_lower.items, term) != null) {
+            if (std.mem.find(u8, g.full_path_search_text_lower.items, term) != null) {
                 points += 2;
                 continue;
             }
-            if (std.mem.indexOf(u8, g.doc_search_text.items, term) != null) {
+            if (std.mem.find(u8, g.doc_search_text.items, term) != null) {
                 points += 1;
                 continue;
             }
@@ -162,7 +165,7 @@ fn query_exec_fallible(query: []const u8, ignore_case: bool) !void {
         }
 
         if (query_results.items.len < max_matched_items or bypass_limit) {
-            try query_results.append(gpa, @enumFromInt(decl_index));
+            try query_results.append(gpa, @fromBackingInt(@intCast(decl_index)));
             try g.scores.append(gpa, .{
                 .points = points,
                 .segments = @intCast(count_scalar(g.full_path_search_text.items, '.')),
@@ -234,7 +237,7 @@ const ErrorIdentifier = packed struct(u64) {
         return ast.tokenTag(token_index - 1) == .doc_comment;
     }
 
-    fn html(ei: ErrorIdentifier, base_decl: Decl.Index, out: *std.ArrayListUnmanaged(u8)) Oom!void {
+    fn html(ei: ErrorIdentifier, base_decl: Decl.Index, out: *ArrayList(u8)) Oom!void {
         const decl_index = ei.decl_index;
         const ast = decl_index.get().file.get_ast();
         const name = ast.tokenSlice(ei.token_index);
@@ -260,8 +263,8 @@ const ErrorIdentifier = packed struct(u64) {
     }
 };
 
-var string_result: std.ArrayListUnmanaged(u8) = .empty;
-var error_set_result: std.StringArrayHashMapUnmanaged(ErrorIdentifier) = .empty;
+var string_result: ArrayList(u8) = .empty;
+var error_set_result: std.array_hash_map.String(ErrorIdentifier) = .empty;
 
 export fn decl_error_set(decl_index: Decl.Index) Slice(ErrorIdentifier) {
     return Slice(ErrorIdentifier).init(decl_error_set_fallible(decl_index) catch @panic("OOM"));
@@ -302,7 +305,7 @@ fn sort_error_set_result() void {
 
 fn addErrorsFromDecl(
     decl_index: Decl.Index,
-    out: *std.StringArrayHashMapUnmanaged(ErrorIdentifier),
+    out: *std.array_hash_map.String(ErrorIdentifier),
 ) Oom!void {
     switch (decl_index.get().categorize()) {
         .error_set => |node| try addErrorsFromExpr(decl_index, out, node),
@@ -313,7 +316,7 @@ fn addErrorsFromDecl(
 
 fn addErrorsFromExpr(
     decl_index: Decl.Index,
-    out: *std.StringArrayHashMapUnmanaged(ErrorIdentifier),
+    out: *std.array_hash_map.String(ErrorIdentifier),
     node: Ast.Node.Index,
 ) Oom!void {
     const decl = decl_index.get();
@@ -340,7 +343,7 @@ fn addErrorsFromExpr(
 
 fn addErrorsFromNode(
     decl_index: Decl.Index,
-    out: *std.StringArrayHashMapUnmanaged(ErrorIdentifier),
+    out: *std.array_hash_map.String(ErrorIdentifier),
     node: Ast.Node.Index,
 ) Oom!void {
     const decl = decl_index.get();
@@ -411,7 +414,7 @@ fn decl_fields_fallible(decl_index: Decl.Index) ![]Ast.Node.Index {
 
 fn ast_decl_fields_fallible(ast: *Ast, ast_index: Ast.Node.Index) ![]Ast.Node.Index {
     const g = struct {
-        var result: std.ArrayListUnmanaged(Ast.Node.Index) = .empty;
+        var result: ArrayList(Ast.Node.Index) = .empty;
     };
     g.result.clearRetainingCapacity();
     var buf: [2]Ast.Node.Index = undefined;
@@ -429,7 +432,7 @@ fn ast_decl_fields_fallible(ast: *Ast, ast_index: Ast.Node.Index) ![]Ast.Node.In
 
 fn decl_params_fallible(decl_index: Decl.Index) ![]Ast.Node.Index {
     const g = struct {
-        var result: std.ArrayListUnmanaged(Ast.Node.Index) = .empty;
+        var result: ArrayList(Ast.Node.Index) = .empty;
     };
     g.result.clearRetainingCapacity();
     const decl = decl_index.get();
@@ -460,7 +463,7 @@ export fn decl_param_html(decl_index: Decl.Index, param_node: Ast.Node.Index) St
 }
 
 fn decl_field_html_fallible(
-    out: *std.ArrayListUnmanaged(u8),
+    out: *ArrayList(u8),
     decl_index: Decl.Index,
     field_node: Ast.Node.Index,
 ) !void {
@@ -480,7 +483,7 @@ fn decl_field_html_fallible(
 }
 
 fn decl_param_html_fallible(
-    out: *std.ArrayListUnmanaged(u8),
+    out: *ArrayList(u8),
     decl_index: Decl.Index,
     param_node: Ast.Node.Index,
 ) !void {
@@ -537,6 +540,16 @@ export fn decl_fn_proto_html(decl_index: Decl.Index, linkify_fn_name: bool) Stri
         .fn_link = if (linkify_fn_name) decl_index else .none,
     }) catch |err| {
         std.debug.panic("unable to render source: {s}", .{@errorName(err)});
+    };
+    return String.init(string_result.items);
+}
+
+export fn decl_line_numbers_html(decl_index: Decl.Index) String {
+    const decl = decl_index.get();
+
+    string_result.clearRetainingCapacity();
+    fileSourceLineNumbersHtml(decl.file, &string_result, decl.ast_node) catch |err| {
+        std.debug.panic("unable to render source line numbers: {s}", .{@errorName(err)});
     };
     return String.init(string_result.items);
 }
@@ -649,7 +662,7 @@ export fn decl_docs_html(decl_index: Decl.Index, short: bool) String {
 }
 
 fn collect_docs(
-    list: *std.ArrayListUnmanaged(u8),
+    list: *ArrayList(u8),
     ast: *const Ast,
     first_doc_comment: Ast.TokenIndex,
 ) Oom!void {
@@ -667,7 +680,7 @@ fn collect_docs(
 }
 
 fn render_docs(
-    out: *std.ArrayListUnmanaged(u8),
+    out: *ArrayList(u8),
     decl_index: Decl.Index,
     first_doc_comment: Ast.TokenIndex,
     short: bool,
@@ -691,11 +704,10 @@ fn render_docs(
     defer parsed_doc.deinit(gpa);
 
     const g = struct {
-        var link_buffer: std.ArrayListUnmanaged(u8) = .empty;
+        var link_buffer: ArrayList(u8) = .empty;
     };
 
-    const Writer = std.ArrayListUnmanaged(u8).Writer;
-    const Renderer = markdown.Renderer(Writer, Decl.Index);
+    const Renderer = markdown.Renderer(Decl.Index);
     const renderer: Renderer = .{
         .context = decl_index,
         .renderFn = struct {
@@ -703,16 +715,16 @@ fn render_docs(
                 r: Renderer,
                 doc: markdown.Document,
                 node: markdown.Document.Node.Index,
-                writer: Writer,
-            ) !void {
-                const data = doc.nodes.items(.data)[@intFromEnum(node)];
-                switch (doc.nodes.items(.tag)[@intFromEnum(node)]) {
+                writer: *Writer,
+            ) Writer.Error!void {
+                const data = doc.nodes.items(.data)[@backingInt(node)];
+                switch (doc.nodes.items(.tag)[@backingInt(node)]) {
                     .code_span => {
                         try writer.writeAll("<code>");
                         const content = doc.string(data.text.content);
                         if (resolve_decl_path(r.context, content)) |resolved_decl_index| {
                             g.link_buffer.clearRetainingCapacity();
-                            try resolveDeclLink(resolved_decl_index, &g.link_buffer);
+                            resolveDeclLink(resolved_decl_index, &g.link_buffer) catch return error.WriteFailed;
 
                             try writer.writeAll("<a href=\"#");
                             _ = missing_feature_url_escape;
@@ -730,7 +742,12 @@ fn render_docs(
             }
         }.render,
     };
-    try renderer.render(parsed_doc, out.writer(gpa));
+
+    var allocating = Writer.Allocating.fromArrayList(gpa, out);
+    defer out.* = allocating.toArrayList();
+    renderer.render(parsed_doc, &allocating.writer) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+    };
 }
 
 fn resolve_decl_path(decl_index: Decl.Index, path: []const u8) ?Decl.Index {
@@ -786,10 +803,10 @@ fn unpackInner(tar_bytes: []u8) !void {
                 if (std.mem.endsWith(u8, tar_file.name, ".zig")) {
                     log.debug("found file: '{s}'", .{tar_file.name});
                     const file_name = try gpa.dupe(u8, tar_file.name);
-                    if (std.mem.indexOfScalar(u8, file_name, '/')) |pkg_name_end| {
+                    if (std.mem.findScalar(u8, file_name, '/')) |pkg_name_end| {
                         const pkg_name = file_name[0..pkg_name_end];
                         const gop = try Walk.modules.getOrPut(gpa, pkg_name);
-                        const file: Walk.File.Index = @enumFromInt(Walk.files.entries.len);
+                        const file: Walk.File.Index = @fromBackingInt(@intCast(Walk.files.entries.len));
                         if (!gop.found_existing or
                             std.mem.eql(u8, file_name[pkg_name_end..], "/root.zig") or
                             std.mem.eql(u8, file_name[pkg_name_end + 1 .. file_name.len - ".zig".len], pkg_name))
@@ -820,14 +837,14 @@ export fn module_name(index: u32) String {
 }
 
 export fn find_module_root(pkg: Walk.ModuleIndex) Decl.Index {
-    const root_file = Walk.modules.values()[@intFromEnum(pkg)];
+    const root_file = Walk.modules.values()[@backingInt(pkg)];
     const result = root_file.findRootDecl();
     assert(result != .none);
     return result;
 }
 
 /// Set by `set_input_string`.
-var input_string: std.ArrayListUnmanaged(u8) = .empty;
+var input_string: ArrayList(u8) = .empty;
 
 export fn set_input_string(len: usize) [*]u8 {
     input_string.resize(gpa, len) catch @panic("OOM");
@@ -837,7 +854,7 @@ export fn set_input_string(len: usize) [*]u8 {
 /// Looks up the root struct decl corresponding to a file by path.
 /// Uses `input_string`.
 export fn find_file_root() Decl.Index {
-    const file: Walk.File.Index = @enumFromInt(Walk.files.getIndex(input_string.items) orelse return .none);
+    const file: Walk.File.Index = @fromBackingInt(@intCast(Walk.files.getIndex(input_string.items) orelse return .none));
     return file.findRootDecl();
 }
 
@@ -849,7 +866,7 @@ export fn find_decl() Decl.Index {
     if (result != .none) return result;
 
     const g = struct {
-        var match_fqn: std.ArrayListUnmanaged(u8) = .empty;
+        var match_fqn: ArrayList(u8) = .empty;
     };
     for (Walk.decls.items, 0..) |*decl, decl_index| {
         g.match_fqn.clearRetainingCapacity();
@@ -857,7 +874,7 @@ export fn find_decl() Decl.Index {
         if (std.mem.eql(u8, g.match_fqn.items, input_string.items)) {
             //const path = @as(Decl.Index, @enumFromInt(decl_index)).get().file.path();
             //log.debug("find_decl '{s}' found in {s}", .{ input_string.items, path });
-            return @enumFromInt(decl_index);
+            return @fromBackingInt(@intCast(decl_index));
         }
     }
     return .none;
@@ -905,7 +922,7 @@ export fn type_fn_members(parent: Decl.Index, include_private: bool) Slice(Decl.
 
 export fn namespace_members(parent: Decl.Index, include_private: bool) Slice(Decl.Index) {
     const g = struct {
-        var members: std.ArrayListUnmanaged(Decl.Index) = .empty;
+        var members: ArrayList(Decl.Index) = .empty;
     };
 
     g.members.clearRetainingCapacity();
@@ -913,7 +930,7 @@ export fn namespace_members(parent: Decl.Index, include_private: bool) Slice(Dec
     for (Walk.decls.items, 0..) |*decl, i| {
         if (decl.parent == parent) {
             if (include_private or decl.is_pub()) {
-                g.members.append(gpa, @enumFromInt(i)) catch @panic("OOM");
+                g.members.append(gpa, @fromBackingInt(@intCast(i))) catch @panic("OOM");
             }
         }
     }

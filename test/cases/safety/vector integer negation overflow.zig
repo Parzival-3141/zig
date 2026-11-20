@@ -18,5 +18,5 @@ fn neg(a: @Vector(4, i16)) @Vector(4, i16) {
     return -a;
 }
 // run
-// backend=stage2,llvm
-// target=x86_64-linux
+// backend=selfhosted,llvm
+// target=x86_64-linux,wasm32-wasi

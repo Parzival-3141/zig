@@ -1,41 +1,47 @@
-const expect = @import("std").testing.expect;
+const expectEqual = @import("std").testing.expectEqual;
 
 test "for basics" {
-    const items = [_]i32{ 4, 5, 3, 4, 0 };
+    const items = [_]i32{ 4, 5, 3, -1, 4 };
     var sum: i32 = 0;
 
     // For loops iterate over slices and arrays.
     for (items) |value| {
         // Break and continue are supported.
-        if (value == 0) {
+        if (value < 0) {
             continue;
         }
         sum += value;
     }
-    try expect(sum == 16);
+    try expectEqual(16, sum);
 
-    // To iterate over a portion of a slice, reslice.
-    for (items[0..1]) |value| {
+    // Use slicing to iterate over a portion of a slice or array.
+    sum = 0;
+    for (items[0..2]) |value| {
         sum += value;
     }
-    try expect(sum == 20);
+    try expectEqual(9, sum);
+}
 
-    // To access the index of iteration, specify a second condition as well
-    // as a second capture value.
-    var sum2: i32 = 0;
-    for (items, 0..) |_, i| {
-        try expect(@TypeOf(i) == usize);
-        sum2 += @as(i32, @intCast(i));
+test "for ranges" {
+    const items = [_]u8{1, 2, 3};
+    var sum: usize = 0;
+
+    // To access the index of iteration, specify an unbounded range as the
+    // second condition, as well as a second capture value.
+    for (items, 0..) |e, i| {
+        try expectEqual(usize, @TypeOf(i));
+        sum += i; 
+        try expectEqual(e, i + 1);
     }
-    try expect(sum2 == 10);
+    try expectEqual(3, sum); // 0 + 1 + 2
 
-    // To iterate over consecutive integers, use the range syntax.
-    // Unbounded range is always a compile error.
-    var sum3: usize = 0;
+    // To iterate over consecutive integers, use bounded range syntax.
+    // A lone unbounded range is a compile error.
+    sum = 0;
     for (0..5) |i| {
-        sum3 += i;
+        sum += i;
     }
-    try expect(sum3 == 10);
+    try expectEqual(10, sum);
 }
 
 test "multi object for" {
@@ -44,13 +50,13 @@ test "multi object for" {
     var count: usize = 0;
 
     // Iterate over multiple objects.
-    // All lengths must be equal at the start of the loop, otherwise detectable
-    // illegal behavior occurs.
+    // All bounded objects must have equal lengths.
+    // There must be at least one bounded object.
     for (items, items2) |i, j| {
         count += i + j;
     }
 
-    try expect(count == 21);
+    try expectEqual(21, count);
 }
 
 test "for reference" {
@@ -62,27 +68,29 @@ test "for reference" {
         value.* += 1;
     }
 
-    try expect(items[0] == 4);
-    try expect(items[1] == 5);
-    try expect(items[2] == 3);
+    try expectEqual(4, items[0]);
+    try expectEqual(5, items[1]);
+    try expectEqual(3, items[2]);
 }
 
 test "for else" {
     // For allows an else attached to it, the same as a while loop.
-    const items = [_]?i32{ 3, 4, null, 5 };
+    // The else branch is evaluated when the loop completes without a break.
+    const items = [_]i32{ 3, 4, 5 };
 
-    // For loops can also be used as expressions.
-    // Similar to while loops, when you break from a for loop, the else branch is not evaluated.
-    var sum: i32 = 0;
     const result = for (items) |value| {
-        if (value != null) {
-            sum += value.?;
-        }
-    } else blk: {
-        try expect(sum == 12);
-        break :blk sum;
-    };
-    try expect(result == 12);
+        if (value > 10) break value;
+    } else 0;
+
+    try expectEqual(0, result);
+
+    const more_items = [_]i32{ 3, 4, 11, 5 };
+
+    const another_result = for (more_items) |value| {
+        if (value > 10) break value;
+    } else 0;
+
+    try expectEqual(11, another_result);
 }
 
 // test

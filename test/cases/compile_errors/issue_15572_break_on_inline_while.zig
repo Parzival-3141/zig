@@ -6,15 +6,14 @@ pub const DwarfSection = enum {
 };
 
 pub fn main() void {
-    const section = inline for (@typeInfo(DwarfSection).@"enum".fields) |section| {
-        if (std.mem.eql(u8, section.name, "eh_frame")) break section;
+    const section = inline for (@typeInfo(DwarfSection).@"enum".field_names) |section_name| {
+        if (std.mem.eql(u8, section_name, "eh_frame")) break section_name;
     };
 
     _ = section;
 }
 
 // error
-// backend=stage2
 // target=x86_64-linux
 //
-// :9:28: error: incompatible types: 'builtin.Type.EnumField' and 'void'
+// :9:28: error: incompatible types: '[:0]const u8' and 'void'

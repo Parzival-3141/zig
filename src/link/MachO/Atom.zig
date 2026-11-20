@@ -129,9 +129,9 @@ const AddExtraOpts = struct {
 pub fn addExtra(atom: *Atom, opts: AddExtraOpts, macho_file: *MachO) void {
     const file = atom.getFile(macho_file);
     var extra = file.getAtomExtra(atom.extra);
-    inline for (@typeInfo(@TypeOf(opts)).@"struct".fields) |field| {
-        if (@field(opts, field.name)) |x| {
-            @field(extra, field.name) = x;
+    inline for (@typeInfo(@TypeOf(opts)).@"struct".field_names) |field_name| {
+        if (@field(opts, field_name)) |x| {
+            @field(extra, field_name) = x;
         }
     }
     file.setAtomExtra(atom.extra, extra);
@@ -555,12 +555,13 @@ fn reportUndefSymbol(self: Atom, rel: Relocation, macho_file: *MachO) !bool {
     const file = self.getFile(macho_file);
     const ref = file.getSymbolRef(rel.target, macho_file);
     if (ref.getFile(macho_file) == null) {
-        macho_file.undefs_mutex.lock();
-        defer macho_file.undefs_mutex.unlock();
         const gpa = macho_file.base.comp.gpa;
+        const io = macho_file.base.comp.io;
+        macho_file.undefs_mutex.lockUncancelable(io);
+        defer macho_file.undefs_mutex.unlock(io);
         const gop = try macho_file.undefs.getOrPut(gpa, file.getGlobals()[rel.target]);
         if (!gop.found_existing) {
-            gop.value_ptr.* = .{ .refs = .{} };
+            gop.value_ptr.* = .{ .refs = .empty };
         }
         try gop.value_ptr.refs.append(gpa, .{ .index = self.atom_index, .file = self.file });
         return true;
@@ -581,19 +582,19 @@ pub fn resolveRelocs(self: Atom, macho_file: *MachO, buffer: []u8) !void {
     relocs_log.debug("{x}: {s}", .{ self.value, name });
 
     var has_error = false;
-    var stream = std.io.fixedBufferStream(buffer);
+    var stream: Writer = .fixed(buffer);
     var i: usize = 0;
     while (i < relocs.len) : (i += 1) {
         const rel = relocs[i];
-        const rel_offset = rel.offset - self.off;
+        const rel_offset: usize = @intCast(rel.offset - self.off);
         const subtractor = if (rel.meta.has_subtractor) relocs[i - 1] else null;
 
         if (rel.tag == .@"extern") {
             if (rel.getTargetSymbol(self, macho_file).getFile(macho_file) == null) continue;
         }
 
-        try stream.seekTo(rel_offset);
-        self.resolveRelocInner(rel, subtractor, buffer, macho_file, stream.writer()) catch |err| {
+        stream.end = rel_offset;
+        self.resolveRelocInner(rel, subtractor, buffer, macho_file, &stream) catch |err| {
             switch (err) {
                 error.RelaxFail => {
                     const target = switch (rel.tag) {
@@ -630,6 +631,7 @@ const ResolveError = error{
     UnexpectedRemainder,
     Overflow,
     OutOfMemory,
+    WriteFailed,
 };
 
 fn resolveRelocInner(
@@ -638,7 +640,7 @@ fn resolveRelocInner(
     subtractor: ?Relocation,
     code: []u8,
     macho_file: *MachO,
-    writer: anytype,
+    writer: *Writer,
 ) ResolveError!void {
     const t = &macho_file.base.comp.root_mod.resolved_target.result;
     const cpu_arch = t.cpu.arch;
@@ -795,8 +797,8 @@ fn resolveRelocInner(
                 .data_processing_immediate => aarch64.writeAddImmInst(@truncate(target), inst_code),
                 .load_store => |load_store| {
                     inst.load_store.register_unsigned_immediate.group.imm12 = switch (load_store.register_unsigned_immediate.decode()) {
-                        .integer => |integer| try divExact(self, rel, @truncate(target), @as(u4, 1) << @intFromEnum(integer.group.size), macho_file),
-                        .vector => |vector| try divExact(self, rel, @truncate(target), @as(u5, 1) << @intFromEnum(vector.group.opc1.decode(vector.group.size)), macho_file),
+                        .integer => |integer| try divExact(self, rel, @truncate(target), @as(u4, 1) << @backingInt(integer.group.size), macho_file),
+                        .vector => |vector| try divExact(self, rel, @truncate(target), @as(u5, 1) << @backingInt(vector.group.opc1.decode(vector.group.size)), macho_file),
                     };
                     try writer.writeInt(u32, @bitCast(inst), .little);
                 },
@@ -851,7 +853,7 @@ fn resolveRelocInner(
 
 const x86_64 = struct {
     fn relaxGotLoad(self: Atom, code: []u8, rel: Relocation, macho_file: *MachO) ResolveError!void {
-        dev.check(.x86_64_backend);
+        dev.checkAny(&.{ .llvm_backend, .x86_64_backend });
         const t = &macho_file.base.comp.root_mod.resolved_target.result;
         const diags = &macho_file.base.comp.link_diags;
         const old_inst = disassemble(code) orelse return error.RelaxFail;
@@ -877,7 +879,7 @@ const x86_64 = struct {
     }
 
     fn relaxTlv(code: []u8, t: *const std.Target) error{RelaxFail}!void {
-        dev.check(.x86_64_backend);
+        dev.checkAny(&.{ .llvm_backend, .x86_64_backend });
         const old_inst = disassemble(code) orelse return error.RelaxFail;
         switch (old_inst.encoding.mnemonic) {
             .mov => {
@@ -900,9 +902,9 @@ const x86_64 = struct {
         for (insts) |inst| try inst.encode(&stream, .{});
     }
 
-    const bits = @import("../../arch/x86_64/bits.zig");
-    const encoder = @import("../../arch/x86_64/encoder.zig");
-    const Disassembler = @import("../../arch/x86_64/Disassembler.zig");
+    const bits = @import("../../codegen/x86_64/bits.zig");
+    const encoder = @import("../../codegen/x86_64/encoder.zig");
+    const Disassembler = @import("../../codegen/x86_64/Disassembler.zig");
     const Immediate = bits.Immediate;
     const Instruction = encoder.Instruction;
 };
@@ -928,7 +930,7 @@ pub fn calcNumRelocs(self: Atom, macho_file: *MachO) u32 {
     }
 }
 
-pub fn writeRelocs(self: Atom, macho_file: *MachO, code: []u8, buffer: []macho.relocation_info) error{ LinkFailure, OutOfMemory }!void {
+pub fn writeRelocs(self: Atom, macho_file: *MachO, code: []u8, buffer: []macho.relocation_info) error{ AlreadyReported, OutOfMemory }!void {
     const tracy = trace(@src());
     defer tracy.end();
 
@@ -988,7 +990,7 @@ pub fn writeRelocs(self: Atom, macho_file: *MachO, code: []u8, buffer: []macho.r
                         .r_pcrel = 0,
                         .r_length = 2,
                         .r_extern = 0,
-                        .r_type = @intFromEnum(macho.reloc_type_arm64.ARM64_RELOC_ADDEND),
+                        .r_type = @backingInt(macho.reloc_type_arm64.ARM64_RELOC_ADDEND),
                     };
                     i += 1;
                 }
@@ -1019,7 +1021,7 @@ pub fn writeRelocs(self: Atom, macho_file: *MachO, code: []u8, buffer: []macho.r
                     .r_pcrel = @intFromBool(rel.meta.pcrel),
                     .r_extern = @intFromBool(r_extern),
                     .r_length = rel.meta.length,
-                    .r_type = @intFromEnum(r_type),
+                    .r_type = @backingInt(r_type),
                 };
             },
             .x86_64 => {
@@ -1062,7 +1064,7 @@ pub fn writeRelocs(self: Atom, macho_file: *MachO, code: []u8, buffer: []macho.r
                     .r_pcrel = @intFromBool(rel.meta.pcrel),
                     .r_extern = @intFromBool(r_extern),
                     .r_length = rel.meta.length,
-                    .r_type = @intFromEnum(r_type),
+                    .r_type = @backingInt(r_type),
                 };
             },
             else => unreachable,
@@ -1072,7 +1074,7 @@ pub fn writeRelocs(self: Atom, macho_file: *MachO, code: []u8, buffer: []macho.r
     assert(i == buffer.len);
 }
 
-pub fn fmt(atom: Atom, macho_file: *MachO) std.fmt.Formatter(Format, Format.print) {
+pub fn fmt(atom: Atom, macho_file: *MachO) std.fmt.Alt(Format, Format.print) {
     return .{ .data = .{
         .atom = atom,
         .macho_file = macho_file,
@@ -1147,7 +1149,7 @@ const math = std.math;
 const mem = std.mem;
 const log = std.log.scoped(.link);
 const relocs_log = std.log.scoped(.link_relocs);
-const Writer = std.io.Writer;
+const Writer = std.Io.Writer;
 const Allocator = mem.Allocator;
 const AtomicBool = std.atomic.Value(bool);
 

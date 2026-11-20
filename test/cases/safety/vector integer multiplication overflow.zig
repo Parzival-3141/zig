@@ -18,5 +18,5 @@ fn mul(a: @Vector(4, u8), b: @Vector(4, u8)) @Vector(4, u8) {
     return a * b;
 }
 // run
-// backend=stage2,llvm
-// target=x86_64-linux
+// backend=selfhosted,llvm
+// target=x86_64-linux,wasm32-wasi

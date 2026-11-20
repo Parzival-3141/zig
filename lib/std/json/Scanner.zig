@@ -1401,7 +1401,7 @@ pub fn validate(allocator: Allocator, s: []const u8) Allocator.Error!bool {
     while (true) {
         const token = scanner.next() catch |err| switch (err) {
             error.SyntaxError, error.UnexpectedEndOfInput => return false,
-            error.OutOfMemory => return error.OutOfMemory,
+            error.OutOfMemory => |e| return e,
             error.BufferUnderrun => unreachable,
         };
         if (token == .end_of_document) break;
@@ -1734,7 +1734,7 @@ pub const Reader = struct {
 
     fn refillBuffer(self: *@This()) std.Io.Reader.Error!void {
         const input = self.reader.peekGreedy(1) catch |err| switch (err) {
-            error.ReadFailed => return error.ReadFailed,
+            error.ReadFailed => |e| return e,
             error.EndOfStream => return self.scanner.endInput(),
         };
         self.reader.toss(input.len);
@@ -1758,7 +1758,7 @@ fn appendSlice(list: *std.array_list.Managed(u8), buf: []const u8, max_value_len
 /// This function will not give meaningful results on non-numeric input.
 pub fn isNumberFormattedLikeAnInteger(value: []const u8) bool {
     if (std.mem.eql(u8, value, "-0")) return false;
-    return std.mem.indexOfAny(u8, value, ".eE") == null;
+    return std.mem.findAny(u8, value, ".eE") == null;
 }
 
 test {

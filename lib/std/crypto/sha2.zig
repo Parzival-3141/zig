@@ -211,7 +211,7 @@ fn Sha2x32(comptime iv: Iv32, digest_bits: comptime_int) type {
                                 s_v[k] = asm (
                                     \\sha256su0.4s %[w0_3], %[w4_7]
                                     \\sha256su1.4s %[w0_3], %[w8_11], %[w12_15]
-                                    : [w0_3] "=w" (-> V4u32),
+                                    : [w0_3] "=&w" (-> V4u32),
                                     : [_] "0" (s_v[k - 4]),
                                       [w4_7] "w" (s_v[k - 3]),
                                       [w8_11] "w" (s_v[k - 2]),
@@ -373,18 +373,6 @@ fn Sha2x32(comptime iv: Iv32, digest_bits: comptime_int) type {
 
             for (&d.s, v) |*dv, vv| dv.* +%= vv;
         }
-
-        pub const Error = error{};
-        pub const Writer = std.io.GenericWriter(*Self, Error, write);
-
-        fn write(self: *Self, bytes: []const u8) Error!usize {
-            self.update(bytes);
-            return bytes.len;
-        }
-
-        pub fn writer(self: *Self) Writer {
-            return .{ .context = self };
-        }
     };
 }
 
@@ -473,7 +461,7 @@ test "sha256 streaming" {
 }
 
 test "sha256 aligned final" {
-    var block = [_]u8{0} ** Sha256.block_length;
+    var block: [Sha256.block_length]u8 = @splat(0);
     var out: [Sha256.digest_length]u8 = undefined;
 
     var h = Sha256.init(.{});
@@ -486,7 +474,7 @@ fn Sha2x64(comptime iv: Iv64, digest_bits: comptime_int) type {
     return struct {
         const Self = @This();
         pub const block_length = 128;
-        pub const digest_length = std.math.divCeil(comptime_int, digest_bits, 8) catch unreachable;
+        pub const digest_length = @divCeil(digest_bits, 8);
         pub const Options = struct {};
 
         s: Iv64,
@@ -845,7 +833,7 @@ test "sha512 streaming" {
 }
 
 test "sha512 aligned final" {
-    var block = [_]u8{0} ** Sha512.block_length;
+    var block: [Sha512.block_length]u8 = @splat(0);
     var out: [Sha512.digest_length]u8 = undefined;
 
     var h = Sha512.init(.{});

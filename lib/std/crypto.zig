@@ -31,9 +31,25 @@ pub const aead = struct {
         pub const Aes256Gcm = @import("crypto/aes_gcm.zig").Aes256Gcm;
     };
 
+    pub const aes_gcm_siv = struct {
+        pub const Aes128GcmSiv = @import("crypto/aes_gcm_siv.zig").Aes128GcmSiv;
+        pub const Aes256GcmSiv = @import("crypto/aes_gcm_siv.zig").Aes256GcmSiv;
+    };
+
+    pub const aes_siv = struct {
+        pub const Aes128Siv = @import("crypto/aes_siv.zig").Aes128Siv;
+        pub const Aes256Siv = @import("crypto/aes_siv.zig").Aes256Siv;
+    };
+
     pub const aes_ocb = struct {
         pub const Aes128Ocb = @import("crypto/aes_ocb.zig").Aes128Ocb;
         pub const Aes256Ocb = @import("crypto/aes_ocb.zig").Aes256Ocb;
+    };
+
+    pub const aes_ccm = @import("crypto/aes_ccm.zig");
+
+    pub const ascon = struct {
+        pub const AsconAead128 = @import("crypto/ascon.zig").AsconAead128;
     };
 
     pub const chacha_poly = struct {
@@ -75,6 +91,7 @@ pub const auth = struct {
         pub const Aegis256Mac_128 = variants.Aegis256Mac_128;
     };
     pub const cmac = @import("crypto/cmac.zig");
+    pub const cbc_mac = @import("crypto/cbc_mac.zig");
 };
 
 /// Core functions, that should rarely be used directly by applications.
@@ -99,6 +116,7 @@ pub const dh = struct {
 
 /// Key Encapsulation Mechanisms.
 pub const kem = struct {
+    pub const hybrid = @import("crypto/hybrid_kem.zig");
     pub const kyber_d00 = @import("crypto/ml_kem.zig").d00;
     pub const ml_kem = @import("crypto/ml_kem.zig").nist;
 };
@@ -115,6 +133,12 @@ pub const ecc = struct {
 
 /// Hash functions.
 pub const hash = struct {
+    pub const ascon = struct {
+        const variants = @import("crypto/ascon.zig");
+        pub const AsconHash256 = variants.AsconHash256;
+        pub const AsconXof128 = variants.AsconXof128;
+        pub const AsconCxof128 = variants.AsconCxof128;
+    };
     pub const blake2 = @import("crypto/blake2.zig");
     pub const Blake3 = @import("crypto/blake3.zig").Blake3;
     pub const Md5 = @import("crypto/md5.zig").Md5;
@@ -160,7 +184,7 @@ pub const pwhash = struct {
 
     pub const Error = HasherError || error{AllocatorRequired};
     pub const HasherError = KdfError || phc_format.Error;
-    pub const KdfError = errors.Error || std.mem.Allocator.Error || std.Thread.SpawnError;
+    pub const KdfError = errors.Error || std.mem.Allocator.Error || std.Thread.SpawnError || std.Io.Cancelable;
 
     pub const argon2 = @import("crypto/argon2.zig");
     pub const bcrypt = @import("crypto/bcrypt.zig");
@@ -174,6 +198,7 @@ pub const pwhash = struct {
 pub const sign = struct {
     pub const Ed25519 = @import("crypto/25519/ed25519.zig").Ed25519;
     pub const ecdsa = @import("crypto/ecdsa.zig");
+    pub const mldsa = @import("crypto/ml_dsa.zig");
 };
 
 /// Stream ciphers. These do not provide any kind of authentication.
@@ -210,9 +235,6 @@ pub const nacl = struct {
 /// Finite-field arithmetic.
 pub const ff = @import("crypto/ff.zig");
 
-/// This is a thread-local, cryptographically secure pseudo random number generator.
-pub const random = @import("crypto/tlcsprng.zig").interface;
-
 /// Encoding and decoding
 pub const codecs = @import("crypto/codecs.zig");
 
@@ -243,14 +265,24 @@ pub const SideChannelsMitigations = enum {
 pub const default_side_channels_mitigations = .medium;
 
 test {
+    _ = aead.ascon.AsconAead128;
+
     _ = aead.aegis.Aegis128L;
     _ = aead.aegis.Aegis256;
 
     _ = aead.aes_gcm.Aes128Gcm;
     _ = aead.aes_gcm.Aes256Gcm;
 
+    _ = aead.aes_gcm_siv.Aes128GcmSiv;
+    _ = aead.aes_gcm_siv.Aes256GcmSiv;
+
+    _ = aead.aes_siv.Aes128Siv;
+    _ = aead.aes_siv.Aes256Siv;
+
     _ = aead.aes_ocb.Aes128Ocb;
     _ = aead.aes_ocb.Aes256Ocb;
+
+    _ = aead.aes_ccm;
 
     _ = aead.chacha_poly.ChaCha20Poly1305;
     _ = aead.chacha_poly.ChaCha12Poly1305;
@@ -264,6 +296,7 @@ test {
 
     _ = auth.hmac;
     _ = auth.cmac;
+    _ = auth.cbc_mac;
     _ = auth.siphash;
 
     _ = core.aes;
@@ -273,6 +306,9 @@ test {
     _ = dh.X25519;
 
     _ = kem.kyber_d00;
+    _ = kem.hybrid;
+    _ = kem.kyber_d00;
+    _ = kem.ml_kem;
 
     _ = ecc.Curve25519;
     _ = ecc.Edwards25519;
@@ -281,6 +317,7 @@ test {
     _ = ecc.Ristretto255;
     _ = ecc.Secp256k1;
 
+    _ = hash.ascon;
     _ = hash.blake2;
     _ = hash.Blake3;
     _ = hash.Md5;
@@ -309,6 +346,7 @@ test {
 
     _ = sign.Ed25519;
     _ = sign.ecdsa;
+    _ = sign.mldsa;
 
     _ = stream.chacha.ChaCha20IETF;
     _ = stream.chacha.ChaCha12IETF;
@@ -330,18 +368,11 @@ test {
     _ = secureZero;
     _ = timing_safe;
     _ = ff;
-    _ = random;
     _ = errors;
     _ = tls;
+    _ = tls.Client;
     _ = Certificate;
     _ = codecs;
-}
-
-test "CSPRNG" {
-    const a = random.int(u64);
-    const b = random.int(u64);
-    const c = random.int(u64);
-    try std.testing.expect(a ^ b ^ c != 0);
 }
 
 test "issue #4532: no index out of bounds" {
@@ -366,7 +397,7 @@ test "issue #4532: no index out of bounds" {
     };
 
     inline for (types) |Hasher| {
-        var block = [_]u8{'#'} ** Hasher.block_length;
+        var block: [Hasher.block_length]u8 = @splat('#');
         var out1: [Hasher.digest_length]u8 = undefined;
         var out2: [Hasher.digest_length]u8 = undefined;
         const h0 = Hasher.init(.{});
@@ -385,12 +416,12 @@ test "issue #4532: no index out of bounds" {
 /// Sets a slice to zeroes.
 /// Prevents the store from being optimized out.
 pub fn secureZero(comptime T: type, s: []volatile T) void {
-    @memset(s, 0);
+    @memset(s, std.mem.zeroes(T));
 }
 
 test secureZero {
-    var a = [_]u8{0xfe} ** 8;
-    var b = [_]u8{0xfe} ** 8;
+    var a: [8]u8 = @splat(0xFE);
+    var b: [8]u8 = @splat(0xFE);
 
     @memset(&a, 0);
     secureZero(u8, &b);

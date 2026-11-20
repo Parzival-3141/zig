@@ -1,5 +1,5 @@
 const std = @import("../../std.zig");
-const errno = linux.E.init;
+const errno = linux.errno;
 const unexpectedErrno = std.posix.unexpectedErrno;
 const expectEqual = std.testing.expectEqual;
 const expectError = std.testing.expectError;
@@ -57,6 +57,12 @@ pub const JEQ = 0x10;
 pub const JGT = 0x20;
 pub const JGE = 0x30;
 pub const JSET = 0x40;
+
+// misc fields
+/// copy A into X
+pub const TAX = 0x00;
+/// copy X into A
+pub const TXA = 0x80;
 
 //#define BPF_SRC(code)   ((code) & 0x08)
 pub const K = 0x00;
@@ -388,6 +394,76 @@ pub const Helper = enum(i32) {
     skc_to_tcp_request_sock,
     skc_to_udp6_sock,
     get_task_stack,
+    load_hdr_opt,
+    store_hdr_opt,
+    reserve_hdr_opt,
+    inode_storage_get,
+    inode_storage_delete,
+    d_path,
+    copy_from_user,
+    snprintf_btf,
+    seq_printf_btf,
+    skb_cgroup_classid,
+    redirect_neigh,
+    per_cpu_ptr,
+    this_cpu_ptr,
+    redirect_peer,
+    task_storage_get,
+    task_storage_delete,
+    get_current_task_btf,
+    bprm_opts_set,
+    ktime_get_coarse_ns,
+    ima_inode_hash,
+    sock_from_file,
+    check_mtu,
+    for_each_map_elem,
+    snprintf,
+    sys_bpf,
+    btf_find_by_name_kind,
+    sys_close,
+    timer_init,
+    timer_set_callback,
+    timer_start,
+    timer_cancel,
+    get_func_ip,
+    get_attach_cookie,
+    task_pt_regs,
+    get_branch_snapshot,
+    trace_vprintk,
+    skc_to_unix_sock,
+    kallsyms_lookup_name,
+    find_vma,
+    loop,
+    strncmp,
+    get_func_arg,
+    get_func_ret,
+    get_func_arg_cnt,
+    get_retval,
+    set_retval,
+    xdp_get_buff_len,
+    xdp_load_bytes,
+    xdp_store_bytes,
+    copy_from_user_task,
+    skb_set_tstamp,
+    ima_file_hash,
+    kptr_xchg,
+    map_lookup_percpu_elem,
+    skc_to_mptcp_sock,
+    dynptr_from_mem,
+    ringbuf_reserve_dynptr,
+    ringbuf_submit_dynptr,
+    ringbuf_discard_dynptr,
+    dynptr_read,
+    dynptr_write,
+    dynptr_data,
+    tcp_raw_gen_syncookie_ipv4,
+    tcp_raw_gen_syncookie_ipv6,
+    tcp_raw_check_syncookie_ipv4,
+    tcp_raw_check_syncookie_ipv6,
+    ktime_get_tai_ns,
+    user_ringbuf_drain,
+    cgrp_storage_get,
+    cgrp_storage_delete,
     _,
 };
 
@@ -471,10 +547,10 @@ pub const Insn = packed struct {
 
         return Insn{
             .code = code | src_type,
-            .dst = @intFromEnum(dst),
+            .dst = @backingInt(dst),
             .src = switch (imm_or_reg) {
                 .imm => 0,
-                .reg => |r| @intFromEnum(r),
+                .reg => |r| @backingInt(r),
             },
             .off = off,
             .imm = switch (imm_or_reg) {
@@ -491,7 +567,7 @@ pub const Insn = packed struct {
             else => @compileError("width must be 32 or 64"),
         };
 
-        return imm_reg(width_bitfield | @intFromEnum(op), dst, src, 0);
+        return imm_reg(width_bitfield | @backingInt(op), dst, src, 0);
     }
 
     pub fn mov(dst: Reg, src: anytype) Insn {
@@ -547,7 +623,7 @@ pub const Insn = packed struct {
     }
 
     pub fn jmp(op: JmpOp, dst: Reg, src: anytype, off: i16) Insn {
-        return imm_reg(JMP | @intFromEnum(op), dst, src, off);
+        return imm_reg(JMP | @backingInt(op), dst, src, off);
     }
 
     pub fn ja(off: i16) Insn {
@@ -601,8 +677,8 @@ pub const Insn = packed struct {
     pub fn xadd(dst: Reg, src: Reg) Insn {
         return Insn{
             .code = STX | XADD | DW,
-            .dst = @intFromEnum(dst),
-            .src = @intFromEnum(src),
+            .dst = @backingInt(dst),
+            .src = @backingInt(src),
             .off = 0,
             .imm = 0,
         };
@@ -610,9 +686,9 @@ pub const Insn = packed struct {
 
     fn ld(mode: Mode, size: Size, dst: Reg, src: Reg, imm: i32) Insn {
         return Insn{
-            .code = @intFromEnum(mode) | @intFromEnum(size) | LD,
-            .dst = @intFromEnum(dst),
-            .src = @intFromEnum(src),
+            .code = @backingInt(mode) | @backingInt(size) | LD,
+            .dst = @backingInt(dst),
+            .src = @backingInt(src),
             .off = 0,
             .imm = imm,
         };
@@ -628,9 +704,9 @@ pub const Insn = packed struct {
 
     pub fn ldx(size: Size, dst: Reg, src: Reg, off: i16) Insn {
         return Insn{
-            .code = MEM | @intFromEnum(size) | LDX,
-            .dst = @intFromEnum(dst),
-            .src = @intFromEnum(src),
+            .code = MEM | @backingInt(size) | LDX,
+            .dst = @backingInt(dst),
+            .src = @backingInt(src),
             .off = off,
             .imm = 0,
         };
@@ -639,8 +715,8 @@ pub const Insn = packed struct {
     fn ld_imm_impl1(dst: Reg, src: Reg, imm: u64) Insn {
         return Insn{
             .code = LD | DW | IMM,
-            .dst = @intFromEnum(dst),
-            .src = @intFromEnum(src),
+            .dst = @backingInt(dst),
+            .src = @backingInt(src),
             .off = 0,
             .imm = @as(i32, @bitCast(@as(u32, @truncate(imm)))),
         };
@@ -665,7 +741,7 @@ pub const Insn = packed struct {
     }
 
     pub fn ld_map_fd1(dst: Reg, map_fd: fd_t) Insn {
-        return ld_imm_impl1(dst, @as(Reg, @enumFromInt(PSEUDO_MAP_FD)), @as(u64, @intCast(map_fd)));
+        return ld_imm_impl1(dst, @as(Reg, @fromBackingInt(@intCast(PSEUDO_MAP_FD))), @as(u64, @intCast(map_fd)));
     }
 
     pub fn ld_map_fd2(map_fd: fd_t) Insn {
@@ -674,8 +750,8 @@ pub const Insn = packed struct {
 
     pub fn st(size: Size, dst: Reg, off: i16, imm: i32) Insn {
         return Insn{
-            .code = MEM | @intFromEnum(size) | ST,
-            .dst = @intFromEnum(dst),
+            .code = MEM | @backingInt(size) | ST,
+            .dst = @backingInt(dst),
             .src = 0,
             .off = off,
             .imm = imm,
@@ -684,9 +760,9 @@ pub const Insn = packed struct {
 
     pub fn stx(size: Size, dst: Reg, off: i16, src: Reg) Insn {
         return Insn{
-            .code = MEM | @intFromEnum(size) | STX,
-            .dst = @intFromEnum(dst),
-            .src = @intFromEnum(src),
+            .code = MEM | @backingInt(size) | STX,
+            .dst = @backingInt(dst),
+            .src = @backingInt(src),
             .off = off,
             .imm = 0,
         };
@@ -698,7 +774,7 @@ pub const Insn = packed struct {
                 .big => 0xdc,
                 .little => 0xd4,
             },
-            .dst = @intFromEnum(dst),
+            .dst = @backingInt(dst),
             .src = 0,
             .off = 0,
             .imm = switch (size) {
@@ -724,7 +800,7 @@ pub const Insn = packed struct {
             .dst = 0,
             .src = 0,
             .off = 0,
-            .imm = @intFromEnum(helper),
+            .imm = @backingInt(helper),
         };
     }
 
@@ -1538,7 +1614,7 @@ pub fn map_create(map_type: MapType, key_size: u32, value_size: u32, max_entries
         .map_create = std.mem.zeroes(MapCreateAttr),
     };
 
-    attr.map_create.map_type = @intFromEnum(map_type);
+    attr.map_create.map_type = @backingInt(map_type);
     attr.map_create.key_size = key_size;
     attr.map_create.value_size = value_size;
     attr.map_create.max_entries = max_entries;
@@ -1555,7 +1631,7 @@ pub fn map_create(map_type: MapType, key_size: u32, value_size: u32, max_entries
 
 test "map_create" {
     const map = try map_create(.hash, 4, 4, 32);
-    defer std.os.close(map);
+    defer _ = std.os.linux.close(map);
 }
 
 pub fn map_lookup_elem(fd: fd_t, key: []const u8, value: []u8) !void {
@@ -1647,7 +1723,7 @@ test "map lookup, update, and delete" {
     const key_size = 4;
     const value_size = 4;
     const map = try map_create(.hash, key_size, value_size, 1);
-    defer std.os.close(map);
+    defer _ = std.os.linux.close(map);
 
     const key = std.mem.zeroes([key_size]u8);
     var value = std.mem.zeroes([value_size]u8);
@@ -1693,7 +1769,7 @@ pub fn prog_load(
         .prog_load = std.mem.zeroes(ProgLoadAttr),
     };
 
-    attr.prog_load.prog_type = @intFromEnum(prog_type);
+    attr.prog_load.prog_type = @backingInt(prog_type);
     attr.prog_load.insns = @intFromPtr(insns.ptr);
     attr.prog_load.insn_cnt = @as(u32, @intCast(insns.len));
     attr.prog_load.license = @intFromPtr(license.ptr);
@@ -1729,7 +1805,7 @@ test "prog_load" {
     };
 
     const prog = try prog_load(.socket_filter, &good_prog, null, "MIT", 0, 0);
-    defer std.os.close(prog);
+    defer _ = std.os.linux.close(prog);
 
     try expectError(error.UnsafeProgram, prog_load(.socket_filter, &bad_prog, null, "MIT", 0, 0));
 }

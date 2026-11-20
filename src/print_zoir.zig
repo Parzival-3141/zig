@@ -5,8 +5,8 @@ pub fn renderToWriter(zoir: Zoir, arena: Allocator, w: *Writer) Error!void {
 
     const bytes_per_node = comptime n: {
         var n: usize = 0;
-        for (@typeInfo(Zoir.Node.Repr).@"struct".fields) |f| {
-            n += @sizeOf(f.type);
+        for (@typeInfo(Zoir.Node.Repr).@"struct".field_types) |f_type| {
+            n += @sizeOf(f_type);
         }
         break :n n;
     };
@@ -54,8 +54,8 @@ const PrintZon = struct {
     }
 
     fn renderNode(pz: *PrintZon, node: Zoir.Node.Index) Error!void {
-        const zoir = pz.zoir;
-        try pz.w.print("%{d} = ", .{@intFromEnum(node)});
+        const zoir = &pz.zoir;
+        try pz.w.print("%{d} = ", .{@backingInt(node)});
         switch (node.get(zoir)) {
             .true => try pz.w.writeAll("true"),
             .false => try pz.w.writeAll("false"),
@@ -113,4 +113,4 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const Zoir = std.zig.Zoir;
-const Writer = std.io.Writer;
+const Writer = std.Io.Writer;

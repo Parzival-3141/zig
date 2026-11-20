@@ -91,7 +91,7 @@ fn SipHashStateless(comptime T: type, comptime c_rounds: usize, comptime d_round
 
             self.msg_len +%= @as(u8, @truncate(b.len));
 
-            var buf = [_]u8{0} ** 8;
+            var buf: [8]u8 = @splat(0);
             @memcpy(buf[0..b.len], b);
             buf[7] = self.msg_len;
             self.round(buf);
@@ -237,18 +237,6 @@ fn SipHash(comptime T: type, comptime c_rounds: usize, comptime d_rounds: usize)
         /// Return an authentication tag for a message and a key, as an integer
         pub fn toInt(msg: []const u8, key: *const [key_length]u8) T {
             return State.hash(msg, key);
-        }
-
-        pub const Error = error{};
-        pub const Writer = std.io.GenericWriter(*Self, Error, write);
-
-        fn write(self: *Self, bytes: []const u8) Error!usize {
-            self.update(bytes);
-            return bytes.len;
-        }
-
-        pub fn writer(self: *Self) Writer {
-            return .{ .context = self };
         }
     };
 }

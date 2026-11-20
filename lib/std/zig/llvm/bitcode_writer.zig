@@ -26,7 +26,7 @@ pub fn BitcodeWriter(comptime types: []const type) type {
         widths: [types.len]u16,
 
         pub fn getTypeWidth(self: BcWriter, comptime Type: type) u16 {
-            return self.widths[comptime std.mem.indexOfScalar(type, types, Type).?];
+            return self.widths[comptime std.mem.findScalar(type, types, Type).?];
         }
 
         pub fn init(allocator: std.mem.Allocator, widths: [types.len]u16) BcWriter {
@@ -88,7 +88,7 @@ pub fn BitcodeWriter(comptime types: []const type) type {
             }
         }
 
-        pub fn writeVBR(self: *BcWriter, value: anytype, comptime vbr_bits: usize) Error!void {
+        pub fn writeVbr(self: *BcWriter, value: anytype, comptime vbr_bits: usize) Error!void {
             comptime {
                 std.debug.assert(vbr_bits > 1);
                 if (@bitSizeOf(@TypeOf(value)) > 64) @compileError("Unsupported VBR block type: " ++ @typeName(@TypeOf(value)));
@@ -110,7 +110,7 @@ pub fn BitcodeWriter(comptime types: []const type) type {
             try self.writeBits(in_buffer, vbr_bits);
         }
 
-        pub fn bitsVBR(_: *const BcWriter, value: anytype, comptime vbr_bits: usize) u16 {
+        pub fn bitsVbr(value: anytype, comptime vbr_bits: usize) u16 {
             comptime {
                 std.debug.assert(vbr_bits > 1);
                 if (@bitSizeOf(@TypeOf(value)) > 64) @compileError("Unsupported VBR block type: " ++ @typeName(@TypeOf(value)));
@@ -177,8 +177,8 @@ pub fn BitcodeWriter(comptime types: []const type) type {
 
                 pub fn init(bitcode: *BcWriter, comptime parent_abbrev_len: u6, comptime define_abbrevs: bool) Error!Self {
                     try bitcode.writeBits(1, parent_abbrev_len);
-                    try bitcode.writeVBR(Block.id, 8);
-                    try bitcode.writeVBR(abbrev_len, 4);
+                    try bitcode.writeVbr(Block.id, 8);
+                    try bitcode.writeVbr(abbrev_len, 4);
                     try bitcode.alignTo32();
 
                     // We store the index of the block size and store a dummy value as the number of words in the block
@@ -214,16 +214,16 @@ pub fn BitcodeWriter(comptime types: []const type) type {
 
                 pub fn writeUnabbrev(self: *Self, code: u32, values: []const u64) Error!void {
                     try self.bitcode.writeBits(3, abbrev_len);
-                    try self.bitcode.writeVBR(code, 6);
-                    try self.bitcode.writeVBR(values.len, 6);
+                    try self.bitcode.writeVbr(code, 6);
+                    try self.bitcode.writeVbr(values.len, 6);
                     for (values) |val| {
-                        try self.bitcode.writeVBR(val, 6);
+                        try self.bitcode.writeVbr(val, 6);
                     }
                 }
 
                 pub fn writeAbbrev(self: *Self, params: anytype) Error!void {
                     return self.writeAbbrevAdapted(params, struct {
-                        pub fn get(_: @This(), param: anytype, comptime _: []const u8) @TypeOf(param) {
+                        pub fn get(_: @This(), param: anytype) @TypeOf(param) {
                             return param;
                         }
                     }{});
@@ -246,59 +246,57 @@ pub fn BitcodeWriter(comptime types: []const type) type {
 
                     try self.bitcode.writeBits(comptime abbrevId(Abbrev), abbrev_len);
 
-                    const fields = std.meta.fields(Abbrev);
+                    const field_names = @typeInfo(Abbrev).@"struct".field_names;
 
                     // This abbreviation might only contain literals
-                    if (fields.len == 0) return;
+                    if (field_names.len == 0) return;
 
                     comptime var field_index: usize = 0;
                     inline for (Abbrev.ops) |ty| {
-                        const field_name = fields[field_index].name;
-                        const param = @field(params, field_name);
-
+                        const param = @field(params, field_names[field_index]);
                         switch (ty) {
                             .literal => continue,
-                            .fixed => |len| try self.bitcode.writeBits(adapter.get(param, field_name), len),
+                            .fixed => |len| try self.bitcode.writeBits(adapter.get(param), len),
                             .fixed_runtime => |width_ty| try self.bitcode.writeBits(
-                                adapter.get(param, field_name),
+                                adapter.get(param),
                                 self.bitcode.getTypeWidth(width_ty),
                             ),
-                            .vbr => |len| try self.bitcode.writeVBR(adapter.get(param, field_name), len),
-                            .char6 => try self.bitcode.write6BitChar(adapter.get(param, field_name)),
+                            .vbr => |len| try self.bitcode.writeVbr(adapter.get(param), len),
+                            .char6 => try self.bitcode.write6BitChar(adapter.get(param)),
                             .blob => {
-                                try self.bitcode.writeVBR(param.len, 6);
+                                try self.bitcode.writeVbr(param.len, 6);
                                 try self.bitcode.writeBlob(param);
                             },
                             .array_fixed => |len| {
-                                try self.bitcode.writeVBR(param.len, 6);
+                                try self.bitcode.writeVbr(param.len, 6);
                                 for (param) |x| {
-                                    try self.bitcode.writeBits(adapter.get(x, field_name), len);
+                                    try self.bitcode.writeBits(adapter.get(x), len);
                                 }
                             },
                             .array_fixed_runtime => |width_ty| {
-                                try self.bitcode.writeVBR(param.len, 6);
+                                try self.bitcode.writeVbr(param.len, 6);
                                 for (param) |x| {
                                     try self.bitcode.writeBits(
-                                        adapter.get(x, field_name),
+                                        adapter.get(x),
                                         self.bitcode.getTypeWidth(width_ty),
                                     );
                                 }
                             },
                             .array_vbr => |len| {
-                                try self.bitcode.writeVBR(param.len, 6);
+                                try self.bitcode.writeVbr(param.len, 6);
                                 for (param) |x| {
-                                    try self.bitcode.writeVBR(adapter.get(x, field_name), len);
+                                    try self.bitcode.writeVbr(adapter.get(x), len);
                                 }
                             },
                             .array_char6 => {
-                                try self.bitcode.writeVBR(param.len, 6);
+                                try self.bitcode.writeVbr(param.len, 6);
                                 for (param) |x| {
-                                    try self.bitcode.write6BitChar(adapter.get(x, field_name));
+                                    try self.bitcode.write6BitChar(adapter.get(x));
                                 }
                             },
                         }
                         field_index += 1;
-                        if (field_index == fields.len) break;
+                        if (field_index == field_names.len) break;
                     }
                 }
 
@@ -307,7 +305,7 @@ pub fn BitcodeWriter(comptime types: []const type) type {
                     try bitcode.writeBits(2, abbrev_len);
 
                     // ops.len is not accurate because arrays are actually two ops
-                    try bitcode.writeVBR(blk: {
+                    try bitcode.writeVbr(blk: {
                         var count: usize = 0;
                         inline for (ops) |op| {
                             count += switch (op) {
@@ -322,22 +320,22 @@ pub fn BitcodeWriter(comptime types: []const type) type {
                         switch (op) {
                             .literal => |value| {
                                 try bitcode.writeBits(1, 1);
-                                try bitcode.writeVBR(value, 8);
+                                try bitcode.writeVbr(value, 8);
                             },
                             .fixed => |width| {
                                 try bitcode.writeBits(0, 1);
                                 try bitcode.writeBits(1, 3);
-                                try bitcode.writeVBR(width, 5);
+                                try bitcode.writeVbr(width, 5);
                             },
                             .fixed_runtime => |width_ty| {
                                 try bitcode.writeBits(0, 1);
                                 try bitcode.writeBits(1, 3);
-                                try bitcode.writeVBR(bitcode.getTypeWidth(width_ty), 5);
+                                try bitcode.writeVbr(bitcode.getTypeWidth(width_ty), 5);
                             },
                             .vbr => |width| {
                                 try bitcode.writeBits(0, 1);
                                 try bitcode.writeBits(2, 3);
-                                try bitcode.writeVBR(width, 5);
+                                try bitcode.writeVbr(width, 5);
                             },
                             .char6 => {
                                 try bitcode.writeBits(0, 1);
@@ -355,7 +353,7 @@ pub fn BitcodeWriter(comptime types: []const type) type {
                                 // Fixed or VBR op
                                 try bitcode.writeBits(0, 1);
                                 try bitcode.writeBits(1, 3);
-                                try bitcode.writeVBR(width, 5);
+                                try bitcode.writeVbr(width, 5);
                             },
                             .array_fixed_runtime => |width_ty| {
                                 // Array op
@@ -365,7 +363,7 @@ pub fn BitcodeWriter(comptime types: []const type) type {
                                 // Fixed or VBR op
                                 try bitcode.writeBits(0, 1);
                                 try bitcode.writeBits(1, 3);
-                                try bitcode.writeVBR(bitcode.getTypeWidth(width_ty), 5);
+                                try bitcode.writeVbr(bitcode.getTypeWidth(width_ty), 5);
                             },
                             .array_vbr => |width| {
                                 // Array op
@@ -375,7 +373,7 @@ pub fn BitcodeWriter(comptime types: []const type) type {
                                 // Fixed or VBR op
                                 try bitcode.writeBits(0, 1);
                                 try bitcode.writeBits(2, 3);
-                                try bitcode.writeVBR(width, 5);
+                                try bitcode.writeVbr(width, 5);
                             },
                             .array_char6 => {
                                 // Array op
@@ -406,7 +404,7 @@ fn charTo6Bit(c: u8) u8 {
 }
 
 fn BufType(comptime T: type, comptime min_len: usize) type {
-    return std.meta.Int(.unsigned, @max(min_len, @bitSizeOf(switch (@typeInfo(T)) {
+    return @Int(.unsigned, @max(min_len, @bitSizeOf(switch (@typeInfo(T)) {
         .comptime_int => u32,
         .int => |info| if (info.signedness == .unsigned)
             T
@@ -416,7 +414,7 @@ fn BufType(comptime T: type, comptime min_len: usize) type {
         .bool => u1,
         .@"struct" => |info| switch (info.layout) {
             .auto, .@"extern" => @compileError("Unsupported type: " ++ @typeName(T)),
-            .@"packed" => std.meta.Int(.unsigned, @bitSizeOf(T)),
+            .@"packed" => @Int(.unsigned, @bitSizeOf(T)),
         },
         else => @compileError("Unsupported type: " ++ @typeName(T)),
     })));
@@ -425,9 +423,9 @@ fn BufType(comptime T: type, comptime min_len: usize) type {
 fn bufValue(value: anytype, comptime min_len: usize) BufType(@TypeOf(value), min_len) {
     return switch (@typeInfo(@TypeOf(value))) {
         .comptime_int, .int => @intCast(value),
-        .@"enum" => @intFromEnum(value),
+        .@"enum" => @backingInt(value),
         .bool => @intFromBool(value),
-        .@"struct" => @intCast(@as(std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(value))), @bitCast(value))),
+        .@"struct" => @intCast(@as(@Int(.unsigned, @bitSizeOf(@TypeOf(value))), @bitCast(value))),
         else => unreachable,
     };
 }

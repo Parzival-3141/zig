@@ -1,17 +1,13 @@
-const std = @import("std");
 const builtin = @import("builtin");
-const arch = builtin.cpu.arch;
-const os = builtin.os.tag;
-const abi = builtin.abi;
-const common = @import("common.zig");
 
-pub const panic = common.panic;
+const compiler_rt = @import("../compiler_rt.zig");
+const symbol = compiler_rt.symbol;
 
 comptime {
-    if (arch == .x86 and common.want_windows_msvc_or_itanium_abi and !builtin.link_libc) {
+    if (compiler_rt.want_windows_x86_msvc_abi) {
         // Don't let LLVM apply the stdcall name mangling on those MSVC builtins
-        @export(&_alldiv, .{ .name = "\x01__alldiv", .linkage = common.linkage, .visibility = common.visibility });
-        @export(&_aulldiv, .{ .name = "\x01__aulldiv", .linkage = common.linkage, .visibility = common.visibility });
+        symbol(&_alldiv, "\x01__alldiv");
+        symbol(&_aulldiv, "\x01__aulldiv");
     }
 }
 

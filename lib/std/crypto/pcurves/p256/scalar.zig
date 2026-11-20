@@ -68,8 +68,8 @@ pub fn sub(a: CompressedScalar, b: CompressedScalar, endian: std.builtin.Endian)
 }
 
 /// Return a random scalar
-pub fn random(endian: std.builtin.Endian) CompressedScalar {
-    return Scalar.random().toBytes(endian);
+pub fn random(io: std.Io, endian: std.builtin.Endian) CompressedScalar {
+    return Scalar.random(io).toBytes(endian);
 }
 
 /// A scalar in unpacked representation.
@@ -170,10 +170,10 @@ pub const Scalar = struct {
     }
 
     /// Return a random scalar < L.
-    pub fn random() Scalar {
+    pub fn random(io: std.Io) Scalar {
         var s: [48]u8 = undefined;
         while (true) {
-            crypto.random.bytes(&s);
+            io.random(&s);
             const n = Scalar.fromBytes48(s, .little);
             if (!n.isZero()) {
                 return n;
@@ -196,19 +196,19 @@ const ScalarDouble = struct {
         }
         var t = ScalarDouble{ .x1 = undefined, .x2 = Fe.zero, .x3 = Fe.zero };
         {
-            var b = [_]u8{0} ** encoded_length;
+            var b: [encoded_length]u8 = @splat(0);
             const len = @min(s.len, 24);
             b[0..len].* = s[0..len].*;
             t.x1 = Fe.fromBytes(b, .little) catch unreachable;
         }
         if (s_.len >= 24) {
-            var b = [_]u8{0} ** encoded_length;
+            var b: [encoded_length]u8 = @splat(0);
             const len = @min(s.len - 24, 24);
             b[0..len].* = s[24..][0..len].*;
             t.x2 = Fe.fromBytes(b, .little) catch unreachable;
         }
         if (s_.len >= 48) {
-            var b = [_]u8{0} ** encoded_length;
+            var b: [encoded_length]u8 = @splat(0);
             const len = s.len - 48;
             b[0..len].* = s[48..][0..len].*;
             t.x3 = Fe.fromBytes(b, .little) catch unreachable;

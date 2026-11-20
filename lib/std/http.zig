@@ -2,7 +2,7 @@ const builtin = @import("builtin");
 const std = @import("std.zig");
 const assert = std.debug.assert;
 const Writer = std.Io.Writer;
-const File = std.fs.File;
+const File = std.Io.File;
 
 pub const Client = @import("http/Client.zig");
 pub const Server = @import("http/Server.zig");
@@ -20,6 +20,8 @@ pub const Version = enum {
 /// https://datatracker.ietf.org/doc/html/rfc7231#section-4 Initial definition
 ///
 /// https://datatracker.ietf.org/doc/html/rfc5789#section-2 PATCH
+///
+/// https://datatracker.ietf.org/doc/html/rfc10008#name-query-method QUERY
 pub const Method = enum {
     GET,
     HEAD,
@@ -30,12 +32,13 @@ pub const Method = enum {
     OPTIONS,
     TRACE,
     PATCH,
+    QUERY,
 
     /// Returns true if a request of this method is allowed to have a body
     /// Actual behavior from servers may vary and should still be checked
     pub fn requestHasBody(m: Method) bool {
         return switch (m) {
-            .POST, .PUT, .PATCH => true,
+            .POST, .PUT, .PATCH, .QUERY => true,
             .GET, .HEAD, .DELETE, .CONNECT, .OPTIONS, .TRACE => false,
         };
     }
@@ -44,8 +47,8 @@ pub const Method = enum {
     /// Actual behavior from clients may vary and should still be checked
     pub fn responseHasBody(m: Method) bool {
         return switch (m) {
-            .GET, .POST, .DELETE, .CONNECT, .OPTIONS, .PATCH => true,
-            .HEAD, .PUT, .TRACE => false,
+            .GET, .POST, .PUT, .DELETE, .CONNECT, .OPTIONS, .PATCH, .QUERY => true,
+            .HEAD, .TRACE => false,
         };
     }
 
@@ -56,7 +59,7 @@ pub const Method = enum {
     /// https://datatracker.ietf.org/doc/html/rfc7231#section-4.2.1
     pub fn safe(m: Method) bool {
         return switch (m) {
-            .GET, .HEAD, .OPTIONS, .TRACE => true,
+            .GET, .HEAD, .OPTIONS, .TRACE, .QUERY => true,
             .POST, .PUT, .DELETE, .CONNECT, .PATCH => false,
         };
     }
@@ -70,7 +73,7 @@ pub const Method = enum {
     /// https://datatracker.ietf.org/doc/html/rfc7231#section-4.2.2
     pub fn idempotent(m: Method) bool {
         return switch (m) {
-            .GET, .HEAD, .PUT, .DELETE, .OPTIONS, .TRACE => true,
+            .GET, .HEAD, .PUT, .DELETE, .OPTIONS, .TRACE, .QUERY => true,
             .CONNECT, .POST, .PATCH => false,
         };
     }
@@ -83,7 +86,7 @@ pub const Method = enum {
     /// https://datatracker.ietf.org/doc/html/rfc7231#section-4.2.3
     pub fn cacheable(m: Method) bool {
         return switch (m) {
-            .GET, .HEAD => true,
+            .GET, .HEAD, .QUERY => true,
             .POST, .PUT, .DELETE, .CONNECT, .OPTIONS, .TRACE, .PATCH => false,
         };
     }
@@ -247,7 +250,7 @@ pub const Status = enum(u10) {
     };
 
     pub fn class(self: Status) Class {
-        return switch (@intFromEnum(self)) {
+        return switch (@backingInt(self)) {
             100...199 => .informational,
             200...299 => .success,
             300...399 => .redirect,
@@ -307,6 +310,11 @@ pub const Connection = enum {
     close,
 };
 
+pub const Side = enum {
+    request,
+    response,
+};
+
 pub const Header = struct {
     name: []const u8,
     value: []const u8,
@@ -330,6 +338,8 @@ pub const Reader = struct {
     trailers: []const u8 = &.{},
     body_err: ?BodyError = null,
     max_head_len: usize,
+    /// Whether this is a reader over a request, sent by a client; or a response, sent by a server.
+    side: Side,
 
     pub const RemainingChunkLen = enum(u64) {
         head = 0,
@@ -338,11 +348,11 @@ pub const Reader = struct {
         _,
 
         pub fn init(integer: u64) RemainingChunkLen {
-            return @enumFromInt(integer);
+            return @fromBackingInt(@intCast(integer));
         }
 
         pub fn int(rcl: RemainingChunkLen) u64 {
-            return @intFromEnum(rcl);
+            return @backingInt(rcl);
         }
     };
 
@@ -400,7 +410,7 @@ pub const Reader = struct {
                         0 => return error.HttpConnectionClosing,
                         else => return error.HttpRequestTruncated,
                     },
-                    error.ReadFailed => return error.ReadFailed,
+                    error.ReadFailed => |e| return e,
                 };
                 continue;
             }
@@ -443,7 +453,7 @@ pub const Reader = struct {
             },
             .none => {
                 if (content_length) |len| {
-                    reader.state = .{ .body_remaining_content_length = len };
+                    reader.state = if (len == 0) .ready else .{ .body_remaining_content_length = len };
                     reader.interface = .{
                         .buffer = transfer_buffer,
                         .seek = 0,
@@ -455,8 +465,17 @@ pub const Reader = struct {
                     };
                     return &reader.interface;
                 } else {
-                    reader.state = .body_none;
-                    return reader.in;
+                    return switch (reader.side) {
+                        .response => resp: {
+                            reader.state = .body_none;
+                            break :resp reader.in;
+                        },
+                        .request => req: {
+                            // RFC7230: If a request has no Content-Length and no Transfer-Encoding, it has no message body.
+                            reader.state = .ready;
+                            break :req .ending;
+                        },
+                    };
                 }
             },
         }
@@ -509,27 +528,29 @@ pub const Reader = struct {
         limit: std.Io.Limit,
     ) std.Io.Reader.StreamError!usize {
         const reader: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
+        if (reader.state == .ready) return error.EndOfStream;
         const remaining_content_length = &reader.state.body_remaining_content_length;
         const remaining = remaining_content_length.*;
-        if (remaining == 0) {
-            reader.state = .ready;
-            return error.EndOfStream;
-        }
         const n = try reader.in.stream(w, limit.min(.limited64(remaining)));
-        remaining_content_length.* = remaining - n;
+        if (n == remaining) {
+            reader.state = .ready;
+        } else {
+            remaining_content_length.* = remaining - n;
+        }
         return n;
     }
 
     fn contentLengthDiscard(io_r: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
         const reader: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
+        if (reader.state == .ready) return error.EndOfStream;
         const remaining_content_length = &reader.state.body_remaining_content_length;
         const remaining = remaining_content_length.*;
-        if (remaining == 0) {
-            reader.state = .ready;
-            return error.EndOfStream;
-        }
         const n = try reader.in.discard(limit.min(.limited64(remaining)));
-        remaining_content_length.* = remaining - n;
+        if (n == remaining) {
+            reader.state = .ready;
+        } else {
+            remaining_content_length.* = remaining - n;
+        }
         return n;
     }
 
@@ -541,8 +562,7 @@ pub const Reader = struct {
             else => unreachable,
         };
         return chunkedReadEndless(reader, w, limit, chunk_len_ptr) catch |err| switch (err) {
-            error.ReadFailed => return error.ReadFailed,
-            error.WriteFailed => return error.WriteFailed,
+            error.ReadFailed, error.WriteFailed => |e| return e,
             error.EndOfStream => {
                 reader.body_err = error.HttpChunkTruncated;
                 return error.ReadFailed;
@@ -596,8 +616,8 @@ pub const Reader = struct {
                 continue :len .head;
             },
             else => |remaining_chunk_len| {
-                const n = try in.stream(w, limit.min(.limited64(@intFromEnum(remaining_chunk_len) - 2)));
-                chunk_len_ptr.* = .init(@intFromEnum(remaining_chunk_len) - n);
+                const n = try in.stream(w, limit.min(.limited64(@backingInt(remaining_chunk_len) - 2)));
+                chunk_len_ptr.* = .init(@backingInt(remaining_chunk_len) - n);
                 return n;
             },
         }
@@ -611,7 +631,7 @@ pub const Reader = struct {
             else => unreachable,
         };
         return chunkedDiscardEndless(reader, limit, chunk_len_ptr) catch |err| switch (err) {
-            error.ReadFailed => return error.ReadFailed,
+            error.ReadFailed => |e| return e,
             error.EndOfStream => {
                 reader.body_err = error.HttpChunkTruncated;
                 return error.ReadFailed;
@@ -742,13 +762,16 @@ pub const BodyWriter = struct {
     http_protocol_output: *Writer,
     state: State,
     writer: Writer,
+    /// Associated `Client.Request`, if applicable, used to tell the request
+    /// that the body has been written and the connection is safe to reuse.
+    client_request: ?*Client.Request = null,
 
     pub const Error = Writer.Error;
 
     /// How many zeroes to reserve for hex-encoded chunk length.
     const chunk_len_digits = 8;
     const max_chunk_len: usize = std.math.pow(u64, 16, chunk_len_digits) - 1;
-    const chunk_header_template = ("0" ** chunk_len_digits) ++ "\r\n";
+    const chunk_header_template = @as([chunk_len_digits]u8, @splat('0')) ++ "\r\n";
 
     comptime {
         assert(max_chunk_len == std.math.maxInt(u32));
@@ -820,8 +843,13 @@ pub const BodyWriter = struct {
                 assert(len == 0); // Trips when end() called before all bytes written.
                 w.state = .end;
             },
-            .none => {},
             .chunk_len => return endChunkedUnflushed(w, .{}),
+            // Don't clear payload_pending to prevent an unframed request from
+            // returning to the pool
+            .none => return,
+        }
+        if (w.client_request) |request| {
+            request.payload_pending = false;
         }
     }
 
@@ -857,26 +885,27 @@ pub const BodyWriter = struct {
     /// * `endUnflushed`
     /// * `end`
     pub fn endChunkedUnflushed(w: *BodyWriter, options: EndChunkedOptions) Error!void {
-        if (w.isEliding()) {
-            w.state = .end;
-            return;
-        }
-        const bw = w.http_protocol_output;
-        switch (w.state.chunk_len) {
-            0 => {},
-            1 => unreachable, // Wrote more data than specified in chunk header.
-            2 => try bw.writeAll("\r\n"),
-            else => unreachable, // An earlier write call indicated more data would follow.
-        }
-        try bw.writeAll("0\r\n");
-        for (options.trailers) |trailer| {
-            try bw.writeAll(trailer.name);
-            try bw.writeAll(": ");
-            try bw.writeAll(trailer.value);
+        if (!w.isEliding()) {
+            const bw = w.http_protocol_output;
+            switch (w.state.chunk_len) {
+                0 => {},
+                1 => unreachable, // Wrote more data than specified in chunk header.
+                2 => try bw.writeAll("\r\n"),
+                else => unreachable, // An earlier write call indicated more data would follow.
+            }
+            try bw.writeAll("0\r\n");
+            for (options.trailers) |trailer| {
+                try bw.writeAll(trailer.name);
+                try bw.writeAll(": ");
+                try bw.writeAll(trailer.value);
+                try bw.writeAll("\r\n");
+            }
             try bw.writeAll("\r\n");
         }
-        try bw.writeAll("\r\n");
         w.state = .end;
+        if (w.client_request) |request| {
+            request.payload_pending = false;
+        }
     }
 
     pub fn contentLengthDrain(w: *Writer, data: []const []const u8, splat: usize) Error!usize {
@@ -962,6 +991,7 @@ pub const BodyWriter = struct {
             // have to flush the chunk header before knowing the chunk length.
             return error.Unimplemented;
         };
+        if (data_len == 0) return error.EndOfStream;
         const out = bw.http_protocol_output;
         l: switch (bw.state.chunk_len) {
             0 => {
@@ -975,8 +1005,7 @@ pub const BodyWriter = struct {
             2 => {
                 try out.writeAll("\r\n");
                 bw.state.chunk_len = 0;
-                assert(file_reader.atEnd());
-                return error.EndOfStream;
+                continue :l 0;
             },
             else => {
                 const chunk_limit: std.Io.Limit = .limited(bw.state.chunk_len - 2);
@@ -985,8 +1014,7 @@ pub const BodyWriter = struct {
                 else
                     try out.write(chunk_limit.slice(w.buffered()));
                 bw.state.chunk_len -= n;
-                const ret = w.consume(n);
-                return ret;
+                return w.consume(n);
             },
         }
     }

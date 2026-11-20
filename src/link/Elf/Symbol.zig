@@ -259,9 +259,9 @@ const AddExtraOpts = struct {
 
 pub fn addExtra(symbol: *Symbol, opts: AddExtraOpts, elf_file: *Elf) void {
     var extras = symbol.extra(elf_file);
-    inline for (@typeInfo(@TypeOf(opts)).@"struct".fields) |field| {
-        if (@field(opts, field.name)) |x| {
-            @field(extras, field.name) = x;
+    inline for (@typeInfo(@TypeOf(opts)).@"struct".field_names) |field_name| {
+        if (@field(opts, field_name)) |x| {
+            @field(extras, field_name) = x;
         }
     }
     symbol.setExtra(extras, elf_file);
@@ -309,8 +309,15 @@ pub fn setOutputSym(symbol: Symbol, elf_file: *Elf, out: *elf.Elf64_Sym) void {
             break :blk symbol.address(.{ .plt = false }, elf_file) - elf_file.tlsAddress();
         break :blk symbol.address(.{ .plt = false, .trampoline = false }, elf_file);
     };
+    const st_other = blk: {
+        const vis = @as(elf.STV, @fromBackingInt(@intCast(@as(u3, @truncate(esym.st_other)))));
+        if (file_ptr != .shared_object or vis != elf.STV.PROTECTED) break :blk esym.st_other;
+        // Reset protected visibility to default for symbols originating in shared objects
+        break :blk esym.st_other & 0b11111000;
+    };
+
     out.st_info = (st_bind << 4) | st_type;
-    out.st_other = esym.st_other;
+    out.st_other = st_other;
     out.st_shndx = st_shndx;
     out.st_value = @intCast(st_value);
     out.st_size = esym.st_size;
@@ -320,12 +327,12 @@ const Format = struct {
     symbol: Symbol,
     elf_file: *Elf,
 
-    fn name(f: Format, writer: *std.io.Writer) std.io.Writer.Error!void {
+    fn name(f: Format, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         const elf_file = f.elf_file;
         const symbol = f.symbol;
         try writer.writeAll(symbol.name(elf_file));
         switch (symbol.version_index.VERSION) {
-            @intFromEnum(elf.VER_NDX.LOCAL), @intFromEnum(elf.VER_NDX.GLOBAL) => {},
+            @backingInt(elf.VER_NDX.LOCAL), @backingInt(elf.VER_NDX.GLOBAL) => {},
             else => {
                 const file_ptr = symbol.file(elf_file).?;
                 assert(file_ptr == .shared_object);
@@ -335,7 +342,7 @@ const Format = struct {
         }
     }
 
-    fn default(f: Format, writer: *std.io.Writer) std.io.Writer.Error!void {
+    fn default(f: Format, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         const symbol = f.symbol;
         const elf_file = f.elf_file;
         try writer.print("%{d} : {f} : @{x}", .{
@@ -356,7 +363,7 @@ const Format = struct {
             if (symbol.atom(elf_file)) |atom_ptr| {
                 try writer.print(" : atom({d})", .{atom_ptr.atom_index});
             }
-            var buf: [2]u8 = .{'_'} ** 2;
+            var buf: [2]u8 = @splat('_');
             if (symbol.flags.@"export") buf[0] = 'E';
             if (symbol.flags.import) buf[1] = 'I';
             try writer.print(" : {s}", .{&buf});
@@ -368,14 +375,14 @@ const Format = struct {
     }
 };
 
-pub fn fmtName(symbol: Symbol, elf_file: *Elf) std.fmt.Formatter(Format, Format.name) {
+pub fn fmtName(symbol: Symbol, elf_file: *Elf) std.fmt.Alt(Format, Format.name) {
     return .{ .data = .{
         .symbol = symbol,
         .elf_file = elf_file,
     } };
 }
 
-pub fn fmt(symbol: Symbol, elf_file: *Elf) std.fmt.Formatter(Format, Format.default) {
+pub fn fmt(symbol: Symbol, elf_file: *Elf) std.fmt.Alt(Format, Format.default) {
     return .{ .data = .{
         .symbol = symbol,
         .elf_file = elf_file,

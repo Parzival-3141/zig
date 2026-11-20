@@ -1,12 +1,15 @@
-const std = @import("std.zig");
+const mem = @This();
+
 const builtin = @import("builtin");
+const native_endian = builtin.cpu.arch.endian();
+
+const std = @import("std.zig");
 const debug = std.debug;
 const assert = debug.assert;
 const math = std.math;
-const mem = @This();
 const testing = std.testing;
-const Endian = std.builtin.Endian;
-const native_endian = builtin.cpu.arch.endian();
+const Endian = std.lang.Endian;
+const AbsorbSentinel = std.meta.AbsorbSentinel;
 
 /// The standard library currently thoroughly depends on byte size
 /// being 8 bits.  (see the use of u8 throughout allocation code as
@@ -30,12 +33,16 @@ pub const Alignment = enum(math.Log2Int(usize)) {
     _,
 
     pub fn toByteUnits(a: Alignment) usize {
-        return @as(usize, 1) << @intFromEnum(a);
+        return @as(usize, 1) << @backingInt(a);
     }
 
     pub fn fromByteUnits(n: usize) Alignment {
         assert(std.math.isPowerOfTwo(n));
-        return @enumFromInt(@ctz(n));
+        return @fromBackingInt(@intCast(@ctz(n)));
+    }
+
+    pub fn fromByteUnitsOptional(maybe_n: ?usize) ?Alignment {
+        return if (maybe_n) |n| .fromByteUnits(n) else null;
     }
 
     pub inline fn of(comptime T: type) Alignment {
@@ -43,36 +50,36 @@ pub const Alignment = enum(math.Log2Int(usize)) {
     }
 
     pub fn order(lhs: Alignment, rhs: Alignment) std.math.Order {
-        return std.math.order(@intFromEnum(lhs), @intFromEnum(rhs));
+        return std.math.order(@backingInt(lhs), @backingInt(rhs));
     }
 
     pub fn compare(lhs: Alignment, op: std.math.CompareOperator, rhs: Alignment) bool {
-        return std.math.compare(@intFromEnum(lhs), op, @intFromEnum(rhs));
+        return std.math.compare(@backingInt(lhs), op, @backingInt(rhs));
     }
 
     pub fn max(lhs: Alignment, rhs: Alignment) Alignment {
-        return @enumFromInt(@max(@intFromEnum(lhs), @intFromEnum(rhs)));
+        return @fromBackingInt(@intCast(@max(@backingInt(lhs), @backingInt(rhs))));
     }
 
     pub fn min(lhs: Alignment, rhs: Alignment) Alignment {
-        return @enumFromInt(@min(@intFromEnum(lhs), @intFromEnum(rhs)));
+        return @fromBackingInt(@intCast(@min(@backingInt(lhs), @backingInt(rhs))));
     }
 
     /// Return next address with this alignment.
     pub fn forward(a: Alignment, address: usize) usize {
-        const x = (@as(usize, 1) << @intFromEnum(a)) - 1;
+        const x = (@as(usize, 1) << @backingInt(a)) - 1;
         return (address + x) & ~x;
     }
 
     /// Return previous address with this alignment.
     pub fn backward(a: Alignment, address: usize) usize {
-        const x = (@as(usize, 1) << @intFromEnum(a)) - 1;
+        const x = (@as(usize, 1) << @backingInt(a)) - 1;
         return address & ~x;
     }
 
     /// Return whether address is aligned to this amount.
     pub fn check(a: Alignment, address: usize) bool {
-        return @ctz(address) >= @intFromEnum(a);
+        return @ctz(address) >= @backingInt(a);
     }
 };
 
@@ -166,6 +173,8 @@ pub fn ValidationAllocator(comptime T: type) type {
     };
 }
 
+/// Wraps an allocator with basic validation checks.
+/// Asserts that allocation sizes are greater than zero and returned pointers have correct alignment.
 pub fn validationWrap(allocator: anytype) ValidationAllocator(@TypeOf(allocator)) {
     return ValidationAllocator(@TypeOf(allocator)).init(allocator);
 }
@@ -195,9 +204,12 @@ test "Allocator.resize" {
         defer testing.allocator.free(values);
 
         for (values, 0..) |*v, i| v.* = @as(T, @intCast(i));
-        if (!testing.allocator.resize(values, values.len + 10)) return error.OutOfMemory;
-        values = values.ptr[0 .. values.len + 10];
-        try testing.expect(values.len == 110);
+        if (testing.allocator.resize(values, values.len + 10)) {
+            values = values.ptr[0 .. values.len + 10];
+            try testing.expect(values.len == 110);
+        } else {
+            // `resize` is not guaranteed to succeed even if there is sufficient memory.
+        }
     }
 
     const primitiveFloatTypes = .{
@@ -211,9 +223,12 @@ test "Allocator.resize" {
         defer testing.allocator.free(values);
 
         for (values, 0..) |*v, i| v.* = @as(T, @floatFromInt(i));
-        if (!testing.allocator.resize(values, values.len + 10)) return error.OutOfMemory;
-        values = values.ptr[0 .. values.len + 10];
-        try testing.expect(values.len == 110);
+        if (testing.allocator.resize(values, values.len + 10)) {
+            values = values.ptr[0 .. values.len + 10];
+            try testing.expect(values.len == 110);
+        } else {
+            // `resize` is not guaranteed to succeed even if there is sufficient memory.
+        }
     }
 }
 
@@ -254,6 +269,39 @@ pub fn copyBackwards(comptime T: type, dest: []T, source: []const T) void {
     }
 }
 
+/// Copy `source` into `dest`, excluding the sentinel.
+///
+/// Asserts no overlap. Asserts `dest.len` greater or equal to source len. Returns number of elements copied,
+/// not counting the sentinel.
+pub fn copySentinel(comptime T: type, comptime s: T, dest: []T, source: [*:s]const T) usize {
+    const i = findSentinel(T, s, source);
+    @memcpy(dest[0..i], source[0..i]);
+    return i;
+}
+
+test copySentinel {
+    var dst: [11]u8 = @splat(0xff);
+    const n = copySentinel(u8, 0, &dst, "hello this\x00is my null-terminated string");
+    try testing.expectEqualStrings("hello this\xff", &dst);
+    try testing.expectEqual(n, 10);
+}
+
+/// Copy `source` into `dest`, including the sentinel.
+///
+/// Asserts no overlap. Asserts `dest.len` greater or equal to source len, including room for the sentinel.
+/// Returns number of elements copied, including the sentinel.
+pub fn copySentinelInclusive(comptime T: type, comptime s: T, dest: []T, source: [*:s]const T) usize {
+    const i = findSentinel(T, s, source) + 1;
+    @memcpy(dest[0..i], source[0..i]);
+    return i;
+}
+
+test copySentinelInclusive {
+    var dst: [12]u8 = @splat(0xff);
+    const n = copySentinelInclusive(u8, 0, &dst, "hello this\x00is my null-terminated string");
+    try testing.expectEqualStrings("hello this\x00\xff", &dst);
+    try testing.expectEqual(n, 11);
+}
 /// Generally, Zig users are encouraged to explicitly initialize all fields of a struct explicitly rather than using this function.
 /// However, it is recognized that there are sometimes use cases for initializing all fields to a "zero" value. For example, when
 /// interfacing with a C API where this practice is more common and relied upon. If you are performing code review and see this
@@ -266,7 +314,7 @@ pub fn zeroes(comptime T: type) T {
             return @as(T, 0);
         },
         .@"enum" => {
-            return @as(T, @enumFromInt(0));
+            return @as(T, @fromBackingInt(@intCast(0)));
         },
         .void => {
             return {};
@@ -285,9 +333,13 @@ pub fn zeroes(comptime T: type) T {
                 return item;
             } else {
                 var structure: T = undefined;
-                inline for (struct_info.fields) |field| {
-                    if (!field.is_comptime) {
-                        @field(structure, field.name) = zeroes(field.type);
+                inline for (
+                    struct_info.field_names,
+                    struct_info.field_types,
+                    struct_info.field_attrs,
+                ) |field_name, field_type, field_attrs| {
+                    if (!field_attrs.@"comptime") {
+                        @field(structure, field_name) = zeroes(field_type);
                     }
                 }
                 return structure;
@@ -309,7 +361,7 @@ pub fn zeroes(comptime T: type) T {
                     return null;
                 },
                 .one, .many => {
-                    if (ptr_info.is_allowzero) return @ptrFromInt(0);
+                    if (ptr_info.attrs.@"allowzero") return @ptrFromInt(0);
                     @compileError("Only nullable and allowzero pointers can be set to zero.");
                 },
             }
@@ -336,6 +388,7 @@ pub fn zeroes(comptime T: type) T {
         .noreturn,
         .undefined,
         .@"opaque",
+        .spirv,
         .frame,
         .@"anyframe",
         => {
@@ -353,7 +406,10 @@ test zeroes {
     var a = zeroes(C_struct);
 
     // Extern structs should have padding zeroed out.
-    try testing.expectEqualSlices(u8, &[_]u8{0} ** @sizeOf(@TypeOf(a)), asBytes(&a));
+    {
+        const num_bytes = @sizeOf(@TypeOf(a));
+        try testing.expectEqualSlices(u8, &@as([num_bytes]u8, @splat(0)), @ptrCast(&a));
+    }
 
     a.y += 10;
 
@@ -364,7 +420,6 @@ test zeroes {
         comptime comptime_field: u8 = 5,
 
         integral_types: struct {
-            integer_0: i0,
             integer_8: i8,
             integer_16: i16,
             integer_32: i32,
@@ -399,7 +454,6 @@ test zeroes {
 
     const b = zeroes(ZigStruct);
     try testing.expectEqual(@as(u8, 5), b.comptime_field);
-    try testing.expectEqual(@as(i8, 0), b.integral_types.integer_0);
     try testing.expectEqual(@as(i8, 0), b.integral_types.integer_8);
     try testing.expectEqual(@as(i16, 0), b.integral_types.integer_16);
     try testing.expectEqual(@as(i32, 0), b.integral_types.integer_32);
@@ -458,44 +512,49 @@ pub fn zeroInit(comptime T: type, init: anytype) T {
             switch (@typeInfo(Init)) {
                 .@"struct" => |init_info| {
                     if (init_info.is_tuple) {
-                        if (init_info.fields.len > struct_info.fields.len) {
+                        if (init_info.field_names.len > struct_info.field_names.len) {
                             @compileError("Tuple initializer has more elements than there are fields in `" ++ @typeName(T) ++ "`");
                         }
                     } else {
-                        inline for (init_info.fields) |field| {
-                            if (!@hasField(T, field.name)) {
-                                @compileError("Encountered an initializer for `" ++ field.name ++ "`, but it is not a field of " ++ @typeName(T));
+                        inline for (init_info.field_names) |field_name| {
+                            if (!@hasField(T, field_name)) {
+                                @compileError("Encountered an initializer for `" ++ field_name ++ "`, but it is not a field of " ++ @typeName(T));
                             }
                         }
                     }
 
                     var value: T = if (struct_info.layout == .@"extern") zeroes(T) else undefined;
 
-                    inline for (struct_info.fields, 0..) |field, i| {
-                        if (field.is_comptime) {
+                    inline for (
+                        struct_info.field_names,
+                        struct_info.field_types,
+                        struct_info.field_attrs,
+                        0..,
+                    ) |f_name, f_type, f_attr, i| {
+                        if (f_attr.@"comptime") {
                             continue;
                         }
 
-                        if (init_info.is_tuple and init_info.fields.len > i) {
-                            @field(value, field.name) = @field(init, init_info.fields[i].name);
-                        } else if (@hasField(@TypeOf(init), field.name)) {
-                            switch (@typeInfo(field.type)) {
+                        if (init_info.is_tuple and init_info.field_names.len > i) {
+                            @field(value, f_name) = @field(init, init_info.field_names[i]);
+                        } else if (@hasField(@TypeOf(init), f_name)) {
+                            switch (@typeInfo(f_type)) {
                                 .@"struct" => {
-                                    @field(value, field.name) = zeroInit(field.type, @field(init, field.name));
+                                    @field(value, f_name) = zeroInit(f_type, @field(init, f_name));
                                 },
                                 else => {
-                                    @field(value, field.name) = @field(init, field.name);
+                                    @field(value, f_name) = @field(init, f_name);
                                 },
                             }
-                        } else if (field.defaultValue()) |val| {
-                            @field(value, field.name) = val;
+                        } else if (f_attr.defaultValue(f_type)) |val| {
+                            @field(value, f_name) = val;
                         } else {
-                            switch (@typeInfo(field.type)) {
+                            switch (@typeInfo(f_type)) {
                                 .@"struct" => {
-                                    @field(value, field.name) = std.mem.zeroInit(field.type, .{});
+                                    @field(value, f_name) = std.mem.zeroInit(f_type, .{});
                                 },
                                 else => {
-                                    @field(value, field.name) = std.mem.zeroes(@TypeOf(@field(value, field.name)));
+                                    @field(value, f_name) = std.mem.zeroes(@TypeOf(@field(value, f_name)));
                                 },
                             }
                         }
@@ -597,6 +656,12 @@ test zeroInit {
     }, nested_baz);
 }
 
+/// Sorts a slice in-place using a stable algorithm (maintains relative order of equal elements).
+/// Average time complexity: O(n log n), worst case: O(n log n)
+/// Space complexity: O(log n) for recursive calls
+///
+/// For slice of primitives with default ordering, consider using `std.sort.block` directly.
+/// For unstable but potentially faster sorting, see `sortUnstable`.
 pub fn sort(
     comptime T: type,
     items: []T,
@@ -606,6 +671,12 @@ pub fn sort(
     std.sort.block(T, items, context, lessThanFn);
 }
 
+/// Sorts a slice in-place using an unstable algorithm (does not preserve relative order of equal elements).
+/// Time complexity: O(n) best case, O(n log n) worst case and average case.
+/// Generally faster than stable sort but order of equal elements is undefined.
+///
+/// Uses pattern-defeating quicksort (PDQ) algorithm which performs well on many data patterns.
+/// For stable sorting that preserves equal element order, use `sort`.
 pub fn sortUnstable(
     comptime T: type,
     items: []T,
@@ -621,18 +692,26 @@ pub fn sortContext(a: usize, b: usize, context: anytype) void {
     std.sort.insertionContext(a, b, context);
 }
 
+/// Sorts a range [a, b) using an unstable algorithm with custom context.
+/// This is a lower-level interface for sorting that works with indices instead of slices.
+/// Does not preserve relative order of equal elements.
+///
+/// The context must provide lessThan(a_idx, b_idx) and swap(a_idx, b_idx) methods.
+/// Uses pattern-defeating quicksort (PDQ) algorithm.
 pub fn sortUnstableContext(a: usize, b: usize, context: anytype) void {
     std.sort.pdqContext(a, b, context);
 }
 
 /// Compares two slices of numbers lexicographically. O(n).
 pub fn order(comptime T: type, lhs: []const T, rhs: []const T) math.Order {
-    const n = @min(lhs.len, rhs.len);
-    for (lhs[0..n], rhs[0..n]) |lhs_elem, rhs_elem| {
-        switch (math.order(lhs_elem, rhs_elem)) {
-            .eq => continue,
-            .lt => return .lt,
-            .gt => return .gt,
+    if (lhs.ptr != rhs.ptr) {
+        const n = @min(lhs.len, rhs.len);
+        for (lhs[0..n], rhs[0..n]) |lhs_elem, rhs_elem| {
+            switch (math.order(lhs_elem, rhs_elem)) {
+                .eq => continue,
+                .lt => return .lt,
+                .gt => return .gt,
+            }
         }
     }
     return math.order(lhs.len, rhs.len);
@@ -640,9 +719,15 @@ pub fn order(comptime T: type, lhs: []const T, rhs: []const T) math.Order {
 
 /// Compares two many-item pointers with NUL-termination lexicographically.
 pub fn orderZ(comptime T: type, lhs: [*:0]const T, rhs: [*:0]const T) math.Order {
+    return boundedOrderZ(T, lhs, rhs, std.math.maxInt(usize));
+}
+
+/// Compares two many-item pointers with NUL-termination lexicographically until some specified bound.
+pub fn boundedOrderZ(comptime T: type, lhs: [*:0]const T, rhs: [*:0]const T, bound: usize) math.Order {
+    if (lhs == rhs) return .eq;
     var i: usize = 0;
-    while (lhs[i] == rhs[i] and lhs[i] != 0) : (i += 1) {}
-    return math.order(lhs[i], rhs[i]);
+    while (lhs[i] == rhs[i] and lhs[i] != 0 and i < bound) : (i += 1) {}
+    return if (i < bound) math.order(lhs[i], rhs[i]) else .eq;
 }
 
 test order {
@@ -651,6 +736,10 @@ test order {
     try testing.expect(order(u8, "abc", "abc0") == .lt);
     try testing.expect(order(u8, "", "") == .eq);
     try testing.expect(order(u8, "", "a") == .lt);
+
+    const s: []const u8 = "abc";
+    try testing.expect(order(u8, s, s) == .eq);
+    try testing.expect(order(u8, s[0..2], s) == .lt);
 }
 
 test orderZ {
@@ -659,6 +748,9 @@ test orderZ {
     try testing.expect(orderZ(u8, "abc", "abc0") == .lt);
     try testing.expect(orderZ(u8, "", "") == .eq);
     try testing.expect(orderZ(u8, "", "a") == .lt);
+
+    const s: [*:0]const u8 = "abc";
+    try testing.expect(orderZ(u8, s, s) == .eq);
 }
 
 /// Returns true if lhs < rhs, false otherwise
@@ -674,9 +766,23 @@ test lessThan {
     try testing.expect(lessThan(u8, "", "a"));
 }
 
+/// Returns `true` if `lhs < rhs`; `false` otherwise, operating on null-terminated arrays.
+pub fn lessThanZ(comptime T: type, lhs: [*:0]const T, rhs: [*:0]const T) bool {
+    return orderZ(T, lhs, rhs) == .lt;
+}
+
+test lessThanZ {
+    try testing.expect(lessThanZ(u8, "abcd", "bee"));
+    try testing.expect(!lessThanZ(u8, "abc", "abc"));
+    try testing.expect(lessThanZ(u8, "abc", "abc0"));
+    try testing.expect(!lessThanZ(u8, "", ""));
+    try testing.expect(lessThanZ(u8, "", "a"));
+}
+
 const use_vectors = switch (builtin.zig_backend) {
     // These backends don't support vectors yet.
     .stage2_aarch64,
+    .stage2_loongarch,
     .stage2_powerpc,
     .stage2_riscv64,
     => false,
@@ -698,7 +804,8 @@ pub fn eql(comptime T: type, a: []const T, b: []const T) bool {
     }
 
     if (a.len != b.len) return false;
-    if (a.len == 0 or a.ptr == b.ptr) return true;
+    if (a.len == 0) return true;
+    if (@typeInfo(T) != .float and a.ptr == b.ptr) return true;
 
     for (a, b) |a_elem, b_elem| {
         if (a_elem != b_elem) return false;
@@ -723,6 +830,9 @@ test eql {
 
     try testing.expect(eql(void, &.{ {}, {} }, &.{ {}, {} }));
     try testing.expect(!eql(void, &.{{}}, &.{ {}, {} }));
+
+    const x: [3]f64 = .{ 42.0, math.nan(f64), 3.1415 };
+    try testing.expect(!eql(f64, &x, &x));
 }
 
 /// std.mem.eql heavily optimized for slices of bytes.
@@ -786,23 +896,31 @@ fn eqlBytes(a: []const u8, b: []const u8) bool {
     return !Scan.isNotEqual(last_a_chunk, last_b_chunk);
 }
 
+/// Deprecated in favor of `findDiff`.
+pub const indexOfDiff = findDiff;
+
 /// Compares two slices and returns the index of the first inequality.
 /// Returns null if the slices are equal.
-pub fn indexOfDiff(comptime T: type, a: []const T, b: []const T) ?usize {
-    const shortest = @min(a.len, b.len);
-    if (a.ptr == b.ptr)
-        return if (a.len == b.len) null else shortest;
-    var index: usize = 0;
-    while (index < shortest) : (index += 1) if (a[index] != b[index]) return index;
-    return if (a.len == b.len) null else shortest;
+pub fn findDiff(comptime T: type, a: []const T, b: []const T) ?usize {
+    const shorter = @min(a.len, b.len);
+    if (@typeInfo(T) != .float and a.ptr == b.ptr) {
+        return if (a.len == b.len) null else shorter;
+    }
+    for (a[0..shorter], b[0..shorter], 0..) |a_elem, b_elem, i| {
+        if (a_elem != b_elem) return i;
+    }
+    return if (a.len == b.len) null else shorter;
 }
 
-test indexOfDiff {
-    try testing.expectEqual(indexOfDiff(u8, "one", "one"), null);
-    try testing.expectEqual(indexOfDiff(u8, "one two", "one"), 3);
-    try testing.expectEqual(indexOfDiff(u8, "one", "one two"), 3);
-    try testing.expectEqual(indexOfDiff(u8, "one twx", "one two"), 6);
-    try testing.expectEqual(indexOfDiff(u8, "xne", "one"), 0);
+test findDiff {
+    try testing.expectEqual(null, findDiff(u8, "one", "one"));
+    try testing.expectEqual(3, findDiff(u8, "one two", "one"));
+    try testing.expectEqual(3, findDiff(u8, "one", "one two"));
+    try testing.expectEqual(6, findDiff(u8, "one twx", "one two"));
+    try testing.expectEqual(0, findDiff(u8, "xne", "one"));
+
+    const x: [3]f64 = .{ 42.0, math.nan(f64), 3.1415 };
+    try testing.expectEqual(1, findDiff(f64, &x, &x));
 }
 
 /// Takes a sentinel-terminated pointer and returns a slice preserving pointer attributes.
@@ -813,17 +931,14 @@ fn Span(comptime T: type) type {
             return ?Span(optional_info.child);
         },
         .pointer => |ptr_info| {
-            var new_ptr_info = ptr_info;
-            switch (ptr_info.size) {
-                .c => {
-                    new_ptr_info.sentinel_ptr = &@as(ptr_info.child, 0);
-                    new_ptr_info.is_allowzero = false;
-                },
-                .many => if (ptr_info.sentinel() == null) @compileError("invalid type given to std.mem.span: " ++ @typeName(T)),
+            const new_sentinel: ?ptr_info.child = switch (ptr_info.size) {
                 .one, .slice => @compileError("invalid type given to std.mem.span: " ++ @typeName(T)),
-            }
-            new_ptr_info.size = .slice;
-            return @Type(.{ .pointer = new_ptr_info });
+                .many => ptr_info.sentinel() orelse @compileError("invalid type given to std.mem.span: " ++ @typeName(T)),
+                .c => 0,
+            };
+            var attrs = ptr_info.attrs;
+            attrs.@"allowzero" = attrs.@"allowzero" and ptr_info.size != .c;
+            return @Pointer(.slice, attrs, ptr_info.child, new_sentinel);
         },
         else => {},
     }
@@ -877,56 +992,29 @@ fn SliceTo(comptime T: type, comptime end: std.meta.Elem(T)) type {
             return ?SliceTo(optional_info.child, end);
         },
         .pointer => |ptr_info| {
-            var new_ptr_info = ptr_info;
-            new_ptr_info.size = .slice;
-            switch (ptr_info.size) {
-                .one => switch (@typeInfo(ptr_info.child)) {
-                    .array => |array_info| {
-                        new_ptr_info.child = array_info.child;
-                        // The return type must only be sentinel terminated if we are guaranteed
-                        // to find the value searched for, which is only the case if it matches
-                        // the sentinel of the type passed.
-                        if (array_info.sentinel()) |s| {
-                            if (end == s) {
-                                new_ptr_info.sentinel_ptr = &end;
-                            } else {
-                                new_ptr_info.sentinel_ptr = null;
-                            }
-                        }
-                    },
-                    else => {},
-                },
-                .many, .slice => {
-                    // The return type must only be sentinel terminated if we are guaranteed
-                    // to find the value searched for, which is only the case if it matches
-                    // the sentinel of the type passed.
-                    if (ptr_info.sentinel()) |s| {
-                        if (end == s) {
-                            new_ptr_info.sentinel_ptr = &end;
-                        } else {
-                            new_ptr_info.sentinel_ptr = null;
-                        }
-                    }
-                },
-                .c => {
-                    new_ptr_info.sentinel_ptr = &end;
-                    // C pointers are always allowzero, but we don't want the return type to be.
-                    assert(new_ptr_info.is_allowzero);
-                    new_ptr_info.is_allowzero = false;
-                },
-            }
-            return @Type(.{ .pointer = new_ptr_info });
+            const Elem = std.meta.Elem(T);
+            const have_sentinel: bool = switch (ptr_info.size) {
+                .one, .slice => if (std.meta.sentinel(T)) |s| s == end else false,
+                .many => if (std.meta.sentinel(T)) |s| s == end else true,
+                .c => true,
+            };
+            var attrs = ptr_info.attrs;
+            attrs.@"allowzero" = attrs.@"allowzero" and ptr_info.size != .c;
+            return @Pointer(.slice, attrs, Elem, if (have_sentinel) end else null);
         },
         else => {},
     }
     @compileError("invalid type given to std.mem.sliceTo: " ++ @typeName(T));
 }
 
-/// Takes a pointer to an array, a sentinel-terminated pointer, or a slice and iterates searching for
-/// the first occurrence of `end`, returning the scanned slice.
-/// If `end` is not found, the full length of the array/slice/sentinel terminated pointer is returned.
-/// If the pointer type is sentinel terminated and `end` matches that terminator, the
-/// resulting slice is also sentinel terminated.
+/// Takes a pointer to an array, a many-item pointer, or a slice, and returns a
+/// slice of the items up to the first occurrence of `end`.
+/// If `end` is not found, the resulting slice will include all items up to the
+/// input's length or sentinel.
+/// If the pointer type is unbounded (no length or sentinel), `end` will be the
+/// sentinel for the resulting slice.
+/// If the pointer type is sentinel-terminated by `end`, the resulting slice
+/// will also be sentinel-terminated by `end`.
 /// Pointer properties such as mutability and alignment are preserved.
 /// C pointers are assumed to be non-null.
 pub fn sliceTo(ptr: anytype, comptime end: std.meta.Elem(@TypeOf(ptr))) SliceTo(@TypeOf(ptr), end) {
@@ -954,8 +1042,15 @@ test sliceTo {
         try testing.expectEqualSlices(u16, array[0..2], sliceTo(&array, 3));
         try testing.expectEqualSlices(u16, array[0..2], sliceTo(array[0..3], 3));
 
+        const many_ptr: [*]u16 = &array;
+        try testing.expectEqualSlices(u16, array[0..2], sliceTo(many_ptr, 3));
+        try testing.expectEqual([:3]u16, @TypeOf(sliceTo(many_ptr, 3)));
+
         const sentinel_ptr = @as([*:5]u16, @ptrCast(&array));
         try testing.expectEqualSlices(u16, array[0..2], sliceTo(sentinel_ptr, 3));
+        try testing.expectEqual([]u16, @TypeOf(sliceTo(sentinel_ptr, 3)));
+        try testing.expectEqualSlices(u16, array[0..4], sliceTo(sentinel_ptr, 5));
+        try testing.expectEqual([:5]u16, @TypeOf(sliceTo(sentinel_ptr, 5)));
         try testing.expectEqualSlices(u16, array[0..4], sliceTo(sentinel_ptr, 99));
 
         const optional_sentinel_ptr = @as(?[*:5]u16, @ptrCast(&array));
@@ -964,6 +1059,7 @@ test sliceTo {
 
         const c_ptr = @as([*c]u16, &array);
         try testing.expectEqualSlices(u16, array[0..2], sliceTo(c_ptr, 3));
+        try testing.expectEqual([:3]u16, @TypeOf(sliceTo(c_ptr, 3)));
 
         const slice: []u16 = &array;
         try testing.expectEqualSlices(u16, array[0..2], sliceTo(slice, 3));
@@ -991,16 +1087,16 @@ fn lenSliceTo(ptr: anytype, comptime end: std.meta.Elem(@TypeOf(ptr))) usize {
                 .array => |array_info| {
                     if (array_info.sentinel()) |s| {
                         if (s == end) {
-                            return indexOfSentinel(array_info.child, end, ptr);
+                            return findSentinel(array_info.child, end, ptr);
                         }
                     }
-                    return indexOfScalar(array_info.child, ptr, end) orelse array_info.len;
+                    return findScalar(array_info.child, ptr, end) orelse array_info.len;
                 },
                 else => {},
             },
             .many => if (ptr_info.sentinel()) |s| {
                 if (s == end) {
-                    return indexOfSentinel(ptr_info.child, end, ptr);
+                    return findSentinel(ptr_info.child, end, ptr);
                 }
                 // We're looking for something other than the sentinel,
                 // but iterating past the sentinel would be a bug so we need
@@ -1008,18 +1104,20 @@ fn lenSliceTo(ptr: anytype, comptime end: std.meta.Elem(@TypeOf(ptr))) usize {
                 var i: usize = 0;
                 while (ptr[i] != end and ptr[i] != s) i += 1;
                 return i;
+            } else {
+                return findSentinel(ptr_info.child, end, @ptrCast(ptr));
             },
             .c => {
                 assert(ptr != null);
-                return indexOfSentinel(ptr_info.child, end, ptr);
+                return findSentinel(ptr_info.child, end, ptr);
             },
             .slice => {
                 if (ptr_info.sentinel()) |s| {
                     if (s == end) {
-                        return indexOfSentinel(ptr_info.child, s, ptr);
+                        return findSentinel(ptr_info.child, s, ptr);
                     }
                 }
-                return indexOfScalar(ptr_info.child, ptr, end) orelse ptr.len;
+                return findScalar(ptr_info.child, ptr, end) orelse ptr.len;
             },
         },
         else => {},
@@ -1069,11 +1167,11 @@ pub fn len(value: anytype) usize {
             .many => {
                 const sentinel = info.sentinel() orelse
                     @compileError("invalid type given to std.mem.len: " ++ @typeName(@TypeOf(value)));
-                return indexOfSentinel(info.child, sentinel, value);
+                return findSentinel(info.child, sentinel, value);
             },
             .c => {
                 assert(value != null);
-                return indexOfSentinel(info.child, 0, value);
+                return findSentinel(info.child, 0, value);
             },
             else => @compileError("invalid type given to std.mem.len: " ++ @typeName(@TypeOf(value))),
         },
@@ -1089,72 +1187,20 @@ test len {
     try testing.expect(len(c_ptr) == 2);
 }
 
-pub fn indexOfSentinel(comptime T: type, comptime sentinel: T, p: [*:sentinel]const T) usize {
+/// Deprecated in favor of `findSentinel`.
+pub const indexOfSentinel = findSentinel;
+
+/// Returns the index of the sentinel value in a sentinel-terminated pointer.
+/// Linear search through memory until the sentinel is found.
+pub fn findSentinel(comptime T: type, comptime sentinel: T, p: [*:sentinel]const T) usize {
     var i: usize = 0;
-
-    if (use_vectors_for_comparison and
-        !std.debug.inValgrind() and // https://github.com/ziglang/zig/issues/17717
-        !@inComptime() and
-        (@typeInfo(T) == .int or @typeInfo(T) == .float) and std.math.isPowerOfTwo(@bitSizeOf(T)))
-    {
-        switch (@import("builtin").cpu.arch) {
-            // The below branch assumes that reading past the end of the buffer is valid, as long
-            // as we don't read into a new page. This should be the case for most architectures
-            // which use paged memory, however should be confirmed before adding a new arch below.
-            .aarch64, .x86, .x86_64 => if (std.simd.suggestVectorLength(T)) |block_len| {
-                const page_size = std.heap.page_size_min;
-                const block_size = @sizeOf(T) * block_len;
-                const Block = @Vector(block_len, T);
-                const mask: Block = @splat(sentinel);
-
-                comptime assert(std.heap.page_size_min % @sizeOf(Block) == 0);
-                assert(page_size % @sizeOf(Block) == 0);
-
-                // First block may be unaligned
-                const start_addr = @intFromPtr(&p[i]);
-                const offset_in_page = start_addr & (page_size - 1);
-                if (offset_in_page <= page_size - @sizeOf(Block)) {
-                    // Will not read past the end of a page, full block.
-                    const block: Block = p[i..][0..block_len].*;
-                    const matches = block == mask;
-                    if (@reduce(.Or, matches)) {
-                        return i + std.simd.firstTrue(matches).?;
-                    }
-
-                    i += @divExact(std.mem.alignForward(usize, start_addr, block_size) - start_addr, @sizeOf(T));
-                } else {
-                    @branchHint(.unlikely);
-                    // Would read over a page boundary. Per-byte at a time until aligned or found.
-                    // 0.39% chance this branch is taken for 4K pages at 16b block length.
-                    //
-                    // An alternate strategy is to do read a full block (the last in the page) and
-                    // mask the entries before the pointer.
-                    while ((@intFromPtr(&p[i]) & (block_size - 1)) != 0) : (i += 1) {
-                        if (p[i] == sentinel) return i;
-                    }
-                }
-
-                assert(std.mem.isAligned(@intFromPtr(&p[i]), block_size));
-                while (true) {
-                    const block: *const Block = @ptrCast(@alignCast(p[i..][0..block_len]));
-                    const matches = block.* == mask;
-                    if (@reduce(.Or, matches)) {
-                        return i + std.simd.firstTrue(matches).?;
-                    }
-                    i += block_len;
-                }
-            },
-            else => {},
-        }
-    }
-
     while (p[i] != sentinel) {
         i += 1;
     }
     return i;
 }
 
-test "indexOfSentinel vector paths" {
+test "findSentinel vector paths" {
     const Types = [_]type{ u8, u16, u32, u64 };
     const allocator = std.testing.allocator;
     const page_size = std.heap.page_size_min;
@@ -1177,7 +1223,7 @@ test "indexOfSentinel vector paths" {
         const search_len = page_size / @sizeOf(T);
         memory[start + search_len] = 0;
         for (0..block_len) |offset| {
-            try testing.expectEqual(search_len - offset, indexOfSentinel(T, 0, @ptrCast(&memory[start + offset])));
+            try testing.expectEqual(search_len - offset, findSentinel(T, 0, @ptrCast(&memory[start + offset])));
         }
         memory[start + search_len] = 0xaa;
 
@@ -1185,7 +1231,7 @@ test "indexOfSentinel vector paths" {
         const start_page_boundary = start + (page_size / @sizeOf(T));
         memory[start_page_boundary + block_len] = 0;
         for (0..block_len) |offset| {
-            try testing.expectEqual(2 * block_len - offset, indexOfSentinel(T, 0, @ptrCast(&memory[start_page_boundary - block_len + offset])));
+            try testing.expectEqual(2 * block_len - offset, findSentinel(T, 0, @ptrCast(&memory[start_page_boundary - block_len + offset])));
         }
     }
 }
@@ -1201,7 +1247,7 @@ pub fn allEqual(comptime T: type, slice: []const T, scalar: T) bool {
 /// Remove a set of values from the beginning of a slice.
 pub fn trimStart(comptime T: type, slice: []const T, values_to_strip: []const T) []const T {
     var begin: usize = 0;
-    while (begin < slice.len and indexOfScalar(T, values_to_strip, slice[begin]) != null) : (begin += 1) {}
+    while (begin < slice.len and findScalar(T, values_to_strip, slice[begin]) != null) : (begin += 1) {}
     return slice[begin..];
 }
 
@@ -1209,13 +1255,10 @@ test trimStart {
     try testing.expectEqualSlices(u8, "foo\n ", trimStart(u8, " foo\n ", " \n"));
 }
 
-/// Deprecated: use `trimStart` instead.
-pub const trimLeft = trimStart;
-
 /// Remove a set of values from the end of a slice.
 pub fn trimEnd(comptime T: type, slice: []const T, values_to_strip: []const T) []const T {
     var end: usize = slice.len;
-    while (end > 0 and indexOfScalar(T, values_to_strip, slice[end - 1]) != null) : (end -= 1) {}
+    while (end > 0 and findScalar(T, values_to_strip, slice[end - 1]) != null) : (end -= 1) {}
     return slice[0..end];
 }
 
@@ -1223,15 +1266,12 @@ test trimEnd {
     try testing.expectEqualSlices(u8, " foo", trimEnd(u8, " foo\n ", " \n"));
 }
 
-/// Deprecated: use `trimEnd` instead.
-pub const trimRight = trimEnd;
-
 /// Remove a set of values from the beginning and end of a slice.
 pub fn trim(comptime T: type, slice: []const T, values_to_strip: []const T) []const T {
     var begin: usize = 0;
     var end: usize = slice.len;
-    while (begin < end and indexOfScalar(T, values_to_strip, slice[begin]) != null) : (begin += 1) {}
-    while (end > begin and indexOfScalar(T, values_to_strip, slice[end - 1]) != null) : (end -= 1) {}
+    while (begin < end and findScalar(T, values_to_strip, slice[begin]) != null) : (begin += 1) {}
+    while (end > begin and findScalar(T, values_to_strip, slice[end - 1]) != null) : (end -= 1) {}
     return slice[begin..end];
 }
 
@@ -1240,13 +1280,19 @@ test trim {
     try testing.expectEqualSlices(u8, "foo", trim(u8, "foo", " \n"));
 }
 
+/// Deprecated in favor of `findScalar`.
+pub const indexOfScalar = findScalar;
+
 /// Linear search for the index of a scalar value inside a slice.
-pub fn indexOfScalar(comptime T: type, slice: []const T, value: T) ?usize {
-    return indexOfScalarPos(T, slice, 0, value);
+pub fn findScalar(comptime T: type, slice: []const T, value: T) ?usize {
+    return findScalarPos(T, slice, 0, value);
 }
 
+/// Deprecated in favor of `findScalarLast`.
+pub const lastIndexOfScalar = findScalarLast;
+
 /// Linear search for the last index of a scalar value inside a slice.
-pub fn lastIndexOfScalar(comptime T: type, slice: []const T, value: T) ?usize {
+pub fn findScalarLast(comptime T: type, slice: []const T, value: T) ?usize {
     var i: usize = slice.len;
     while (i != 0) {
         i -= 1;
@@ -1255,7 +1301,12 @@ pub fn lastIndexOfScalar(comptime T: type, slice: []const T, value: T) ?usize {
     return null;
 }
 
-pub fn indexOfScalarPos(comptime T: type, slice: []const T, start_index: usize, value: T) ?usize {
+/// Deprecated in favor of `findScalarPos`.
+pub const indexOfScalarPos = findScalarPos;
+
+/// Linear search for the index of a scalar value inside a slice, starting from a given position.
+/// Returns null if the value is not found.
+pub fn findScalarPos(comptime T: type, slice: []const T, start_index: usize, value: T) ?usize {
     if (start_index >= slice.len) return null;
 
     var i: usize = start_index;
@@ -1317,7 +1368,7 @@ pub fn indexOfScalarPos(comptime T: type, slice: []const T, start_index: usize, 
     return null;
 }
 
-test indexOfScalarPos {
+test findScalarPos {
     const Types = [_]type{ u8, u16, u32, u64 };
 
     inline for (Types) |T| {
@@ -1326,16 +1377,26 @@ test indexOfScalarPos {
         memory[memory.len - 1] = 0;
 
         for (0..memory.len) |i| {
-            try testing.expectEqual(memory.len - i - 1, indexOfScalarPos(T, memory[i..], 0, 0).?);
+            try testing.expectEqual(memory.len - i - 1, findScalarPos(T, memory[i..], 0, 0).?);
         }
     }
 }
 
-pub fn indexOfAny(comptime T: type, slice: []const T, values: []const T) ?usize {
-    return indexOfAnyPos(T, slice, 0, values);
+/// Deprecated in favor of `findAny`.
+pub const indexOfAny = findAny;
+
+/// Linear search for the index of any value in the provided list inside a slice.
+/// Returns null if no values are found.
+pub fn findAny(comptime T: type, slice: []const T, values: []const T) ?usize {
+    return findAnyPos(T, slice, 0, values);
 }
 
-pub fn lastIndexOfAny(comptime T: type, slice: []const T, values: []const T) ?usize {
+/// Deprecated in favor of `findLastAny`.
+pub const lastIndexOfAny = findLastAny;
+
+/// Linear search for the last index of any value in the provided list inside a slice.
+/// Returns null if no values are found.
+pub fn findLastAny(comptime T: type, slice: []const T, values: []const T) ?usize {
     var i: usize = slice.len;
     while (i != 0) {
         i -= 1;
@@ -1346,7 +1407,12 @@ pub fn lastIndexOfAny(comptime T: type, slice: []const T, values: []const T) ?us
     return null;
 }
 
-pub fn indexOfAnyPos(comptime T: type, slice: []const T, start_index: usize, values: []const T) ?usize {
+/// Deprecated in favor of `findAnyPos`.
+pub const indexOfAnyPos = findAnyPos;
+
+/// Linear search for the index of any value in the provided list inside a slice, starting from a given position.
+/// Returns null if no values are found.
+pub fn findAnyPos(comptime T: type, slice: []const T, start_index: usize, values: []const T) ?usize {
     if (start_index >= slice.len) return null;
     for (slice[start_index..], start_index..) |c, i| {
         for (values) |value| {
@@ -1356,17 +1422,34 @@ pub fn indexOfAnyPos(comptime T: type, slice: []const T, start_index: usize, val
     return null;
 }
 
+/// Deprecated in favor of `findNone`.
+pub const indexOfNone = findNone;
+
 /// Find the first item in `slice` which is not contained in `values`.
 ///
 /// Comparable to `strspn` in the C standard library.
-pub fn indexOfNone(comptime T: type, slice: []const T, values: []const T) ?usize {
-    return indexOfNonePos(T, slice, 0, values);
+pub fn findNone(comptime T: type, slice: []const T, values: []const T) ?usize {
+    return findNonePos(T, slice, 0, values);
 }
+
+test findNone {
+    try testing.expect(findNone(u8, "abc123", "123").? == 0);
+    try testing.expect(findLastNone(u8, "abc123", "123").? == 2);
+    try testing.expect(findNone(u8, "123abc", "123").? == 3);
+    try testing.expect(findLastNone(u8, "123abc", "123").? == 5);
+    try testing.expect(findNone(u8, "123123", "123") == null);
+    try testing.expect(findNone(u8, "333333", "123") == null);
+
+    try testing.expect(findNonePos(u8, "abc123", 3, "321") == null);
+}
+
+/// Deprecated in favor of `findLastNone`.
+pub const lastIndexOfNone = findLastNone;
 
 /// Find the last item in `slice` which is not contained in `values`.
 ///
 /// Like `strspn` in the C standard library, but searches from the end.
-pub fn lastIndexOfNone(comptime T: type, slice: []const T, values: []const T) ?usize {
+pub fn findLastNone(comptime T: type, slice: []const T, values: []const T) ?usize {
     var i: usize = slice.len;
     outer: while (i != 0) {
         i -= 1;
@@ -1378,11 +1461,13 @@ pub fn lastIndexOfNone(comptime T: type, slice: []const T, values: []const T) ?u
     return null;
 }
 
+pub const indexOfNonePos = findNonePos;
+
 /// Find the first item in `slice[start_index..]` which is not contained in `values`.
 /// The returned index will be relative to the start of `slice`, and never less than `start_index`.
 ///
 /// Comparable to `strspn` in the C standard library.
-pub fn indexOfNonePos(comptime T: type, slice: []const T, start_index: usize, values: []const T) ?usize {
+pub fn findNonePos(comptime T: type, slice: []const T, start_index: usize, values: []const T) ?usize {
     if (start_index >= slice.len) return null;
     outer: for (slice[start_index..], start_index..) |c, i| {
         for (values) |value| {
@@ -1393,26 +1478,24 @@ pub fn indexOfNonePos(comptime T: type, slice: []const T, start_index: usize, va
     return null;
 }
 
-test indexOfNone {
-    try testing.expect(indexOfNone(u8, "abc123", "123").? == 0);
-    try testing.expect(lastIndexOfNone(u8, "abc123", "123").? == 2);
-    try testing.expect(indexOfNone(u8, "123abc", "123").? == 3);
-    try testing.expect(lastIndexOfNone(u8, "123abc", "123").? == 5);
-    try testing.expect(indexOfNone(u8, "123123", "123") == null);
-    try testing.expect(indexOfNone(u8, "333333", "123") == null);
+/// Deprecated in favor of `find`.
+pub const indexOf = find;
 
-    try testing.expect(indexOfNonePos(u8, "abc123", 3, "321") == null);
+/// Search for needle in haystack and return the index of the first occurrence.
+/// Uses Boyer-Moore-Horspool algorithm on large inputs; linear search on small inputs.
+/// Returns null if needle is not found.
+pub fn find(comptime T: type, haystack: []const T, needle: []const T) ?usize {
+    return findPos(T, haystack, 0, needle);
 }
 
-pub fn indexOf(comptime T: type, haystack: []const T, needle: []const T) ?usize {
-    return indexOfPos(T, haystack, 0, needle);
-}
+/// Deprecated in favor of `findLastLinear`.
+pub const lastIndexOfLinear = findLastLinear;
 
 /// Find the index in a slice of a sub-slice, searching from the end backwards.
 /// To start looking at a different index, slice the haystack first.
 /// Consider using `lastIndexOf` instead of this, which will automatically use a
 /// more sophisticated algorithm on larger inputs.
-pub fn lastIndexOfLinear(comptime T: type, haystack: []const T, needle: []const T) ?usize {
+pub fn findLastLinear(comptime T: type, haystack: []const T, needle: []const T) ?usize {
     if (needle.len > haystack.len) return null;
     var i: usize = haystack.len - needle.len;
     while (true) : (i -= 1) {
@@ -1421,9 +1504,11 @@ pub fn lastIndexOfLinear(comptime T: type, haystack: []const T, needle: []const 
     }
 }
 
-/// Consider using `indexOfPos` instead of this, which will automatically use a
+pub const indexOfPosLinear = findPosLinear;
+
+/// Consider using `findPos` instead of this, which will automatically use a
 /// more sophisticated algorithm on larger inputs.
-pub fn indexOfPosLinear(comptime T: type, haystack: []const T, start_index: usize, needle: []const T) ?usize {
+pub fn findPosLinear(comptime T: type, haystack: []const T, start_index: usize, needle: []const T) ?usize {
     if (needle.len > haystack.len) return null;
     var i: usize = start_index;
     const end = haystack.len - needle.len;
@@ -1433,24 +1518,24 @@ pub fn indexOfPosLinear(comptime T: type, haystack: []const T, start_index: usiz
     return null;
 }
 
-test indexOfPosLinear {
-    try testing.expectEqual(0, indexOfPosLinear(u8, "", 0, ""));
-    try testing.expectEqual(0, indexOfPosLinear(u8, "123", 0, ""));
+test findPosLinear {
+    try testing.expectEqual(0, findPosLinear(u8, "", 0, ""));
+    try testing.expectEqual(0, findPosLinear(u8, "123", 0, ""));
 
-    try testing.expectEqual(null, indexOfPosLinear(u8, "", 0, "1"));
-    try testing.expectEqual(0, indexOfPosLinear(u8, "1", 0, "1"));
-    try testing.expectEqual(null, indexOfPosLinear(u8, "2", 0, "1"));
-    try testing.expectEqual(1, indexOfPosLinear(u8, "21", 0, "1"));
-    try testing.expectEqual(null, indexOfPosLinear(u8, "222", 0, "1"));
+    try testing.expectEqual(null, findPosLinear(u8, "", 0, "1"));
+    try testing.expectEqual(0, findPosLinear(u8, "1", 0, "1"));
+    try testing.expectEqual(null, findPosLinear(u8, "2", 0, "1"));
+    try testing.expectEqual(1, findPosLinear(u8, "21", 0, "1"));
+    try testing.expectEqual(null, findPosLinear(u8, "222", 0, "1"));
 
-    try testing.expectEqual(null, indexOfPosLinear(u8, "", 0, "12"));
-    try testing.expectEqual(null, indexOfPosLinear(u8, "1", 0, "12"));
-    try testing.expectEqual(null, indexOfPosLinear(u8, "2", 0, "12"));
-    try testing.expectEqual(0, indexOfPosLinear(u8, "12", 0, "12"));
-    try testing.expectEqual(null, indexOfPosLinear(u8, "21", 0, "12"));
-    try testing.expectEqual(1, indexOfPosLinear(u8, "212", 0, "12"));
-    try testing.expectEqual(0, indexOfPosLinear(u8, "122", 0, "12"));
-    try testing.expectEqual(1, indexOfPosLinear(u8, "212112", 0, "12"));
+    try testing.expectEqual(null, findPosLinear(u8, "", 0, "12"));
+    try testing.expectEqual(null, findPosLinear(u8, "1", 0, "12"));
+    try testing.expectEqual(null, findPosLinear(u8, "2", 0, "12"));
+    try testing.expectEqual(0, findPosLinear(u8, "12", 0, "12"));
+    try testing.expectEqual(null, findPosLinear(u8, "21", 0, "12"));
+    try testing.expectEqual(1, findPosLinear(u8, "212", 0, "12"));
+    try testing.expectEqual(0, findPosLinear(u8, "122", 0, "12"));
+    try testing.expectEqual(1, findPosLinear(u8, "212112", 0, "12"));
 }
 
 fn boyerMooreHorspoolPreprocessReverse(pattern: []const u8, table: *[256]usize) void {
@@ -1479,16 +1564,19 @@ fn boyerMooreHorspoolPreprocess(pattern: []const u8, table: *[256]usize) void {
     }
 }
 
+/// Deprecated in favor of `find`.
+pub const lastIndexOf = findLast;
+
 /// Find the index in a slice of a sub-slice, searching from the end backwards.
 /// To start looking at a different index, slice the haystack first.
 /// Uses the Reverse Boyer-Moore-Horspool algorithm on large inputs;
 /// `lastIndexOfLinear` on small inputs.
-pub fn lastIndexOf(comptime T: type, haystack: []const T, needle: []const T) ?usize {
+pub fn findLast(comptime T: type, haystack: []const T, needle: []const T) ?usize {
     if (needle.len > haystack.len) return null;
     if (needle.len == 0) return haystack.len;
 
     if (!std.meta.hasUniqueRepresentation(T) or haystack.len < 52 or needle.len <= 4)
-        return lastIndexOfLinear(T, haystack, needle);
+        return findLastLinear(T, haystack, needle);
 
     const haystack_bytes = sliceAsBytes(haystack);
     const needle_bytes = sliceAsBytes(needle);
@@ -1509,17 +1597,20 @@ pub fn lastIndexOf(comptime T: type, haystack: []const T, needle: []const T) ?us
     return null;
 }
 
-/// Uses Boyer-Moore-Horspool algorithm on large inputs; `indexOfPosLinear` on small inputs.
-pub fn indexOfPos(comptime T: type, haystack: []const T, start_index: usize, needle: []const T) ?usize {
+/// Deprecated in favor of `findPos`.
+pub const indexOfPos = findPos;
+
+/// Uses Boyer-Moore-Horspool algorithm on large inputs; `findPosLinear` on small inputs.
+pub fn findPos(comptime T: type, haystack: []const T, start_index: usize, needle: []const T) ?usize {
     if (needle.len > haystack.len) return null;
     if (needle.len < 2) {
         if (needle.len == 0) return start_index;
-        // indexOfScalarPos is significantly faster than indexOfPosLinear
-        return indexOfScalarPos(T, haystack, start_index, needle[0]);
+        // findScalarPos is significantly faster than findPosLinear
+        return findScalarPos(T, haystack, start_index, needle[0]);
     }
 
     if (!std.meta.hasUniqueRepresentation(T) or haystack.len < 52 or needle.len <= 4)
-        return indexOfPosLinear(T, haystack, start_index, needle);
+        return findPosLinear(T, haystack, start_index, needle);
 
     const haystack_bytes = sliceAsBytes(haystack);
     const needle_bytes = sliceAsBytes(needle);
@@ -1538,72 +1629,73 @@ pub fn indexOfPos(comptime T: type, haystack: []const T, start_index: usize, nee
     return null;
 }
 
-test indexOf {
-    try testing.expect(indexOf(u8, "one two three four five six seven eight nine ten eleven", "three four").? == 8);
-    try testing.expect(lastIndexOf(u8, "one two three four five six seven eight nine ten eleven", "three four").? == 8);
-    try testing.expect(indexOf(u8, "one two three four five six seven eight nine ten eleven", "two two") == null);
-    try testing.expect(lastIndexOf(u8, "one two three four five six seven eight nine ten eleven", "two two") == null);
+test find {
+    try testing.expect(find(u8, "one two three four five six seven eight nine ten eleven", "three four").? == 8);
+    try testing.expect(findLast(u8, "one two three four five six seven eight nine ten eleven", "three four").? == 8);
+    try testing.expect(find(u8, "one two three four five six seven eight nine ten eleven", "two two") == null);
+    try testing.expect(findLast(u8, "one two three four five six seven eight nine ten eleven", "two two") == null);
 
-    try testing.expect(indexOf(u8, "one two three four five six seven eight nine ten", "").? == 0);
-    try testing.expect(lastIndexOf(u8, "one two three four five six seven eight nine ten", "").? == 48);
+    try testing.expect(find(u8, "one two three four five six seven eight nine ten", "").? == 0);
+    try testing.expect(findLast(u8, "one two three four five six seven eight nine ten", "").? == 48);
 
-    try testing.expect(indexOf(u8, "one two three four", "four").? == 14);
-    try testing.expect(lastIndexOf(u8, "one two three two four", "two").? == 14);
-    try testing.expect(indexOf(u8, "one two three four", "gour") == null);
-    try testing.expect(lastIndexOf(u8, "one two three four", "gour") == null);
-    try testing.expect(indexOf(u8, "foo", "foo").? == 0);
-    try testing.expect(lastIndexOf(u8, "foo", "foo").? == 0);
-    try testing.expect(indexOf(u8, "foo", "fool") == null);
-    try testing.expect(lastIndexOf(u8, "foo", "lfoo") == null);
-    try testing.expect(lastIndexOf(u8, "foo", "fool") == null);
+    try testing.expect(find(u8, "one two three four", "four").? == 14);
+    try testing.expect(findLast(u8, "one two three two four", "two").? == 14);
+    try testing.expect(find(u8, "one two three four", "gour") == null);
+    try testing.expect(findLast(u8, "one two three four", "gour") == null);
+    try testing.expect(find(u8, "foo", "foo").? == 0);
+    try testing.expect(findLast(u8, "foo", "foo").? == 0);
+    try testing.expect(find(u8, "foo", "fool") == null);
+    try testing.expect(findLast(u8, "foo", "lfoo") == null);
+    try testing.expect(findLast(u8, "foo", "fool") == null);
 
-    try testing.expect(indexOf(u8, "foo foo", "foo").? == 0);
-    try testing.expect(lastIndexOf(u8, "foo foo", "foo").? == 4);
-    try testing.expect(lastIndexOfAny(u8, "boo, cat", "abo").? == 6);
-    try testing.expect(lastIndexOfScalar(u8, "boo", 'o').? == 2);
+    try testing.expect(find(u8, "foo foo", "foo").? == 0);
+    try testing.expect(findLast(u8, "foo foo", "foo").? == 4);
+    try testing.expect(findLastAny(u8, "boo, cat", "abo").? == 6);
+    try testing.expect(findScalarLast(u8, "boo", 'o').? == 2);
 }
 
-test "indexOf multibyte" {
+test "find multibyte" {
     {
         // make haystack and needle long enough to trigger Boyer-Moore-Horspool algorithm
-        const haystack = [1]u16{0} ** 100 ++ [_]u16{ 0xbbaa, 0xccbb, 0xddcc, 0xeedd, 0xffee, 0x00ff };
+        const haystack = @as([100]u16, @splat(0)) ++ [_]u16{ 0xbbaa, 0xccbb, 0xddcc, 0xeedd, 0xffee, 0x00ff };
         const needle = [_]u16{ 0xbbaa, 0xccbb, 0xddcc, 0xeedd, 0xffee };
-        try testing.expectEqual(indexOfPos(u16, &haystack, 0, &needle), 100);
+        try testing.expectEqual(findPos(u16, &haystack, 0, &needle), 100);
 
         // check for misaligned false positives (little and big endian)
         const needleLE = [_]u16{ 0xbbbb, 0xcccc, 0xdddd, 0xeeee, 0xffff };
-        try testing.expectEqual(indexOfPos(u16, &haystack, 0, &needleLE), null);
+        try testing.expectEqual(findPos(u16, &haystack, 0, &needleLE), null);
         const needleBE = [_]u16{ 0xaacc, 0xbbdd, 0xccee, 0xddff, 0xee00 };
-        try testing.expectEqual(indexOfPos(u16, &haystack, 0, &needleBE), null);
+        try testing.expectEqual(findPos(u16, &haystack, 0, &needleBE), null);
     }
 
     {
         // make haystack and needle long enough to trigger Boyer-Moore-Horspool algorithm
-        const haystack = [_]u16{ 0xbbaa, 0xccbb, 0xddcc, 0xeedd, 0xffee, 0x00ff } ++ [1]u16{0} ** 100;
+        const haystack = [_]u16{ 0xbbaa, 0xccbb, 0xddcc, 0xeedd, 0xffee, 0x00ff } ++ @as([100]u16, @splat(0));
         const needle = [_]u16{ 0xbbaa, 0xccbb, 0xddcc, 0xeedd, 0xffee };
-        try testing.expectEqual(lastIndexOf(u16, &haystack, &needle), 0);
+        try testing.expectEqual(findLast(u16, &haystack, &needle), 0);
 
         // check for misaligned false positives (little and big endian)
         const needleLE = [_]u16{ 0xbbbb, 0xcccc, 0xdddd, 0xeeee, 0xffff };
-        try testing.expectEqual(lastIndexOf(u16, &haystack, &needleLE), null);
+        try testing.expectEqual(findLast(u16, &haystack, &needleLE), null);
         const needleBE = [_]u16{ 0xaacc, 0xbbdd, 0xccee, 0xddff, 0xee00 };
-        try testing.expectEqual(lastIndexOf(u16, &haystack, &needleBE), null);
+        try testing.expectEqual(findLast(u16, &haystack, &needleBE), null);
     }
 }
 
-test "indexOfPos empty needle" {
-    try testing.expectEqual(indexOfPos(u8, "abracadabra", 5, ""), 5);
+test "findPos empty needle" {
+    try testing.expectEqual(findPos(u8, "abracadabra", 5, ""), 5);
 }
 
 /// Returns the number of needles inside the haystack
 /// needle.len must be > 0
 /// does not count overlapping needles
 pub fn count(comptime T: type, haystack: []const T, needle: []const T) usize {
+    if (needle.len == 1) return countScalar(T, haystack, needle[0]);
     assert(needle.len > 0);
     var i: usize = 0;
     var found: usize = 0;
 
-    while (indexOfPos(T, haystack, i, needle)) |idx| {
+    while (findPos(T, haystack, i, needle)) |idx| {
         i = idx + needle.len;
         found += 1;
     }
@@ -1625,19 +1717,55 @@ test count {
     try testing.expect(count(u8, "owowowu", "owowu") == 1);
 }
 
+/// Returns the number of times `element` appears in a slice of memory.
+pub fn countScalar(comptime T: type, list: []const T, element: T) usize {
+    const n = list.len;
+    var i: usize = 0;
+    var found: usize = 0;
+
+    if (use_vectors_for_comparison and
+        (@typeInfo(T) == .int or @typeInfo(T) == .float) and std.math.isPowerOfTwo(@bitSizeOf(T)))
+    {
+        if (std.simd.suggestVectorLength(T)) |block_size| {
+            const Block = @Vector(block_size, T);
+
+            const letter_mask: Block = @splat(element);
+            while (n - i >= block_size) : (i += block_size) {
+                const haystack_block: Block = list[i..][0..block_size].*;
+                found += std.simd.countTrues(letter_mask == haystack_block);
+            }
+        }
+    }
+
+    for (list[i..n]) |item| {
+        found += @intFromBool(item == element);
+    }
+
+    return found;
+}
+
+test countScalar {
+    try testing.expectEqual(0, countScalar(u8, "", 'h'));
+    try testing.expectEqual(1, countScalar(u8, "h", 'h'));
+    try testing.expectEqual(2, countScalar(u8, "hh", 'h'));
+    try testing.expectEqual(2, countScalar(u8, "ahhb", 'h'));
+    try testing.expectEqual(3, countScalar(u8, "   abcabc   abc", 'b'));
+}
+
 /// Returns true if the haystack contains expected_count or more needles
 /// needle.len must be > 0
 /// does not count overlapping needles
 //
 /// See also: `containsAtLeastScalar`
 pub fn containsAtLeast(comptime T: type, haystack: []const T, expected_count: usize, needle: []const T) bool {
+    if (needle.len == 1) return containsAtLeastScalar(T, haystack, needle[0], expected_count);
     assert(needle.len > 0);
     if (expected_count == 0) return true;
 
     var i: usize = 0;
     var found: usize = 0;
 
-    while (indexOfPos(T, haystack, i, needle)) |idx| {
+    while (findPos(T, haystack, i, needle)) |idx| {
         i = idx + needle.len;
         found += 1;
         if (found == expected_count) return true;
@@ -1661,42 +1789,57 @@ test containsAtLeast {
     try testing.expect(!containsAtLeast(u8, "   radar      radar   ", 3, "radar"));
 }
 
-/// Returns true if the haystack contains expected_count or more needles
+/// Returns true if `element` appears at least `minimum` number of times in `list`.
 //
-/// See also: `containsAtLeast`
-pub fn containsAtLeastScalar(comptime T: type, haystack: []const T, expected_count: usize, needle: T) bool {
-    if (expected_count == 0) return true;
-
+/// Related:
+/// * `containsAtLeast`
+/// * `countScalar`
+pub fn containsAtLeastScalar(comptime T: type, list: []const T, element: T, minimum: usize) bool {
+    const n = list.len;
+    var i: usize = 0;
     var found: usize = 0;
 
-    for (haystack) |item| {
-        if (item == needle) {
-            found += 1;
-            if (found == expected_count) return true;
+    if (use_vectors_for_comparison and
+        (@typeInfo(T) == .int or @typeInfo(T) == .float) and std.math.isPowerOfTwo(@bitSizeOf(T)))
+    {
+        if (std.simd.suggestVectorLength(T)) |block_size| {
+            const Block = @Vector(block_size, T);
+
+            const letter_mask: Block = @splat(element);
+            while (n - i >= block_size) : (i += block_size) {
+                const haystack_block: Block = list[i..][0..block_size].*;
+                found += std.simd.countTrues(letter_mask == haystack_block);
+                if (found >= minimum) return true;
+            }
         }
+    }
+
+    for (list[i..n]) |item| {
+        found += @intFromBool(item == element);
+        if (found >= minimum) return true;
     }
 
     return false;
 }
 
 test containsAtLeastScalar {
-    try testing.expect(containsAtLeastScalar(u8, "aa", 0, 'a'));
-    try testing.expect(containsAtLeastScalar(u8, "aa", 1, 'a'));
-    try testing.expect(containsAtLeastScalar(u8, "aa", 2, 'a'));
-    try testing.expect(!containsAtLeastScalar(u8, "aa", 3, 'a'));
+    try testing.expect(containsAtLeastScalar(u8, "aa", 'a', 0));
+    try testing.expect(containsAtLeastScalar(u8, "aa", 'a', 1));
+    try testing.expect(containsAtLeastScalar(u8, "aa", 'a', 2));
+    try testing.expect(!containsAtLeastScalar(u8, "aa", 'a', 3));
 
-    try testing.expect(containsAtLeastScalar(u8, "adadda", 3, 'd'));
-    try testing.expect(!containsAtLeastScalar(u8, "adadda", 4, 'd'));
+    try testing.expect(containsAtLeastScalar(u8, "adadda", 'd', 3));
+    try testing.expect(!containsAtLeastScalar(u8, "adadda", 'd', 4));
 }
 
 /// Reads an integer from memory with size equal to bytes.len.
-/// T specifies the return type, which must be large enough to store
+/// ReturnType specifies the return type, which must be large enough to store
 /// the result.
 pub fn readVarInt(comptime ReturnType: type, bytes: []const u8, endian: Endian) ReturnType {
     assert(@typeInfo(ReturnType).int.bits >= bytes.len * 8);
     const bits = @typeInfo(ReturnType).int.bits;
     const signedness = @typeInfo(ReturnType).int.signedness;
-    const WorkType = std.meta.Int(signedness, @max(16, bits));
+    const WorkType = @Int(signedness, @max(16, bits));
     var result: WorkType = 0;
     switch (endian) {
         .big => {
@@ -1747,8 +1890,8 @@ pub fn readVarPackedInt(
     endian: std.builtin.Endian,
     signedness: std.builtin.Signedness,
 ) T {
-    const uN = std.meta.Int(.unsigned, @bitSizeOf(T));
-    const iN = std.meta.Int(.signed, @bitSizeOf(T));
+    const uN = @Int(.unsigned, @bitSizeOf(T));
+    const iN = @Int(.signed, @bitSizeOf(T));
     const Log2N = std.math.Log2Int(T);
 
     const read_size = (bit_count + (bit_offset % 8) + 7) / 8;
@@ -1764,18 +1907,18 @@ pub fn readVarPackedInt(
     if (@bitSizeOf(T) <= 8) {
         // These are the same shifts/masks we perform below, but adds `@truncate`/`@intCast`
         // where needed since int is smaller than a byte.
-        const value = if (read_size == 1) b: {
-            break :b @as(uN, @truncate(read_bytes[0] >> bit_shift));
+        const value: uN = if (read_size == 1) b: {
+            break :b @truncate(read_bytes[0] >> bit_shift);
         } else b: {
             const i: u1 = @intFromBool(endian == .big);
-            const head = @as(uN, @truncate(read_bytes[i] >> bit_shift));
-            const tail_shift = @as(Log2N, @intCast(@as(u4, 8) - bit_shift));
-            const tail = @as(uN, @truncate(read_bytes[1 - i]));
+            const head: uN = @truncate(read_bytes[i] >> bit_shift);
+            const tail_shift: Log2N = @intCast(@as(u4, 8) - bit_shift);
+            const tail: uN = @truncate(read_bytes[1 - i]);
             break :b (tail << tail_shift) | head;
         };
         switch (signedness) {
-            .signed => return @as(T, @intCast((@as(iN, @bitCast(value)) << pad) >> pad)),
-            .unsigned => return @as(T, @intCast((@as(uN, @bitCast(value)) << pad) >> pad)),
+            .signed => return @intCast((@as(iN, @bitCast(value)) << pad) >> pad),
+            .unsigned => return @intCast((value << pad) >> pad),
         }
     }
 
@@ -1796,8 +1939,8 @@ pub fn readVarPackedInt(
         },
     }
     switch (signedness) {
-        .signed => return @as(T, @intCast((@as(iN, @bitCast(int)) << pad) >> pad)),
-        .unsigned => return @as(T, @intCast((@as(uN, @bitCast(int)) << pad) >> pad)),
+        .signed => return @intCast((@as(iN, @bitCast(int)) << pad) >> pad),
+        .unsigned => return @intCast((int << pad) >> pad),
     }
 }
 
@@ -1812,8 +1955,13 @@ test readVarPackedInt {
 /// The bit count of T must be evenly divisible by 8.
 /// This function cannot fail and cannot cause undefined behavior.
 pub inline fn readInt(comptime T: type, buffer: *const [@divExact(@typeInfo(T).int.bits, 8)]u8, endian: Endian) T {
-    const value: T = @bitCast(buffer.*);
-    return if (endian == native_endian) value else @byteSwap(value);
+    // Zig's logical bit order aligns with a little-endian byte array, so when reading in big-endian
+    // we must `@byteSwap` the int after we `@bitCast` to it.
+    const little_val: T = @bitCast(buffer.*);
+    return switch (endian) {
+        .little => little_val,
+        .big => @byteSwap(little_val),
+    };
 }
 
 test readInt {
@@ -1840,15 +1988,15 @@ test readInt {
 }
 
 fn readPackedIntLittle(comptime T: type, bytes: []const u8, bit_offset: usize) T {
-    const uN = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const uN = @Int(.unsigned, @bitSizeOf(T));
     const Log2N = std.math.Log2Int(T);
 
     const bit_count = @as(usize, @bitSizeOf(T));
     const bit_shift = @as(u3, @intCast(bit_offset % 8));
 
-    const load_size = (bit_count + 7) / 8;
+    const load_size = @divCeil(bit_count, 8);
     const load_tail_bits = @as(u3, @intCast((load_size * 8) - bit_count));
-    const LoadInt = std.meta.Int(.unsigned, load_size * 8);
+    const LoadInt = @Int(.unsigned, load_size * 8);
 
     if (bit_count == 0)
         return 0;
@@ -1856,26 +2004,28 @@ fn readPackedIntLittle(comptime T: type, bytes: []const u8, bit_offset: usize) T
     // Read by loading a LoadInt, and then follow it up with a 1-byte read
     // of the tail if bit_offset pushed us over a byte boundary.
     const read_bytes = bytes[bit_offset / 8 ..];
-    const val = @as(uN, @truncate(readInt(LoadInt, read_bytes[0..load_size], .little) >> bit_shift));
+    const val: uN = @truncate(readInt(LoadInt, read_bytes[0..load_size], .little) >> bit_shift);
     if (bit_shift > load_tail_bits) {
         const tail_bits = @as(Log2N, @intCast(bit_shift - load_tail_bits));
         const tail_byte = read_bytes[load_size];
         const tail_truncated = if (bit_count < 8) @as(uN, @truncate(tail_byte)) else @as(uN, tail_byte);
-        return @as(T, @bitCast(val | (tail_truncated << (@as(Log2N, @truncate(bit_count)) -% tail_bits))));
-    } else return @as(T, @bitCast(val));
+        return @bitCast(val | (tail_truncated << (@as(Log2N, @truncate(bit_count)) -% tail_bits)));
+    } else {
+        return @bitCast(val);
+    }
 }
 
 fn readPackedIntBig(comptime T: type, bytes: []const u8, bit_offset: usize) T {
-    const uN = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const uN = @Int(.unsigned, @bitSizeOf(T));
     const Log2N = std.math.Log2Int(T);
 
     const bit_count = @as(usize, @bitSizeOf(T));
     const bit_shift = @as(u3, @intCast(bit_offset % 8));
-    const byte_count = (@as(usize, bit_shift) + bit_count + 7) / 8;
+    const byte_count = @divCeil(@as(usize, bit_shift) + bit_count, 8);
 
-    const load_size = (bit_count + 7) / 8;
+    const load_size = @divCeil(bit_count, 8);
     const load_tail_bits = @as(u3, @intCast((load_size * 8) - bit_count));
-    const LoadInt = std.meta.Int(.unsigned, load_size * 8);
+    const LoadInt = @Int(.unsigned, load_size * 8);
 
     if (bit_count == 0)
         return 0;
@@ -1888,19 +2038,11 @@ fn readPackedIntBig(comptime T: type, bytes: []const u8, bit_offset: usize) T {
     if (bit_shift > load_tail_bits) {
         const tail_bits = @as(Log2N, @intCast(bit_shift - load_tail_bits));
         const tail_byte = if (bit_count < 8) @as(uN, @truncate(read_bytes[0])) else @as(uN, read_bytes[0]);
-        return @as(T, @bitCast(val | (tail_byte << (@as(Log2N, @truncate(bit_count)) -% tail_bits))));
-    } else return @as(T, @bitCast(val));
+        return @bitCast(val | (tail_byte << (@as(Log2N, @truncate(bit_count)) -% tail_bits)));
+    } else {
+        return @bitCast(val);
+    }
 }
-
-pub const readPackedIntNative = switch (native_endian) {
-    .little => readPackedIntLittle,
-    .big => readPackedIntBig,
-};
-
-pub const readPackedIntForeign = switch (native_endian) {
-    .little => readPackedIntBig,
-    .big => readPackedIntLittle,
-};
 
 /// Loads an integer from packed memory.
 /// Asserts that buffer contains at least bit_offset + @bitSizeOf(T) bits.
@@ -1937,7 +2079,12 @@ test "comptime read/write int" {
 /// This function always succeeds, has defined behavior for all inputs, but
 /// the integer bit width must be divisible by 8.
 pub inline fn writeInt(comptime T: type, buffer: *[@divExact(@typeInfo(T).int.bits, 8)]u8, value: T, endian: Endian) void {
-    buffer.* = @bitCast(if (endian == native_endian) value else @byteSwap(value));
+    // Zig's logical bit order aligns with a little-endian byte array, so when writing in big-endian
+    // we must `@byteSwap` the int before we `@bitCast` to an array.
+    buffer.* = switch (endian) {
+        .little => @bitCast(value),
+        .big => @bitCast(@byteSwap(value)),
+    };
 }
 
 test writeInt {
@@ -1978,7 +2125,7 @@ test writeInt {
 }
 
 fn writePackedIntLittle(comptime T: type, bytes: []u8, bit_offset: usize, value: T) void {
-    const uN = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const uN = @Int(.unsigned, @bitSizeOf(T));
     const Log2N = std.math.Log2Int(T);
 
     const bit_count = @as(usize, @bitSizeOf(T));
@@ -1986,7 +2133,7 @@ fn writePackedIntLittle(comptime T: type, bytes: []u8, bit_offset: usize, value:
 
     const store_size = (@bitSizeOf(T) + 7) / 8;
     const store_tail_bits = @as(u3, @intCast((store_size * 8) - bit_count));
-    const StoreInt = std.meta.Int(.unsigned, store_size * 8);
+    const StoreInt = @Int(.unsigned, store_size * 8);
 
     if (bit_count == 0)
         return;
@@ -2011,7 +2158,7 @@ fn writePackedIntLittle(comptime T: type, bytes: []u8, bit_offset: usize, value:
 }
 
 fn writePackedIntBig(comptime T: type, bytes: []u8, bit_offset: usize, value: T) void {
-    const uN = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const uN = @Int(.unsigned, @bitSizeOf(T));
     const Log2N = std.math.Log2Int(T);
 
     const bit_count = @as(usize, @bitSizeOf(T));
@@ -2020,7 +2167,7 @@ fn writePackedIntBig(comptime T: type, bytes: []u8, bit_offset: usize, value: T)
 
     const store_size = (@bitSizeOf(T) + 7) / 8;
     const store_tail_bits = @as(u3, @intCast((store_size * 8) - bit_count));
-    const StoreInt = std.meta.Int(.unsigned, store_size * 8);
+    const StoreInt = @Int(.unsigned, store_size * 8);
 
     if (bit_count == 0)
         return;
@@ -2045,16 +2192,6 @@ fn writePackedIntBig(comptime T: type, bytes: []u8, bit_offset: usize, value: T)
     writeInt(StoreInt, write_bytes[(byte_count - store_size)..][0..store_size], write_value, .big);
 }
 
-pub const writePackedIntNative = switch (native_endian) {
-    .little => writePackedIntLittle,
-    .big => writePackedIntBig,
-};
-
-pub const writePackedIntForeign = switch (native_endian) {
-    .little => writePackedIntBig,
-    .big => writePackedIntLittle,
-};
-
 /// Stores an integer to packed memory.
 /// Asserts that buffer contains at least bit_offset + @bitSizeOf(T) bits.
 pub fn writePackedInt(comptime T: type, bytes: []u8, bit_offset: usize, value: T, endian: Endian) void {
@@ -2075,7 +2212,7 @@ test writePackedInt {
 /// If negative, the written value is sign-extended.
 pub fn writeVarPackedInt(bytes: []u8, bit_offset: usize, bit_count: usize, value: anytype, endian: std.builtin.Endian) void {
     const T = @TypeOf(value);
-    const uN = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const uN = @Int(.unsigned, @bitSizeOf(T));
 
     const bit_shift = @as(u3, @intCast(bit_offset % 8));
     const write_size = (bit_count + bit_shift + 7) / 8;
@@ -2135,49 +2272,85 @@ test writeVarPackedInt {
     try testing.expectEqual(T{ .a = 1, .b = value, .c = 4 }, st);
 }
 
-/// Swap the byte order of all the members of the fields of a struct
-/// (Changing their endianness)
-pub fn byteSwapAllFields(comptime S: type, ptr: *S) void {
+/// Deprecated: use `byteSwap` instead.
+pub const byteSwapAllFields = byteSwap;
+
+/// Deprecated: use `byteSwapAligned` instead.
+pub const byteSwapAllFieldsAligned = byteSwapAligned;
+
+/// Reverses the byte order.
+/// Handles structs, unions, arrays, enums, floats, and integers recursively.
+/// The order of extern struct fields and array elements remains unchanged and
+/// will be byte swapped recursively.
+/// Useful for converting between little-endian and big-endian representations.
+pub fn byteSwap(comptime S: type, ptr: *S) void {
+    byteSwapAligned(S, .of(S), ptr);
+}
+
+/// Reverses the byte order.
+/// Handles structs, unions, arrays, enums, floats, and integers recursively.
+/// The order of extern struct fields and array elements remains unchanged and
+/// will be byte swapped recursively.
+/// Useful for converting between little-endian and big-endian representations.
+pub fn byteSwapAligned(
+    comptime S: type,
+    comptime a: Alignment,
+    ptr: *align(a.toByteUnits()) S,
+) void {
     switch (@typeInfo(S)) {
-        .@"struct" => {
-            inline for (std.meta.fields(S)) |f| {
-                switch (@typeInfo(f.type)) {
-                    .@"struct" => |struct_info| if (struct_info.backing_integer) |Int| {
-                        @field(ptr, f.name) = @bitCast(@byteSwap(@as(Int, @bitCast(@field(ptr, f.name)))));
-                    } else {
-                        byteSwapAllFields(f.type, &@field(ptr, f.name));
-                    },
-                    .@"union", .array => byteSwapAllFields(f.type, &@field(ptr, f.name)),
-                    .@"enum" => {
-                        @field(ptr, f.name) = @enumFromInt(@byteSwap(@intFromEnum(@field(ptr, f.name))));
-                    },
-                    .bool => {},
-                    .float => |float_info| {
-                        @field(ptr, f.name) = @bitCast(@byteSwap(@as(std.meta.Int(.unsigned, float_info.bits), @bitCast(@field(ptr, f.name)))));
-                    },
-                    else => {
-                        @field(ptr, f.name) = @byteSwap(@field(ptr, f.name));
-                    },
+        .@"struct" => |@"struct"| {
+            if (@"struct".backing_integer) |Int| {
+                ptr.* = @bitCast(@byteSwap(@as(Int, @bitCast(ptr.*))));
+            } else {
+                if (@"struct".layout != .@"extern") {
+                    @compileError("byteSwapAligned expects a packed or extern struct");
+                }
+                inline for (@"struct".field_types, @"struct".field_names, @"struct".field_attrs) |f_type, f_name, f_attr| {
+                    switch (@typeInfo(f_type)) {
+                        .@"struct" => byteSwapAligned(f_type, .fromByteUnits(f_attr.@"align" orelse @alignOf(f_type)), &@field(ptr, f_name)),
+                        .@"union", .array => byteSwapAligned(f_type, .fromByteUnits(f_attr.@"align" orelse @alignOf(f_type)), &@field(ptr, f_name)),
+                        .@"enum" => {
+                            @field(ptr, f_name) = @fromBackingInt(@byteSwap(@backingInt(@field(ptr, f_name))));
+                        },
+                        .bool => {},
+                        .float => |float| {
+                            @field(ptr, f_name) = @bitCast(@byteSwap(@as(@Int(.unsigned, float.bits), @bitCast(@field(ptr, f_name)))));
+                        },
+                        else => {
+                            @field(ptr, f_name) = @byteSwap(@field(ptr, f_name));
+                        },
+                    }
                 }
             }
         },
-        .@"union" => |union_info| {
-            if (union_info.tag_type != null) {
-                @compileError("byteSwapAllFields expects an untagged union");
+        .@"union" => |@"union"| if (@"union".backing_integer) |Int| {
+            ptr.* = @bitCast(@byteSwap(@as(Int, @bitCast(ptr.*))));
+        } else {
+            if (@"union".layout != .@"extern") {
+                @compileError("byteSwapAligned expects a packed or extern union");
             }
 
-            const first_size = @bitSizeOf(union_info.fields[0].type);
-            inline for (union_info.fields) |field| {
-                if (@bitSizeOf(field.type) != first_size) {
+            const first_size = @bitSizeOf(@"union".field_types[0]);
+            inline for (@"union".field_types) |field_type| {
+                if (@bitSizeOf(field_type) != first_size) {
                     @compileError("Unable to byte-swap unions with varying field sizes");
                 }
             }
 
-            const BackingInt = std.meta.Int(.unsigned, @bitSizeOf(S));
-            ptr.* = @bitCast(@byteSwap(@as(BackingInt, @bitCast(ptr.*))));
+            const FieldInt = @Int(.unsigned, first_size);
+            const field_ptr = &@field(ptr, @"union".field_names[0]);
+            field_ptr.* = @bitCast(@byteSwap(@as(FieldInt, @bitCast(field_ptr.*))));
         },
-        .array => |info| {
-            byteSwapAllElements(info.child, ptr);
+        .array => |array| {
+            byteSwapAllElements(array.child, ptr);
+        },
+        .@"enum" => {
+            ptr.* = @fromBackingInt(@byteSwap(@backingInt(ptr.*)));
+        },
+        .bool => {},
+        .float => |float| {
+            const int_repr: @Int(.unsigned, float.bits) = @bitCast(ptr.*);
+            ptr.* = @bitCast(@byteSwap(int_repr));
         },
         else => {
             ptr.* = @byteSwap(ptr.*);
@@ -2185,7 +2358,7 @@ pub fn byteSwapAllFields(comptime S: type, ptr: *S) void {
     }
 }
 
-test byteSwapAllFields {
+test byteSwap {
     const T = extern struct {
         f0: u8,
         f1: u16,
@@ -2203,13 +2376,30 @@ test byteSwapAllFields {
         f4: bool,
         f5: f32,
     };
+    const P = packed struct(u32) {
+        f0: u1,
+        f1: u7,
+        f2: u4,
+        f3: u4,
+        f4: u16,
+    };
+    const A = extern struct {
+        f0: u32,
+        f1: extern struct {
+            f0: u64,
+        } align(4),
+        f2: u32,
+    };
+    const E = enum(u32) {
+        _,
+    };
     var s = T{
         .f0 = 0x12,
         .f1 = 0x1234,
         .f2 = 0x12345678,
         .f3 = .{0x12},
         .f4 = true,
-        .f5 = @as(f32, @bitCast(@as(u32, 0x4640e400))),
+        .f5 = @bitCast(@as(u32, 0x4640e400)),
         .f6 = .{ .f0 = 0x1234 },
     };
     var k = K{
@@ -2218,17 +2408,29 @@ test byteSwapAllFields {
         .f2 = 0x1234,
         .f3 = .{0x12},
         .f4 = false,
-        .f5 = @as(f32, @bitCast(@as(u32, 0x45d42800))),
+        .f5 = @bitCast(@as(u32, 0x45d42800)),
     };
-    byteSwapAllFields(T, &s);
-    byteSwapAllFields(K, &k);
+    var p: P = @bitCast(@as(u32, 0x01234567));
+    var a: A = A{
+        .f0 = 0x12345678,
+        .f1 = .{ .f0 = 0x123456789ABCDEF0 },
+        .f2 = 0x87654321,
+    };
+    var e: E = @fromBackingInt(0x12345678);
+    var f: f32 = @bitCast(@as(u32, 0x4640e400));
+    byteSwap(T, &s);
+    byteSwap(K, &k);
+    byteSwap(P, &p);
+    byteSwap(A, &a);
+    byteSwap(E, &e);
+    byteSwap(f32, &f);
     try std.testing.expectEqual(T{
         .f0 = 0x12,
         .f1 = 0x3412,
         .f2 = 0x78563412,
         .f3 = .{0x12},
         .f4 = true,
-        .f5 = @as(f32, @bitCast(@as(u32, 0x00e44046))),
+        .f5 = @bitCast(@as(u32, 0x00e44046)),
         .f6 = .{ .f0 = 0x3412 },
     }, s);
     try std.testing.expectEqual(K{
@@ -2237,26 +2439,23 @@ test byteSwapAllFields {
         .f2 = 0x3412,
         .f3 = .{0x12},
         .f4 = false,
-        .f5 = @as(f32, @bitCast(@as(u32, 0x0028d445))),
+        .f5 = @bitCast(@as(u32, 0x0028d445)),
     }, k);
+    try std.testing.expectEqual(@as(P, @bitCast(@as(u32, 0x67452301))), p);
+    try std.testing.expectEqual(A{
+        .f0 = 0x78563412,
+        .f1 = .{ .f0 = 0xF0DEBC9A78563412 },
+        .f2 = 0x21436587,
+    }, a);
+    try std.testing.expectEqual(@as(E, @fromBackingInt(0x78563412)), e);
+    try std.testing.expectEqual(@as(f32, @bitCast(@as(u32, 0x00e44046))), f);
 }
 
+/// Reverses the byte order of all elements in a slice.
+/// Handles structs, unions, arrays, enums, floats, and integers recursively.
+/// Useful for converting between little-endian and big-endian representations.
 pub fn byteSwapAllElements(comptime Elem: type, slice: []Elem) void {
-    for (slice) |*elem| {
-        switch (@typeInfo(@TypeOf(elem.*))) {
-            .@"struct", .@"union", .array => byteSwapAllFields(@TypeOf(elem.*), elem),
-            .@"enum" => {
-                elem.* = @enumFromInt(@byteSwap(@intFromEnum(elem.*)));
-            },
-            .bool => {},
-            .float => |float_info| {
-                elem.* = @bitCast(@byteSwap(@as(std.meta.Int(.unsigned, float_info.bits), @bitCast(elem.*))));
-            },
-            else => {
-                elem.* = @byteSwap(elem.*);
-            },
-        }
-    }
+    for (slice) |*elem| byteSwap(Elem, elem);
 }
 
 /// Returns an iterator that iterates over the slices of `buffer` that are not
@@ -2890,7 +3089,7 @@ pub fn window(comptime T: type, buffer: []const T, size: usize, advance: usize) 
     assert(size != 0);
     assert(advance != 0);
     return .{
-        .index = 0,
+        .index = if (buffer.len > 0) 0 else null,
         .buffer = buffer,
         .size = size,
         .advance = advance,
@@ -2901,85 +3100,125 @@ test window {
     {
         // moving average size 3
         var it = window(u8, "abcdefg", 3, 1);
-        try testing.expectEqualSlices(u8, it.next().?, "abc");
-        try testing.expectEqualSlices(u8, it.next().?, "bcd");
-        try testing.expectEqualSlices(u8, it.next().?, "cde");
-        try testing.expectEqualSlices(u8, it.next().?, "def");
-        try testing.expectEqualSlices(u8, it.next().?, "efg");
-        try testing.expectEqual(it.next(), null);
+        try testing.expectEqualSlices(u8, "abc", it.next().?);
+        try testing.expectEqualSlices(u8, "bcd", it.next().?);
+        try testing.expectEqualSlices(u8, "cde", it.next().?);
+        try testing.expectEqualSlices(u8, "def", it.next().?);
+        try testing.expectEqualSlices(u8, "efg", it.next().?);
+        try testing.expectEqual(null, it.next());
 
         // multibyte
         var it16 = window(u16, std.unicode.utf8ToUtf16LeStringLiteral("abcdefg"), 3, 1);
-        try testing.expectEqualSlices(u16, it16.next().?, std.unicode.utf8ToUtf16LeStringLiteral("abc"));
-        try testing.expectEqualSlices(u16, it16.next().?, std.unicode.utf8ToUtf16LeStringLiteral("bcd"));
-        try testing.expectEqualSlices(u16, it16.next().?, std.unicode.utf8ToUtf16LeStringLiteral("cde"));
-        try testing.expectEqualSlices(u16, it16.next().?, std.unicode.utf8ToUtf16LeStringLiteral("def"));
-        try testing.expectEqualSlices(u16, it16.next().?, std.unicode.utf8ToUtf16LeStringLiteral("efg"));
+        try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("abc"), it16.next().?);
+        try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("bcd"), it16.next().?);
+        try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("cde"), it16.next().?);
+        try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("def"), it16.next().?);
+        try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("efg"), it16.next().?);
         try testing.expectEqual(it16.next(), null);
     }
 
     {
         // chunk/split every 3
         var it = window(u8, "abcdefg", 3, 3);
-        try testing.expectEqualSlices(u8, it.next().?, "abc");
-        try testing.expectEqualSlices(u8, it.next().?, "def");
-        try testing.expectEqualSlices(u8, it.next().?, "g");
-        try testing.expectEqual(it.next(), null);
+        try testing.expectEqualSlices(u8, "abc", it.next().?);
+        try testing.expectEqualSlices(u8, "def", it.next().?);
+        try testing.expectEqualSlices(u8, "g", it.next().?);
+        try testing.expectEqual(null, it.next());
     }
 
     {
         // pick even
         var it = window(u8, "abcdefg", 1, 2);
-        try testing.expectEqualSlices(u8, it.next().?, "a");
-        try testing.expectEqualSlices(u8, it.next().?, "c");
-        try testing.expectEqualSlices(u8, it.next().?, "e");
-        try testing.expectEqualSlices(u8, it.next().?, "g");
-        try testing.expectEqual(it.next(), null);
+        try testing.expectEqualSlices(u8, "a", it.next().?);
+        try testing.expectEqualSlices(u8, "c", it.next().?);
+        try testing.expectEqualSlices(u8, "e", it.next().?);
+        try testing.expectEqualSlices(u8, "g", it.next().?);
+        try testing.expectEqual(null, it.next());
+
+        it = window(u8, "abcdefgh", 1, 2);
+        try testing.expectEqualSlices(u8, "a", it.next().?);
+        try testing.expectEqualSlices(u8, "c", it.next().?);
+        try testing.expectEqualSlices(u8, "e", it.next().?);
+        try testing.expectEqualSlices(u8, "g", it.next().?);
+        try testing.expectEqual(null, it.next());
     }
 
     {
         // empty
         var it = window(u8, "", 1, 1);
-        try testing.expectEqualSlices(u8, it.next().?, "");
-        try testing.expectEqual(it.next(), null);
+        try testing.expectEqual(null, it.next());
 
         it = window(u8, "", 10, 1);
-        try testing.expectEqualSlices(u8, it.next().?, "");
-        try testing.expectEqual(it.next(), null);
+        try testing.expectEqual(null, it.next());
 
         it = window(u8, "", 1, 10);
-        try testing.expectEqualSlices(u8, it.next().?, "");
-        try testing.expectEqual(it.next(), null);
+        try testing.expectEqual(null, it.next());
 
         it = window(u8, "", 10, 10);
-        try testing.expectEqualSlices(u8, it.next().?, "");
-        try testing.expectEqual(it.next(), null);
+        try testing.expectEqual(null, it.next());
     }
 
     {
         // first
         var it = window(u8, "abcdefg", 3, 3);
-        try testing.expectEqualSlices(u8, it.first(), "abc");
+        try testing.expectEqualSlices(u8, "abc", it.next().?);
         it.reset();
-        try testing.expectEqualSlices(u8, it.next().?, "abc");
+        try testing.expectEqualSlices(u8, "abc", it.next().?);
     }
 
     {
         // reset
         var it = window(u8, "abcdefg", 3, 3);
-        try testing.expectEqualSlices(u8, it.next().?, "abc");
-        try testing.expectEqualSlices(u8, it.next().?, "def");
-        try testing.expectEqualSlices(u8, it.next().?, "g");
-        try testing.expectEqual(it.next(), null);
+        try testing.expectEqualSlices(u8, "abc", it.next().?);
+        try testing.expectEqualSlices(u8, "def", it.next().?);
+        try testing.expectEqualSlices(u8, "g", it.next().?);
+        try testing.expectEqual(null, it.next());
 
         it.reset();
-        try testing.expectEqualSlices(u8, it.next().?, "abc");
-        try testing.expectEqualSlices(u8, it.next().?, "def");
-        try testing.expectEqualSlices(u8, it.next().?, "g");
-        try testing.expectEqual(it.next(), null);
+        try testing.expectEqualSlices(u8, "abc", it.next().?);
+        try testing.expectEqualSlices(u8, "def", it.next().?);
+        try testing.expectEqualSlices(u8, "g", it.next().?);
+        try testing.expectEqual(null, it.next());
+    }
+
+    {
+        // size > buffer.len
+        var it = window(u8, "abcdefg", 100, 1);
+        try testing.expectEqualSlices(u8, "abcdefg", it.next().?);
+        try testing.expectEqual(null, it.next());
+    }
+
+    {
+        // advance >= buffer.len
+        var it = window(u8, "abcdefg", 1, 7);
+        try testing.expectEqualSlices(u8, "a", it.next().?);
+        try testing.expectEqual(null, it.next());
+    }
+
+    {
+        // advance == 1 and size == 1
+        var it = window(u8, "abcdefg", 1, 1);
+        try testing.expectEqualSlices(u8, "a", it.next().?);
+        try testing.expectEqualSlices(u8, "b", it.next().?);
+        try testing.expectEqualSlices(u8, "c", it.next().?);
+        try testing.expectEqualSlices(u8, "d", it.next().?);
+        try testing.expectEqualSlices(u8, "e", it.next().?);
+        try testing.expectEqualSlices(u8, "f", it.next().?);
+        try testing.expectEqualSlices(u8, "g", it.next().?);
+        try testing.expectEqual(null, it.next());
+    }
+
+    {
+        // advance > size
+        var it = window(u8, "abcdefg", 2, 3);
+        try testing.expectEqualSlices(u8, "ab", it.next().?);
+        try testing.expectEqualSlices(u8, "de", it.next().?);
+        try testing.expectEqualSlices(u8, "g", it.next().?);
+        try testing.expectEqual(null, it.next());
     }
 }
 
+/// Iterator type returned by the `window` function for sliding window operations.
 pub fn WindowIterator(comptime T: type) type {
     return struct {
         buffer: []const T,
@@ -2989,27 +3228,17 @@ pub fn WindowIterator(comptime T: type) type {
 
         const Self = @This();
 
-        /// Returns a slice of the first window.
-        /// Call this only to get the first window and then use `next` to get
-        /// all subsequent windows.
-        /// Asserts that iteration has not begun.
-        pub fn first(self: *Self) []const T {
-            assert(self.index.? == 0);
-            return self.next().?;
-        }
-
         /// Returns a slice of the next window, or null if window is at end.
         pub fn next(self: *Self) ?[]const T {
             const start = self.index orelse return null;
             const next_index = start + self.advance;
-            const end = if (start + self.size < self.buffer.len and next_index < self.buffer.len) blk: {
-                self.index = next_index;
+            const end = if (start + self.size < self.buffer.len) blk: {
+                self.index = if (next_index < self.buffer.len) next_index else null;
                 break :blk start + self.size;
             } else blk: {
                 self.index = null;
                 break :blk self.buffer.len;
             };
-
             return self.buffer[start..end];
         }
 
@@ -3020,6 +3249,8 @@ pub fn WindowIterator(comptime T: type) type {
     };
 }
 
+/// Returns true if haystack starts with needle.
+/// Time complexity: O(needle.len)
 pub fn startsWith(comptime T: type, haystack: []const T, needle: []const T) bool {
     return if (needle.len > haystack.len) false else eql(T, haystack[0..needle.len], needle);
 }
@@ -3029,6 +3260,8 @@ test startsWith {
     try testing.expect(!startsWith(u8, "Needle in haystack", "haystack"));
 }
 
+/// Returns true if haystack ends with needle.
+/// Time complexity: O(needle.len)
 pub fn endsWith(comptime T: type, haystack: []const T, needle: []const T) bool {
     return if (needle.len > haystack.len) false else eql(T, haystack[haystack.len - needle.len ..], needle);
 }
@@ -3038,8 +3271,105 @@ test endsWith {
     try testing.expect(!endsWith(u8, "Bob", "Bo"));
 }
 
+/// If `slice` starts with `prefix`, returns the rest of `slice` starting at `prefix.len`.
+pub fn cutPrefix(comptime T: type, slice: []const T, prefix: []const T) ?[]const T {
+    return if (startsWith(T, slice, prefix)) slice[prefix.len..] else null;
+}
+
+test cutPrefix {
+    try testing.expectEqualStrings("foo", cutPrefix(u8, "--example=foo", "--example=").?);
+    try testing.expectEqual(null, cutPrefix(u8, "--example=foo", "-example="));
+}
+
+/// If `slice` ends with `suffix`, returns `slice` from beginning to start of `suffix`.
+pub fn cutSuffix(comptime T: type, slice: []const T, suffix: []const T) ?[]const T {
+    return if (endsWith(T, slice, suffix)) slice[0 .. slice.len - suffix.len] else null;
+}
+
+test cutSuffix {
+    try testing.expectEqualStrings("foo", cutSuffix(u8, "foobar", "bar").?);
+    try testing.expectEqual(null, cutSuffix(u8, "foobar", "baz"));
+}
+
+/// Returns slice of `haystack` before and after first occurrence of `needle`,
+/// or `null` if not found.
+///
+/// See also:
+/// * `cutScalar`
+/// * `split`
+/// * `tokenizeAny`
+pub fn cut(comptime T: type, haystack: []const T, needle: []const T) ?struct { []const T, []const T } {
+    const index = find(T, haystack, needle) orelse return null;
+    return .{ haystack[0..index], haystack[index + needle.len ..] };
+}
+
+test cut {
+    try testing.expectEqual(null, cut(u8, "a b c", "B"));
+    const before, const after = cut(u8, "a be c", "be") orelse return error.TestFailed;
+    try testing.expectEqualStrings("a ", before);
+    try testing.expectEqualStrings(" c", after);
+}
+
+/// Returns slice of `haystack` before and after last occurrence of `needle`,
+/// or `null` if not found.
+///
+/// See also:
+/// * `cut`
+/// * `cutScalarLast`
+pub fn cutLast(comptime T: type, haystack: []const T, needle: []const T) ?struct { []const T, []const T } {
+    const index = findLast(T, haystack, needle) orelse return null;
+    return .{ haystack[0..index], haystack[index + needle.len ..] };
+}
+
+test cutLast {
+    try testing.expectEqual(null, cutLast(u8, "a b c", "B"));
+    const before, const after = cutLast(u8, "a be c be d", "be") orelse return error.TestFailed;
+    try testing.expectEqualStrings("a be c ", before);
+    try testing.expectEqualStrings(" d", after);
+}
+
+/// Returns slice of `haystack` before and after first occurrence `needle`, or
+/// `null` if not found.
+///
+/// See also:
+/// * `cut`
+/// * `splitScalar`
+/// * `tokenizeScalar`
+pub fn cutScalar(comptime T: type, haystack: []const T, needle: T) ?struct { []const T, []const T } {
+    const index = findScalar(T, haystack, needle) orelse return null;
+    return .{ haystack[0..index], haystack[index + 1 ..] };
+}
+
+test cutScalar {
+    try testing.expectEqual(null, cutScalar(u8, "a b c", 'B'));
+    const before, const after = cutScalar(u8, "a b c", 'b') orelse return error.TestFailed;
+    try testing.expectEqualStrings("a ", before);
+    try testing.expectEqualStrings(" c", after);
+}
+
+/// Returns slice of `haystack` before and after last occurrence of `needle`,
+/// or `null` if not found.
+///
+/// See also:
+/// * `cut`
+/// * `splitScalar`
+/// * `tokenizeScalar`
+pub fn cutScalarLast(comptime T: type, haystack: []const T, needle: T) ?struct { []const T, []const T } {
+    const index = findScalarLast(T, haystack, needle) orelse return null;
+    return .{ haystack[0..index], haystack[index + 1 ..] };
+}
+
+test cutScalarLast {
+    try testing.expectEqual(null, cutScalarLast(u8, "a b c", 'B'));
+    const before, const after = cutScalarLast(u8, "a b c b d", 'b') orelse return error.TestFailed;
+    try testing.expectEqualStrings("a b c ", before);
+    try testing.expectEqualStrings(" d", after);
+}
+
+/// Delimiter type for tokenization and splitting operations.
 pub const DelimiterType = enum { sequence, any, scalar };
 
+/// Iterator type for tokenization operations, skipping empty sequences and delimiter sequences.
 pub fn TokenIterator(comptime T: type, comptime delimiter_type: DelimiterType) type {
     return struct {
         buffer: []const T,
@@ -3113,6 +3443,7 @@ pub fn TokenIterator(comptime T: type, comptime delimiter_type: DelimiterType) t
     };
 }
 
+/// Iterator type for splitting operations, including empty sequences between delimiters.
 pub fn SplitIterator(comptime T: type, comptime delimiter_type: DelimiterType) type {
     return struct {
         buffer: []const T,
@@ -3136,9 +3467,9 @@ pub fn SplitIterator(comptime T: type, comptime delimiter_type: DelimiterType) t
         pub fn next(self: *Self) ?[]const T {
             const start = self.index orelse return null;
             const end = if (switch (delimiter_type) {
-                .sequence => indexOfPos(T, self.buffer, start, self.delimiter),
-                .any => indexOfAnyPos(T, self.buffer, start, self.delimiter),
-                .scalar => indexOfScalarPos(T, self.buffer, start, self.delimiter),
+                .sequence => findPos(T, self.buffer, start, self.delimiter),
+                .any => findAnyPos(T, self.buffer, start, self.delimiter),
+                .scalar => findScalarPos(T, self.buffer, start, self.delimiter),
             }) |delim_start| blk: {
                 self.index = delim_start + switch (delimiter_type) {
                     .sequence => self.delimiter.len,
@@ -3154,12 +3485,12 @@ pub fn SplitIterator(comptime T: type, comptime delimiter_type: DelimiterType) t
 
         /// Returns a slice of the next field, or null if splitting is complete.
         /// This method does not alter self.index.
-        pub fn peek(self: *Self) ?[]const T {
+        pub fn peek(self: *const Self) ?[]const T {
             const start = self.index orelse return null;
             const end = if (switch (delimiter_type) {
-                .sequence => indexOfPos(T, self.buffer, start, self.delimiter),
-                .any => indexOfAnyPos(T, self.buffer, start, self.delimiter),
-                .scalar => indexOfScalarPos(T, self.buffer, start, self.delimiter),
+                .sequence => findPos(T, self.buffer, start, self.delimiter),
+                .any => findAnyPos(T, self.buffer, start, self.delimiter),
+                .scalar => findScalarPos(T, self.buffer, start, self.delimiter),
             }) |delim_start| delim_start else self.buffer.len;
             return self.buffer[start..end];
         }
@@ -3178,6 +3509,7 @@ pub fn SplitIterator(comptime T: type, comptime delimiter_type: DelimiterType) t
     };
 }
 
+/// Iterator type for splitting operations from the end backwards, including empty sequences.
 pub fn SplitBackwardsIterator(comptime T: type, comptime delimiter_type: DelimiterType) type {
     return struct {
         buffer: []const T,
@@ -3201,9 +3533,9 @@ pub fn SplitBackwardsIterator(comptime T: type, comptime delimiter_type: Delimit
         pub fn next(self: *Self) ?[]const T {
             const end = self.index orelse return null;
             const start = if (switch (delimiter_type) {
-                .sequence => lastIndexOf(T, self.buffer[0..end], self.delimiter),
-                .any => lastIndexOfAny(T, self.buffer[0..end], self.delimiter),
-                .scalar => lastIndexOfScalar(T, self.buffer[0..end], self.delimiter),
+                .sequence => findLast(T, self.buffer[0..end], self.delimiter),
+                .any => findLastAny(T, self.buffer[0..end], self.delimiter),
+                .scalar => findScalarLast(T, self.buffer[0..end], self.delimiter),
             }) |delim_start| blk: {
                 self.index = delim_start;
                 break :blk delim_start + switch (delimiter_type) {
@@ -3517,9 +3849,12 @@ test minMax {
     }
 }
 
+/// Deprecated in favor of `findMin`.
+pub const indexOfMin = findMin;
+
 /// Returns the index of the smallest number in a slice. O(n).
 /// `slice` must not be empty.
-pub fn indexOfMin(comptime T: type, slice: []const T) usize {
+pub fn findMin(comptime T: type, slice: []const T) usize {
     assert(slice.len > 0);
     var best = slice[0];
     var index: usize = 0;
@@ -3532,15 +3867,17 @@ pub fn indexOfMin(comptime T: type, slice: []const T) usize {
     return index;
 }
 
-test indexOfMin {
-    try testing.expectEqual(indexOfMin(u8, "abcdefg"), 0);
-    try testing.expectEqual(indexOfMin(u8, "bcdefga"), 6);
-    try testing.expectEqual(indexOfMin(u8, "a"), 0);
+test findMin {
+    try testing.expectEqual(findMin(u8, "abcdefg"), 0);
+    try testing.expectEqual(findMin(u8, "bcdefga"), 6);
+    try testing.expectEqual(findMin(u8, "a"), 0);
 }
+
+pub const indexOfMax = findMax;
 
 /// Returns the index of the largest number in a slice. O(n).
 /// `slice` must not be empty.
-pub fn indexOfMax(comptime T: type, slice: []const T) usize {
+pub fn findMax(comptime T: type, slice: []const T) usize {
     assert(slice.len > 0);
     var best = slice[0];
     var index: usize = 0;
@@ -3553,16 +3890,19 @@ pub fn indexOfMax(comptime T: type, slice: []const T) usize {
     return index;
 }
 
-test indexOfMax {
-    try testing.expectEqual(indexOfMax(u8, "abcdefg"), 6);
-    try testing.expectEqual(indexOfMax(u8, "gabcdef"), 0);
-    try testing.expectEqual(indexOfMax(u8, "a"), 0);
+test findMax {
+    try testing.expectEqual(findMax(u8, "abcdefg"), 6);
+    try testing.expectEqual(findMax(u8, "gabcdef"), 0);
+    try testing.expectEqual(findMax(u8, "a"), 0);
 }
+
+/// Deprecated in favor of `findMinMax`.
+pub const indexOfMinMax = findMinMax;
 
 /// Finds the indices of the smallest and largest number in a slice. O(n).
 /// Returns the indices of the smallest and largest numbers in that order.
 /// `slice` must not be empty.
-pub fn indexOfMinMax(comptime T: type, slice: []const T) struct { usize, usize } {
+pub fn findMinMax(comptime T: type, slice: []const T) struct { usize, usize } {
     assert(slice.len > 0);
     var minVal = slice[0];
     var maxVal = slice[0];
@@ -3581,16 +3921,41 @@ pub fn indexOfMinMax(comptime T: type, slice: []const T) struct { usize, usize }
     return .{ minIdx, maxIdx };
 }
 
-test indexOfMinMax {
-    try testing.expectEqual(.{ 0, 6 }, indexOfMinMax(u8, "abcdefg"));
-    try testing.expectEqual(.{ 1, 0 }, indexOfMinMax(u8, "gabcdef"));
-    try testing.expectEqual(.{ 0, 0 }, indexOfMinMax(u8, "a"));
+test findMinMax {
+    try testing.expectEqual(.{ 0, 6 }, findMinMax(u8, "abcdefg"));
+    try testing.expectEqual(.{ 1, 0 }, findMinMax(u8, "gabcdef"));
+    try testing.expectEqual(.{ 0, 0 }, findMinMax(u8, "a"));
 }
 
-pub fn swap(comptime T: type, a: *T, b: *T) void {
-    const tmp = a.*;
-    a.* = b.*;
-    b.* = tmp;
+/// Exchanges contents of two memory locations.
+pub fn swap(comptime T: type, noalias a: *T, noalias b: *T) void {
+    if (@inComptime()) {
+        // In comptime, accessing bytes of values with no defined layout is a compile error.
+        const tmp = a.*;
+        a.* = b.*;
+        b.* = tmp;
+    } else {
+        // Swapping in streaming nature from start to end instead of swapping
+        // everything in one step allows easier optimizations and less stack usage.
+        const a_bytes: []align(@alignOf(T)) u8 = @ptrCast(a);
+        const b_bytes: []align(@alignOf(T)) u8 = @ptrCast(b);
+        for (a_bytes, b_bytes) |*ab, *bb| {
+            const tmp = ab.*;
+            ab.* = bb.*;
+            bb.* = tmp;
+        }
+    }
+}
+
+test "swap works at comptime with types with no defined layout" {
+    comptime {
+        const T = struct { val: u64 };
+        var a: T = .{ .val = 0 };
+        var b: T = .{ .val = 1 };
+        swap(T, &a, &b);
+        try testing.expectEqual(T{ .val = 1 }, a);
+        try testing.expectEqual(T{ .val = 0 }, b);
+    }
 }
 
 inline fn reverseVector(comptime N: usize, comptime T: type, a: []T) [N]T {
@@ -3605,25 +3970,29 @@ inline fn reverseVector(comptime N: usize, comptime T: type, a: []T) [N]T {
 pub fn reverse(comptime T: type, items: []T) void {
     var i: usize = 0;
     const end = items.len / 2;
-    if (use_vectors and
-        !@inComptime() and
-        @bitSizeOf(T) > 0 and
-        std.math.isPowerOfTwo(@bitSizeOf(T)))
-    {
-        if (std.simd.suggestVectorLength(T)) |simd_size| {
-            if (simd_size <= end) {
-                const simd_end = end - (simd_size - 1);
-                while (i < simd_end) : (i += simd_size) {
-                    const left_slice = items[i .. i + simd_size];
-                    const right_slice = items[items.len - i - simd_size .. items.len - i];
 
-                    const left_shuffled: [simd_size]T = reverseVector(simd_size, T, left_slice);
-                    const right_shuffled: [simd_size]T = reverseVector(simd_size, T, right_slice);
+    vec: {
+        if (!use_vectors) break :vec;
+        if (@inComptime()) break :vec;
+        switch (@typeInfo(T)) {
+            .int, .float => {},
+            .pointer => |pointer| if (pointer.size == .slice) break :vec,
+            else => break :vec,
+        }
+        if (@bitSizeOf(T) == 0 or !comptime std.math.isPowerOfTwo(@bitSizeOf(T))) break :vec;
+        const simd_size = std.simd.suggestVectorLength(T) orelse break :vec;
+        if (simd_size > end) break :vec;
 
-                    @memcpy(right_slice, &left_shuffled);
-                    @memcpy(left_slice, &right_shuffled);
-                }
-            }
+        const simd_end = end - (simd_size - 1);
+        while (i < simd_end) : (i += simd_size) {
+            const left_slice = items[i .. i + simd_size];
+            const right_slice = items[items.len - i - simd_size .. items.len - i];
+
+            const left_shuffled: [simd_size]T = reverseVector(simd_size, T, left_slice);
+            const right_shuffled: [simd_size]T = reverseVector(simd_size, T, right_slice);
+
+            @memcpy(right_slice, &left_shuffled);
+            @memcpy(left_slice, &right_shuffled);
         }
     }
 
@@ -3664,39 +4033,21 @@ test reverse {
         try testing.expectEqualSlices(MyType, &arr, &([_]MyType{ .c, .{ .b = 0 }, .{ .a = .{ 0, 0, 0 } } }));
     }
 }
-fn ReverseIterator(comptime T: type) type {
-    const Pointer = blk: {
-        switch (@typeInfo(T)) {
-            .pointer => |ptr_info| switch (ptr_info.size) {
-                .one => switch (@typeInfo(ptr_info.child)) {
-                    .array => |array_info| {
-                        var new_ptr_info = ptr_info;
-                        new_ptr_info.size = .many;
-                        new_ptr_info.child = array_info.child;
-                        new_ptr_info.sentinel_ptr = array_info.sentinel_ptr;
-                        break :blk @Type(.{ .pointer = new_ptr_info });
-                    },
-                    else => {},
-                },
-                .slice => {
-                    var new_ptr_info = ptr_info;
-                    new_ptr_info.size = .many;
-                    break :blk @Type(.{ .pointer = new_ptr_info });
-                },
-                else => {},
-            },
-            else => {},
-        }
-        @compileError("expected slice or pointer to array, found '" ++ @typeName(T) ++ "'");
+
+/// Returned by `reverseIterator`.
+pub fn ReverseIterator(comptime T: type) type {
+    const ptr = switch (@typeInfo(T)) {
+        .pointer => |ptr| ptr,
+        else => @compileError("expected slice or pointer to array, found '" ++ @typeName(T) ++ "'"),
     };
-    const Element = std.meta.Elem(Pointer);
-    const ElementPointer = @Type(.{ .pointer = ptr: {
-        var ptr = @typeInfo(Pointer).pointer;
-        ptr.size = .one;
-        ptr.child = Element;
-        ptr.sentinel_ptr = null;
-        break :ptr ptr;
-    } });
+    switch (ptr.size) {
+        .slice => {},
+        .one => if (@typeInfo(ptr.child) != .array) @compileError("expected slice or pointer to array, found '" ++ @typeName(T) ++ "'"),
+        .many, .c => @compileError("expected slice or pointer to array, found '" ++ @typeName(T) ++ "'"),
+    }
+    const Element = std.meta.Elem(T);
+    const Pointer = @Pointer(.many, ptr.attrs, Element, std.meta.sentinel(T));
+    const ElementPointer = @Pointer(.one, ptr.attrs, Element, null);
     return struct {
         ptr: Pointer,
         index: usize,
@@ -4003,7 +4354,7 @@ pub fn alignPointerOffset(ptr: anytype, align_to: usize) ?usize {
         @compileError("expected many item pointer, got " ++ @typeName(T));
 
     // Do nothing if the pointer is already well-aligned.
-    if (align_to <= info.pointer.alignment)
+    if (align_to <= info.pointer.attrs.@"align" orelse @alignOf(info.pointer.child))
         return 0;
 
     // Calculate the aligned base address with an eye out for overflow.
@@ -4056,19 +4407,15 @@ fn CopyPtrAttrs(
     comptime size: std.builtin.Type.Pointer.Size,
     comptime child: type,
 ) type {
-    const info = @typeInfo(source).pointer;
-    return @Type(.{
-        .pointer = .{
-            .size = size,
-            .is_const = info.is_const,
-            .is_volatile = info.is_volatile,
-            .is_allowzero = info.is_allowzero,
-            .alignment = info.alignment,
-            .address_space = info.address_space,
-            .child = child,
-            .sentinel_ptr = null,
-        },
-    });
+    const ptr = @typeInfo(source).pointer;
+    var attrs = ptr.attrs;
+    if (attrs.@"align" == null) {
+        const want = @alignOf(ptr.child);
+        if (@alignOf(child) != want) {
+            attrs.@"align" = want;
+        }
+    }
+    return @Pointer(size, attrs, child, null);
 }
 
 fn AsBytesReturnType(comptime P: type) type {
@@ -4132,10 +4479,13 @@ test "asBytes preserves pointer attributes" {
     const in = @typeInfo(@TypeOf(inPtr)).pointer;
     const out = @typeInfo(@TypeOf(outSlice)).pointer;
 
-    try testing.expectEqual(in.is_const, out.is_const);
-    try testing.expectEqual(in.is_volatile, out.is_volatile);
-    try testing.expectEqual(in.is_allowzero, out.is_allowzero);
-    try testing.expectEqual(in.alignment, out.alignment);
+    const in_attrs = in.attrs;
+    const out_attrs = out.attrs;
+
+    try testing.expectEqual(in_attrs.@"const", out_attrs.@"const");
+    try testing.expectEqual(in_attrs.@"volatile", out_attrs.@"volatile");
+    try testing.expectEqual(in_attrs.@"allowzero", out_attrs.@"allowzero");
+    try testing.expectEqual(in_attrs.@"align", out_attrs.@"align");
 }
 
 /// Given any value, returns a copy of its bytes in an array.
@@ -4212,13 +4562,13 @@ test "bytesAsValue preserves pointer attributes" {
     const inSlice = @as(*align(16) const volatile [4]u8, @ptrCast(&inArr))[0..];
     const outPtr = bytesAsValue(u32, inSlice);
 
-    const in = @typeInfo(@TypeOf(inSlice)).pointer;
-    const out = @typeInfo(@TypeOf(outPtr)).pointer;
+    const in_attrs = @typeInfo(@TypeOf(inSlice)).pointer.attrs;
+    const out_attrs = @typeInfo(@TypeOf(outPtr)).pointer.attrs;
 
-    try testing.expectEqual(in.is_const, out.is_const);
-    try testing.expectEqual(in.is_volatile, out.is_volatile);
-    try testing.expectEqual(in.is_allowzero, out.is_allowzero);
-    try testing.expectEqual(in.alignment, out.alignment);
+    try testing.expectEqual(in_attrs.@"const", out_attrs.@"const");
+    try testing.expectEqual(in_attrs.@"volatile", out_attrs.@"volatile");
+    try testing.expectEqual(in_attrs.@"allowzero", out_attrs.@"allowzero");
+    try testing.expectEqual(in_attrs.@"align", out_attrs.@"align");
 }
 
 /// Given a pointer to an array of bytes, returns a value of the specified type backed by a
@@ -4315,13 +4665,13 @@ test "bytesAsSlice preserves pointer attributes" {
     const inSlice = @as(*align(16) const volatile [4]u8, @ptrCast(&inArr))[0..];
     const outSlice = bytesAsSlice(u16, inSlice);
 
-    const in = @typeInfo(@TypeOf(inSlice)).pointer;
-    const out = @typeInfo(@TypeOf(outSlice)).pointer;
+    const in_attrs = @typeInfo(@TypeOf(inSlice)).pointer.attrs;
+    const out_attrs = @typeInfo(@TypeOf(outSlice)).pointer.attrs;
 
-    try testing.expectEqual(in.is_const, out.is_const);
-    try testing.expectEqual(in.is_volatile, out.is_volatile);
-    try testing.expectEqual(in.is_allowzero, out.is_allowzero);
-    try testing.expectEqual(in.alignment, out.alignment);
+    try testing.expectEqual(in_attrs.@"const", out_attrs.@"const");
+    try testing.expectEqual(in_attrs.@"volatile", out_attrs.@"volatile");
+    try testing.expectEqual(in_attrs.@"allowzero", out_attrs.@"allowzero");
+    try testing.expectEqual(in_attrs.@"align", out_attrs.@"align");
 }
 
 test "bytesAsSlice with zero-bit element type" {
@@ -4374,7 +4724,7 @@ test "sliceAsBytes with sentinel slice" {
 }
 
 test "sliceAsBytes with zero-bit element type" {
-    const lots_of_nothing = [1]void{{}} ** 10_000;
+    const lots_of_nothing: [10_000]void = @splat({});
     const bytes = sliceAsBytes(&lots_of_nothing);
     try testing.expect(bytes.len == 0);
 }
@@ -4427,13 +4777,68 @@ test "sliceAsBytes preserves pointer attributes" {
     const inSlice = @as(*align(16) const volatile [2]u16, @ptrCast(&inArr))[0..];
     const outSlice = sliceAsBytes(inSlice);
 
-    const in = @typeInfo(@TypeOf(inSlice)).pointer;
-    const out = @typeInfo(@TypeOf(outSlice)).pointer;
+    const in_attrs = @typeInfo(@TypeOf(inSlice)).pointer.attrs;
+    const out_attrs = @typeInfo(@TypeOf(outSlice)).pointer.attrs;
 
-    try testing.expectEqual(in.is_const, out.is_const);
-    try testing.expectEqual(in.is_volatile, out.is_volatile);
-    try testing.expectEqual(in.is_allowzero, out.is_allowzero);
-    try testing.expectEqual(in.alignment, out.alignment);
+    try testing.expectEqual(in_attrs.@"const", out_attrs.@"const");
+    try testing.expectEqual(in_attrs.@"volatile", out_attrs.@"volatile");
+    try testing.expectEqual(in_attrs.@"allowzero", out_attrs.@"allowzero");
+    try testing.expectEqual(in_attrs.@"align", out_attrs.@"align");
+}
+
+/// If the provided slice is not sentinel terminated, do nothing and return that slice.
+/// If it is sentinel-terminated, return a non-sentinel-terminated slice with the
+/// length increased by one to include the absorbed sentinel element.
+pub fn absorbSentinel(slice: anytype) AbsorbSentinel(@TypeOf(slice)) {
+    const info = @typeInfo(@TypeOf(slice)).pointer;
+    switch (info.size) {
+        .slice => {
+            if (info.sentinel_ptr == null) {
+                return slice;
+            } else {
+                return slice.ptr[0 .. slice.len + 1];
+            }
+        },
+        .one => {
+            const child_info = @typeInfo(info.child).array;
+            if (child_info.sentinel_ptr == null) {
+                return slice;
+            } else {
+                return slice[0 .. child_info.len + 1];
+            }
+        },
+        else => unreachable,
+    }
+}
+
+test absorbSentinel {
+    {
+        var buffer: [3:0]u8 = .{ 1, 2, 3 };
+        const foo: [:0]const u8 = &buffer;
+        const bar: []const u8 = &buffer;
+        const baz: *const [3:0]u8 = &buffer;
+        try testing.expectEqual([]const u8, @TypeOf(absorbSentinel(foo)));
+        try testing.expectEqual([]const u8, @TypeOf(absorbSentinel(bar)));
+        try testing.expectEqual(*const [4]u8, @TypeOf(absorbSentinel(baz)));
+        try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 0 }, absorbSentinel(foo));
+        try testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, absorbSentinel(bar));
+        try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 0 }, absorbSentinel(baz));
+    }
+    {
+        var buffer: [3:0]u8 = .{ 1, 2, 3 };
+        const foo: [:0]u8 = &buffer;
+        const bar: []u8 = &buffer;
+        const baz: *[3:0]u8 = &buffer;
+        try testing.expectEqual([]u8, @TypeOf(absorbSentinel(foo)));
+        try testing.expectEqual([]u8, @TypeOf(absorbSentinel(bar)));
+        try testing.expectEqual(*[4]u8, @TypeOf(absorbSentinel(baz)));
+        var expected_foo = [_]u8{ 1, 2, 3, 0 };
+        try testing.expectEqualSlices(u8, &expected_foo, absorbSentinel(foo));
+        var expected_bar = [_]u8{ 1, 2, 3 };
+        try testing.expectEqualSlices(u8, &expected_bar, absorbSentinel(bar));
+        var expected_baz = [_]u8{ 1, 2, 3, 0 };
+        try testing.expectEqualSlices(u8, &expected_baz, absorbSentinel(baz));
+    }
 }
 
 /// Round an address down to the next (or current) aligned address.
@@ -4453,6 +4858,9 @@ pub fn alignForward(comptime T: type, addr: T, alignment: T) T {
     return alignBackward(T, addr + (alignment - 1), alignment);
 }
 
+/// Rounds an address up to the next alignment boundary using log2 representation.
+/// Equivalent to alignForward with alignment = 1 << log2_alignment.
+/// More efficient when alignment is known to be a power of 2.
 pub fn alignForwardLog2(addr: usize, log2_alignment: u8) usize {
     const alignment = @as(usize, 1) << @as(math.Log2Int(usize), @intCast(log2_alignment));
     return alignForward(usize, addr, alignment);
@@ -4465,61 +4873,56 @@ pub fn alignForwardLog2(addr: usize, log2_alignment: u8) usize {
 pub fn doNotOptimizeAway(val: anytype) void {
     if (@inComptime()) return;
 
-    const max_gp_register_bits = @bitSizeOf(c_long);
-    const t = @typeInfo(@TypeOf(val));
-    switch (t) {
+    if (builtin.zig_backend == .stage2_c and builtin.abi == .msvc) {
+        _ = @atomicRmw(*const anyopaque, @as(*volatile *const anyopaque, &struct {
+            var escape: *const anyopaque = undefined;
+        }.escape), .Xchg, &val, .acq_rel); // TODO: syncscope("singlethreaded")
+        return;
+    }
+
+    switch (@typeInfo(@TypeOf(val))) {
         .void, .null, .comptime_int, .comptime_float => return,
-        .@"enum" => doNotOptimizeAway(@intFromEnum(val)),
+        .@"enum" => doNotOptimizeAway(@backingInt(val)),
         .bool => doNotOptimizeAway(@intFromBool(val)),
-        .int => {
-            const bits = t.int.bits;
-            if (bits <= max_gp_register_bits and builtin.zig_backend != .stage2_c) {
+        .int => |int| {
+            // SPIR-V targets do not have registers per se, they have values
+            // tied to IDs that can be passed to valid instructions. Some
+            // SPIR-V targets do not define c_long, so we just allow any sized
+            // integer on these targets
+            const val_fits_in_gp_register = builtin.target.cpu.arch.isSpirV() or fits: {
+                const max_gp_register_bits = @bitSizeOf(c_long);
+                break :fits int.bits <= max_gp_register_bits;
+            };
+            if (val_fits_in_gp_register) {
                 const val2 = @as(
-                    std.meta.Int(t.int.signedness, @max(8, std.math.ceilPowerOfTwoAssert(u16, bits))),
+                    @Int(int.signedness, @max(8, std.math.ceilPowerOfTwoAssert(u16, int.bits))),
                     val,
                 );
                 asm volatile (""
                     :
                     : [_] "r" (val2),
                 );
-            } else doNotOptimizeAway(&val);
-        },
-        .float => {
-            // https://github.com/llvm/llvm-project/issues/159200
-            if ((t.float.bits == 32 or t.float.bits == 64) and builtin.zig_backend != .stage2_c and !builtin.cpu.arch.isLoongArch()) {
-                asm volatile (""
-                    :
-                    : [_] "rm" (val),
-                );
-            } else doNotOptimizeAway(&val);
-        },
-        .pointer => {
-            if (builtin.zig_backend == .stage2_c) {
-                doNotOptimizeAwayC(val);
             } else {
-                asm volatile (""
-                    :
-                    : [_] "m" (val),
-                    : .{ .memory = true });
+                doNotOptimizeAway(&val);
             }
         },
-        .array => {
-            if (t.array.len * @sizeOf(t.array.child) <= 64) {
-                for (val) |v| doNotOptimizeAway(v);
-            } else doNotOptimizeAway(&val);
+        .float => |float| switch (float.bits) {
+            else => comptime unreachable,
+            16, 80, 128 => doNotOptimizeAway(&val),
+            32, 64 => asm volatile (""
+                :
+                : [_] "rm" (val),
+            ),
         },
+        .pointer => asm volatile (""
+            :
+            : [_] "m" (val),
+            : .{ .memory = true }),
+        .array => |array| if (array.len * @sizeOf(array.child) <= 64) {
+            for (val) |v| doNotOptimizeAway(v);
+        } else doNotOptimizeAway(&val),
         else => doNotOptimizeAway(&val),
     }
-}
-
-/// .stage2_c doesn't support asm blocks yet, so use volatile stores instead
-var deopt_target: if (builtin.zig_backend == .stage2_c) u8 else void = undefined;
-fn doNotOptimizeAwayC(ptr: anytype) void {
-    const dest = @as(*volatile u8, @ptrCast(&deopt_target));
-    for (asBytes(ptr)) |b| {
-        dest.* = b;
-    }
-    dest.* = 0;
 }
 
 test doNotOptimizeAway {
@@ -4542,8 +4945,8 @@ test doNotOptimizeAway {
     doNotOptimizeAway(@as(u200, 0));
     doNotOptimizeAway(@as(f32, 0.0));
     doNotOptimizeAway(@as(f64, 0.0));
-    doNotOptimizeAway([_]u8{0} ** 4);
-    doNotOptimizeAway([_]u8{0} ** 100);
+    doNotOptimizeAway(@as([4]u8, @splat(0)));
+    doNotOptimizeAway(@as([100]u8, @splat(0)));
     doNotOptimizeAway(@as(std.builtin.Endian, .little));
 }
 
@@ -4593,6 +4996,9 @@ pub fn isValidAlignGeneric(comptime T: type, alignment: T) bool {
     return alignment > 0 and std.math.isPowerOfTwo(alignment);
 }
 
+/// Returns true if i is aligned to the given alignment.
+/// Works with any positive alignment value, not just powers of 2.
+/// For power-of-2 alignments, `isAligned` is more efficient.
 pub fn isAlignedAnyAlign(i: usize, alignment: usize) bool {
     if (isValidAlign(alignment))
         return isAligned(i, alignment);
@@ -4600,6 +5006,9 @@ pub fn isAlignedAnyAlign(i: usize, alignment: usize) bool {
     return 0 == @mod(i, alignment);
 }
 
+/// Returns true if addr is aligned to 2^log2_alignment.
+/// More efficient than `isAligned` when alignment is known to be a power of 2.
+/// log2_alignment must be < @bitSizeOf(usize).
 pub fn isAlignedLog2(addr: usize, log2_alignment: u8) bool {
     return @ctz(addr) >= log2_alignment;
 }
@@ -4610,6 +5019,9 @@ pub fn isAligned(addr: usize, alignment: usize) bool {
     return isAlignedGeneric(u64, addr, alignment);
 }
 
+/// Generic version of `isAligned` that works with any integer type.
+/// Returns true if addr is aligned to the given alignment.
+/// Alignment must be a power of 2 and greater than 0.
 pub fn isAlignedGeneric(comptime T: type, addr: T, alignment: T) bool {
     return alignBackward(T, addr, alignment) == addr;
 }
@@ -4631,26 +5043,17 @@ test isAligned {
 }
 
 test "freeing empty string with null-terminated sentinel" {
-    const empty_string = try testing.allocator.dupeZ(u8, "");
+    const empty_string = try testing.allocator.dupeSentinel(u8, "", 0);
     testing.allocator.free(empty_string);
 }
 
 /// Returns a slice with the given new alignment,
 /// all other pointer attributes copied from `AttributeSource`.
 fn AlignedSlice(comptime AttributeSource: type, comptime new_alignment: usize) type {
-    const info = @typeInfo(AttributeSource).pointer;
-    return @Type(.{
-        .pointer = .{
-            .size = .slice,
-            .is_const = info.is_const,
-            .is_volatile = info.is_volatile,
-            .is_allowzero = info.is_allowzero,
-            .alignment = new_alignment,
-            .address_space = info.address_space,
-            .child = info.child,
-            .sentinel_ptr = null,
-        },
-    });
+    const ptr = @typeInfo(AttributeSource).pointer;
+    var attrs = ptr.attrs;
+    attrs.@"align" = new_alignment;
+    return @Pointer(.slice, attrs, ptr.child, null);
 }
 
 /// Returns the largest slice in the given bytes that conforms to the new alignment,
@@ -4680,12 +5083,9 @@ pub fn alignInSlice(slice: anytype, comptime new_alignment: usize) ?AlignedSlice
 }
 
 test "read/write(Var)PackedInt" {
-    switch (builtin.cpu.arch) {
-        // This test generates too much code to execute on WASI.
-        // LLVM backend fails with "too many locals: locals exceed maximum"
-        .wasm32, .wasm64 => return error.SkipZigTest,
-        else => {},
-    }
+    // This test generates too much code to execute on WASI.
+    // LLVM backend fails with "too many locals: locals exceed maximum"
+    if (builtin.cpu.arch.isWasm()) return error.SkipZigTest;
 
     const foreign_endian: Endian = if (native_endian == .big) .little else .big;
     const expect = std.testing.expect;
@@ -4707,8 +5107,8 @@ test "read/write(Var)PackedInt" {
                 if (@bitSizeOf(PackedType) > @bitSizeOf(BackingType))
                     continue;
 
-                const iPackedType = std.meta.Int(.signed, @bitSizeOf(PackedType));
-                const uPackedType = std.meta.Int(.unsigned, @bitSizeOf(PackedType));
+                const iPackedType = @Int(.signed, @bitSizeOf(PackedType));
+                const uPackedType = @Int(.unsigned, @bitSizeOf(PackedType));
                 const Log2T = std.math.Log2Int(BackingType);
 
                 const offset_at_end = @bitSizeOf(BackingType) - @bitSizeOf(PackedType);
@@ -4719,8 +5119,8 @@ test "read/write(Var)PackedInt" {
                     for ([_]PackedType{
                         ~@as(PackedType, 0), // all ones: -1 iN / maxInt uN
                         @as(PackedType, 0), // all zeros: 0 iN / 0 uN
-                        @as(PackedType, @bitCast(@as(iPackedType, math.maxInt(iPackedType)))), // maxInt iN
-                        @as(PackedType, @bitCast(@as(iPackedType, math.minInt(iPackedType)))), // maxInt iN
+                        @bitCast(@as(iPackedType, math.maxInt(iPackedType))), // maxInt iN
+                        @bitCast(@as(iPackedType, math.minInt(iPackedType))), // maxInt iN
                         random.int(PackedType), // random
                         random.int(PackedType), // random
                     }) |write_value| {
@@ -4775,8 +5175,8 @@ test "read/write(Var)PackedInt" {
                         }
 
                         const signedness = @typeInfo(PackedType).int.signedness;
-                        const NextPowerOfTwoInt = std.meta.Int(signedness, try comptime std.math.ceilPowerOfTwo(u16, @bitSizeOf(PackedType)));
-                        const ui64 = std.meta.Int(signedness, 64);
+                        const NextPowerOfTwoInt = @Int(signedness, try std.math.ceilPowerOfTwo(u16, @bitSizeOf(PackedType)));
+                        const ui64 = @Int(signedness, 64);
                         inline for ([_]type{ PackedType, NextPowerOfTwoInt, ui64 }) |U| {
                             { // Variable-size Read/Write (Native-endian)
 
@@ -4839,4 +5239,51 @@ test "read/write(Var)PackedInt" {
             }
         }
     }
+}
+
+pub const PrintError = error{
+    /// As much as possible was written to the buffer, but it was too small to
+    /// fit all the printed bytes.
+    NoSpaceLeft,
+};
+
+/// Render a formatted string into `buffer`. Returns a slice of `buffer`
+/// starting at index 0 containing the result, or `error.NoSpaceLeft` if one or
+/// more bytes were truncated.
+///
+/// See `std.Io.Writer.print`.
+pub fn print(buffer: []u8, comptime format: []const u8, args: anytype) PrintError![]u8 {
+    var w: std.Io.Writer = .fixed(buffer);
+    w.print(format, args) catch |err| switch (err) {
+        error.WriteFailed => return error.NoSpaceLeft,
+    };
+    return w.buffered();
+}
+
+test print {
+    const x: i32 = -1;
+    const y: []const u8 = "hi";
+    var buffer: [64]u8 = undefined;
+    const s = try print(&buffer, "{d}={s}", .{ x, y });
+    try testing.expectEqualStrings("-1=hi", s);
+}
+
+/// Like `print` but returned slice has the provided sentinel.
+pub fn printSentinel(
+    buffer: []u8,
+    comptime format: []const u8,
+    args: anytype,
+    comptime sentinel: u8,
+) PrintError![:sentinel]u8 {
+    const result = try print(buffer, format ++ [1]u8{sentinel}, args);
+    return result[0 .. result.len - 1 :sentinel];
+}
+
+test printSentinel {
+    const x: i32 = -1;
+    const y: []const u8 = "hi";
+    var buffer: [64]u8 = undefined;
+    const s = try printSentinel(&buffer, "{d}={s}", .{ x, y }, 0);
+    try testing.expectEqualStrings("-1=hi", s);
+    try testing.expectEqual(0, s[s.len]);
 }

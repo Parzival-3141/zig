@@ -3,41 +3,47 @@
 //!
 //! https://git.musl-libc.org/cgit/musl/tree/src/math/tanf.c
 //! https://git.musl-libc.org/cgit/musl/tree/src/math/tan.c
+//! https://git.musl-libc.org/cgit/musl/tree/src/math/tanl.c
 //! https://golang.org/src/math/tan.go
 
 const std = @import("std");
 const builtin = @import("builtin");
 const math = std.math;
+const ld = math.long_double;
 const mem = std.mem;
 const expect = std.testing.expect;
+const expectApproxEqAbs = std.testing.expectApproxEqAbs;
 
 const kernel = @import("trig.zig");
 const rem_pio2 = @import("rem_pio2.zig").rem_pio2;
 const rem_pio2f = @import("rem_pio2f.zig").rem_pio2f;
+const rem_pio2l = @import("rem_pio2l.zig").rem_pio2l;
 
 const arch = builtin.cpu.arch;
-const common = @import("common.zig");
-
-pub const panic = common.panic;
+const compiler_rt = @import("../compiler_rt.zig");
+const symbol = compiler_rt.symbol;
 
 comptime {
-    @export(&__tanh, .{ .name = "__tanh", .linkage = common.linkage, .visibility = common.visibility });
-    @export(&tanf, .{ .name = "tanf", .linkage = common.linkage, .visibility = common.visibility });
-    @export(&tan, .{ .name = "tan", .linkage = common.linkage, .visibility = common.visibility });
-    @export(&__tanx, .{ .name = "__tanx", .linkage = common.linkage, .visibility = common.visibility });
-    if (common.want_ppc_abi) {
-        @export(&tanq, .{ .name = "tanf128", .linkage = common.linkage, .visibility = common.visibility });
-    }
-    @export(&tanq, .{ .name = "tanq", .linkage = common.linkage, .visibility = common.visibility });
-    @export(&tanl, .{ .name = "tanl", .linkage = common.linkage, .visibility = common.visibility });
+    symbol(&__tanh, "__tanh");
+    symbol(&tanf, "tanf");
+    symbol(&tan, "tan");
+    symbol(&__tanx, "__tanx");
+    symbol(&tanq, "tanf128");
+    if (compiler_rt.have_c_longdouble) symbol(&tanl, "tanl");
 }
 
-pub fn __tanh(x: f16) callconv(.c) f16 {
+fn __tanh(x: compiler_rt.f16.Abi) callconv(.c) compiler_rt.f16.Abi {
+    return compiler_rt.f16.toAbi(tan_f16(compiler_rt.f16.fromAbi(x)));
+}
+pub fn tan_f16(x: f16) f16 {
     // TODO: more efficient implementation
-    return @floatCast(tanf(x));
+    return @floatCast(tan_f32(x));
 }
 
-pub fn tanf(x: f32) callconv(.c) f32 {
+fn tanf(x: compiler_rt.f32.Abi) callconv(.c) compiler_rt.f32.Abi {
+    return compiler_rt.f32.toAbi(tan_f32(compiler_rt.f32.fromAbi(x)));
+}
+pub fn tan_f32(x: f32) f32 {
     // Small multiples of pi/2 rounded to double precision.
     const t1pio2: f64 = 1.0 * math.pi / 2.0; // 0x3FF921FB, 0x54442D18
     const t2pio2: f64 = 2.0 * math.pi / 2.0; // 0x400921FB, 0x54442D18
@@ -51,7 +57,7 @@ pub fn tanf(x: f32) callconv(.c) f32 {
     if (ix <= 0x3f490fda) { // |x| ~<= pi/4
         if (ix < 0x39800000) { // |x| < 2**-12
             // raise inexact if x!=0 and underflow if subnormal
-            if (common.want_float_exceptions) {
+            if (compiler_rt.want_float_exceptions) {
                 if (ix < 0x00800000) {
                     mem.doNotOptimizeAway(x / 0x1p120);
                 } else {
@@ -60,20 +66,20 @@ pub fn tanf(x: f32) callconv(.c) f32 {
             }
             return x;
         }
-        return kernel.__tandf(x, false);
+        return kernel.tandf(x, false);
     }
     if (ix <= 0x407b53d1) { // |x| ~<= 5*pi/4
         if (ix <= 0x4016cbe3) { // |x| ~<= 3pi/4
-            return kernel.__tandf((if (sign) x + t1pio2 else x - t1pio2), true);
+            return kernel.tandf((if (sign) x + t1pio2 else x - t1pio2), true);
         } else {
-            return kernel.__tandf((if (sign) x + t2pio2 else x - t2pio2), false);
+            return kernel.tandf((if (sign) x + t2pio2 else x - t2pio2), false);
         }
     }
     if (ix <= 0x40e231d5) { // |x| ~<= 9*pi/4
         if (ix <= 0x40afeddf) { // |x| ~<= 7*pi/4
-            return kernel.__tandf((if (sign) x + t3pio2 else x - t3pio2), true);
+            return kernel.tandf((if (sign) x + t3pio2 else x - t3pio2), true);
         } else {
-            return kernel.__tandf((if (sign) x + t4pio2 else x - t4pio2), false);
+            return kernel.tandf((if (sign) x + t4pio2 else x - t4pio2), false);
         }
     }
 
@@ -84,10 +90,13 @@ pub fn tanf(x: f32) callconv(.c) f32 {
 
     var y: f64 = undefined;
     const n = rem_pio2f(x, &y);
-    return kernel.__tandf(y, n & 1 != 0);
+    return kernel.tandf(y, n & 1 != 0);
 }
 
-pub fn tan(x: f64) callconv(.c) f64 {
+fn tan(x: compiler_rt.f64.Abi) callconv(.c) compiler_rt.f64.Abi {
+    return compiler_rt.f64.toAbi(tan_f64(compiler_rt.f64.fromAbi(x)));
+}
+pub fn tan_f64(x: f64) f64 {
     var ix = @as(u64, @bitCast(x)) >> 32;
     ix &= 0x7fffffff;
 
@@ -95,7 +104,7 @@ pub fn tan(x: f64) callconv(.c) f64 {
     if (ix <= 0x3fe921fb) {
         if (ix < 0x3e400000) { // |x| < 2**-27
             // raise inexact if x!=0 and underflow if subnormal
-            if (common.want_float_exceptions) {
+            if (compiler_rt.want_float_exceptions) {
                 if (ix < 0x00100000) {
                     mem.doNotOptimizeAway(x / 0x1p120);
                 } else {
@@ -104,7 +113,7 @@ pub fn tan(x: f64) callconv(.c) f64 {
             }
             return x;
         }
-        return kernel.__tan(x, 0.0, false);
+        return kernel.tan(x, 0.0, false);
     }
 
     // tan(Inf or NaN) is NaN
@@ -114,69 +123,144 @@ pub fn tan(x: f64) callconv(.c) f64 {
 
     var y: [2]f64 = undefined;
     const n = rem_pio2(x, &y);
-    return kernel.__tan(y[0], y[1], n & 1 != 0);
+    return kernel.tan(y[0], y[1], n & 1 != 0);
 }
 
-pub fn __tanx(x: f80) callconv(.c) f80 {
-    // TODO: more efficient implementation
-    return @floatCast(tanq(x));
+fn __tanx(x: compiler_rt.f80.Abi) callconv(.c) compiler_rt.f80.Abi {
+    return compiler_rt.f80.toAbi(tan_f80(compiler_rt.f80.fromAbi(x)));
+}
+pub fn tan_f80(x: f80) f80 {
+    const se = ld.signExponent(x) & 0x7fff;
+    if (se == 0x7fff) {
+        return x - x;
+    }
+
+    if (@abs(x) < kernel.pi_4) {
+        if (se < 0x3fff - math.floatMantissaBits(f80) / 2) {
+            if (compiler_rt.want_float_exceptions) {
+                mem.doNotOptimizeAway(if (se == 0) x * 0x1p-120 else x + 0x1p120);
+            }
+            return x;
+        }
+        return kernel.tanx(x, 0.0, 0);
+    }
+
+    var y: [2]f80 = undefined;
+    const n = rem_pio2l(f80, x, &y);
+    return kernel.tanx(y[0], y[1], n & 1);
 }
 
-pub fn tanq(x: f128) callconv(.c) f128 {
-    // TODO: more correct implementation
-    return tan(@floatCast(x));
+fn tanq(x: compiler_rt.f128.Abi) callconv(.c) compiler_rt.f128.Abi {
+    return compiler_rt.f128.toAbi(tan_f128(compiler_rt.f128.fromAbi(x)));
+}
+pub fn tan_f128(x: f128) f128 {
+    const se = ld.signExponent(x) & 0x7fff;
+    if (se == 0x7fff) {
+        return x - x;
+    }
+
+    if (@abs(x) < kernel.pi_4) {
+        if (se < 0x3fff - math.floatMantissaBits(f128) / 2) {
+            if (compiler_rt.want_float_exceptions) {
+                mem.doNotOptimizeAway(if (se == 0) x * 0x1p-120 else x + 0x1p120);
+            }
+            return x;
+        }
+        return kernel.tanq(x, 0.0, 0);
+    }
+
+    var y: [2]f128 = undefined;
+    const n = rem_pio2l(f128, x, &y);
+    return kernel.tanq(y[0], y[1], n & 1);
 }
 
 pub fn tanl(x: c_longdouble) callconv(.c) c_longdouble {
     switch (@typeInfo(c_longdouble).float.bits) {
-        16 => return __tanh(x),
-        32 => return tanf(x),
-        64 => return tan(x),
-        80 => return __tanx(x),
-        128 => return tanq(x),
-        else => @compileError("unreachable"),
+        64 => return tan_f64(x),
+        80 => return tan_f80(x),
+        128 => return tan_f128(x),
+        else => comptime unreachable,
     }
 }
 
-test "tan" {
-    try expect(tan(@as(f32, 0.0)) == tanf(0.0));
-    try expect(tan(@as(f64, 0.0)) == tan(0.0));
-}
-
-test "tan32" {
+fn testTanNormal(comptime T: type) !void {
+    const f = switch (T) {
+        f16 => tan_f16,
+        f32 => tan_f32,
+        f64 => tan_f64,
+        f80 => tan_f80,
+        f128 => tan_f128,
+        else => comptime unreachable,
+    };
     const epsilon = 0.00001;
 
-    try expect(math.approxEqAbs(f32, tanf(0.0), 0.0, epsilon));
-    try expect(math.approxEqAbs(f32, tanf(0.2), 0.202710, epsilon));
-    try expect(math.approxEqAbs(f32, tanf(0.8923), 1.240422, epsilon));
-    try expect(math.approxEqAbs(f32, tanf(1.5), 14.101420, epsilon));
-    try expect(math.approxEqAbs(f32, tanf(37.45), -0.254397, epsilon));
-    try expect(math.approxEqAbs(f32, tanf(89.123), 2.285852, epsilon));
+    try expectApproxEqAbs(@as(T, 0.0), f(0.0), epsilon);
+    try expectApproxEqAbs(@as(T, 0.202710), f(0.2), epsilon);
+    try expectApproxEqAbs(@as(T, 1.240422), f(0.8923), epsilon);
+    try expectApproxEqAbs(@as(T, 14.101420), f(1.5), epsilon);
+    try expectApproxEqAbs(@as(T, -0.254397), f(37.45), epsilon);
+    try expectApproxEqAbs(@as(T, 2.285837), f(89.123), epsilon);
 }
 
-test "tan64" {
-    const epsilon = 0.000001;
+fn testTanSpecial(comptime T: type) !void {
+    const f = switch (T) {
+        f16 => tan_f16,
+        f32 => tan_f32,
+        f64 => tan_f64,
+        f80 => tan_f80,
+        f128 => tan_f128,
+        else => comptime unreachable,
+    };
 
-    try expect(math.approxEqAbs(f64, tan(0.0), 0.0, epsilon));
-    try expect(math.approxEqAbs(f64, tan(0.2), 0.202710, epsilon));
-    try expect(math.approxEqAbs(f64, tan(0.8923), 1.240422, epsilon));
-    try expect(math.approxEqAbs(f64, tan(1.5), 14.101420, epsilon));
-    try expect(math.approxEqAbs(f64, tan(37.45), -0.254397, epsilon));
-    try expect(math.approxEqAbs(f64, tan(89.123), 2.2858376, epsilon));
+    try expect(math.isPositiveZero(f(0.0)));
+    try expect(math.isNegativeZero(f(-0.0)));
+    try expect(math.isNan(f(math.inf(f32))));
+    try expect(math.isNan(f(-math.inf(f32))));
+    try expect(math.isNan(f(math.nan(f32))));
+}
+
+test "tan32.normal" {
+    try testTanNormal(f32);
+}
+
+test "tan64.normal" {
+    try testTanNormal(f64);
+}
+
+test "tan80.normal" {
+    const epsilon = math.floatEps(f80);
+
+    try expectApproxEqAbs(@as(f80, 0.0), tan_f80(0.0), epsilon);
+    try expectApproxEqAbs(@as(f80, 0.2027100355086724833213582716475345), tan_f80(0.2), epsilon);
+    try expectApproxEqAbs(@as(f80, 1.2404217445497097995561220131857544), tan_f80(0.8923), epsilon);
+    try expectApproxEqAbs(@as(f80, 14.10141994717171938764), tan_f80(1.5), epsilon);
+    try expectApproxEqAbs(@as(f80, -0.25439607116885656232), tan_f80(37.45), epsilon);
+    try expectApproxEqAbs(@as(f80, 2.2858376251355320963), tan_f80(89.123), epsilon);
+}
+
+test "tan128.normal" {
+    const epsilon = math.floatEps(f128);
+
+    try expectApproxEqAbs(@as(f128, 0.0), tan_f128(0.0), epsilon);
+    try expectApproxEqAbs(@as(f128, 0.2027100355086724833213582716475345), tan_f128(0.2), epsilon);
+    try expectApproxEqAbs(@as(f128, 1.2404217445497097995561220131857544), tan_f128(0.8923), epsilon);
+    try expectApproxEqAbs(@as(f128, 14.101419947171719387646083651987755), tan_f128(1.5), epsilon);
+    try expectApproxEqAbs(@as(f128, -0.2543960711688565630469573224504774), tan_f128(37.45), epsilon);
+    try expectApproxEqAbs(@as(f128, 2.2858376251355321074066028114094292), tan_f128(89.123), epsilon);
 }
 
 test "tan32.special" {
-    try expect(tanf(0.0) == 0.0);
-    try expect(tanf(-0.0) == -0.0);
-    try expect(math.isNan(tanf(math.inf(f32))));
-    try expect(math.isNan(tanf(-math.inf(f32))));
-    try expect(math.isNan(tanf(math.nan(f32))));
+    try testTanSpecial(f32);
 }
 
 test "tan64.special" {
-    try expect(tan(0.0) == 0.0);
-    try expect(tan(-0.0) == -0.0);
-    try expect(math.isNan(tan(math.inf(f64))));
-    try expect(math.isNan(tan(-math.inf(f64))));
-    try expect(math.isNan(tan(math.nan(f64))));
+    try testTanSpecial(f64);
+}
+
+test "tan80.special" {
+    try testTanSpecial(f80);
+}
+
+test "tan128.special" {
+    try testTanSpecial(f128);
 }

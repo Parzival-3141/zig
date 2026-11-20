@@ -5,7 +5,5 @@ export fn entry() usize {
 }
 
 // error
-// backend=stage2
-// target=native
 //
-// :1:29: error: unable to open 'bogus.txt': FileNotFound
+// :1:29: error: failed opening "bogus.txt": FileNotFound

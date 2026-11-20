@@ -155,7 +155,6 @@ test "fn returning empty error set can be passed as fn returning any error - poi
     entryPtr();
     comptime entryPtr();
 }
-
 fn entry() void {
     foo2(bar2);
 }
@@ -206,7 +205,7 @@ const MyErrSet = error{
 };
 
 fn testErrorSetType() !void {
-    try expect(@typeInfo(MyErrSet).error_set.?.len == 2);
+    try expect(@typeInfo(MyErrSet).error_set.error_names.?.len == 2);
 
     const a: MyErrSet!i32 = 5678;
     const b: MyErrSet!i32 = MyErrSet.OutOfMemory;
@@ -509,7 +508,6 @@ test "function pointer with return type that is error union with payload which i
         const Foo = struct {
             fun: *const fn (a: i32) (anyerror!*Foo),
         };
-
         const Err = error{UnspecifiedErr};
 
         fn bar(a: i32) anyerror!*Foo {
@@ -695,7 +693,6 @@ test "coerce error set to the current inferred error set" {
 test "error union payload is properly aligned" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
     const S = struct {
@@ -784,9 +781,9 @@ const NoReturn = struct {
 };
 
 test "error union of noreturn used with if" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
     NoReturn.a = 64;
@@ -798,9 +795,9 @@ test "error union of noreturn used with if" {
 }
 
 test "error union of noreturn used with try" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
     NoReturn.a = 64;
@@ -809,9 +806,9 @@ test "error union of noreturn used with try" {
 }
 
 test "error union of noreturn used with catch" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
     NoReturn.a = 64;
@@ -951,7 +948,6 @@ test "returning an error union containing a type with no runtime bits" {
 }
 
 test "try used in recursive function with inferred error set" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
@@ -1072,7 +1068,6 @@ test "result location initialization of error union with OPV payload" {
 
 test "return error union with i65" {
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     try expect(try add(1000, 234) == 1234);
 }
@@ -1090,4 +1085,62 @@ test "compare error union to error set" {
     };
     try S.doTheTest(0);
     try comptime S.doTheTest(0);
+}
+
+test "'if' ignores error via local while 'else' ignores error directly" {
+    const S = struct {
+        /// This function is intentionally fallible despite never returning an
+        /// error so that it participates in error return tracing.
+        fn testOne(cond: bool) !void {
+            if (cond) {
+                const result = notError();
+                result catch {};
+            } else {
+                notError() catch {};
+            }
+        }
+        fn notError() error{E}!void {}
+    };
+
+    try S.testOne(false);
+    try S.testOne(true);
+}
+
+test "@errorCast into own inferred error set" {
+    const static = struct {
+        fn foo(b: bool) !void {
+            if (b) {
+                return @errorCast(error.Bad);
+            }
+        }
+    };
+    try static.foo(false);
+    if (static.foo(true)) {
+        return error.ExpectedError;
+    } else |err| {
+        try expect(err == error.Bad);
+    }
+
+    const error_names = @typeInfo(@typeInfo(@TypeOf(static.foo(false))).error_union.error_set).error_set.error_names.?;
+    comptime assert(error_names.len == 1);
+    comptime assert(std.mem.eql(u8, error_names[0], "Bad"));
+}
+
+test "@errorCast into other inferred error set" {
+    const static = struct {
+        fn foo() !void {
+            return error.Bad;
+        }
+    };
+    const Ies = @typeInfo(@TypeOf(static.foo())).error_union.error_set;
+    const err: Ies = @errorCast(error.Bad);
+    try expect(err == error.Bad);
+    const non_err: Ies!u32 = @errorCast(@as(error{}!u32, 123));
+    try expect(try non_err == 123);
+}
+
+test "error union with vector type" {
+    var x: anyerror!@Vector(5, f64) = undefined;
+    x = error.Expected;
+    try expect(x == error.Expected);
 }

@@ -6,6 +6,7 @@ test {
     _ = @import("behavior/alignof.zig");
     _ = @import("behavior/array.zig");
     _ = @import("behavior/atomics.zig");
+    _ = @import("behavior/backing_int.zig");
     _ = @import("behavior/basic.zig");
     _ = @import("behavior/bit_shifting.zig");
     _ = @import("behavior/bitcast.zig");
@@ -24,7 +25,6 @@ test {
     _ = @import("behavior/duplicated_test_names.zig");
     _ = @import("behavior/defer.zig");
     _ = @import("behavior/destructure.zig");
-    _ = @import("behavior/empty_union.zig");
     _ = @import("behavior/enum.zig");
     _ = @import("behavior/error.zig");
     _ = @import("behavior/eval.zig");
@@ -61,6 +61,7 @@ test {
     _ = @import("behavior/nan.zig");
     _ = @import("behavior/null.zig");
     _ = @import("behavior/optional.zig");
+    _ = @import("behavior/overlapping_assign.zig");
     _ = @import("behavior/packed-struct.zig");
     _ = @import("behavior/packed_struct_explicit_backing_int.zig");
     _ = @import("behavior/packed-union.zig");
@@ -78,6 +79,7 @@ test {
     _ = @import("behavior/sizeof_and_typeof.zig");
     _ = @import("behavior/slice.zig");
     _ = @import("behavior/slice_sentinel_comptime.zig");
+    _ = @import("behavior/splat.zig");
     _ = @import("behavior/src.zig");
     _ = @import("behavior/string_literals.zig");
     _ = @import("behavior/struct.zig");
@@ -100,13 +102,8 @@ test {
     _ = @import("behavior/undefined.zig");
     _ = @import("behavior/underscore.zig");
     _ = @import("behavior/union.zig");
-    _ = @import("behavior/union_with_members.zig");
     _ = @import("behavior/var_args.zig");
-    // https://github.com/llvm/llvm-project/issues/118879
-    // https://github.com/llvm/llvm-project/issues/134659
-    if (!(builtin.zig_backend == .stage2_llvm and builtin.cpu.arch == .hexagon)) {
-        _ = @import("behavior/vector.zig");
-    }
+    _ = @import("behavior/vector.zig");
     _ = @import("behavior/void.zig");
     _ = @import("behavior/while.zig");
     _ = @import("behavior/widening.zig");
@@ -116,6 +113,10 @@ test {
 
     if (builtin.cpu.arch == .wasm32) {
         _ = @import("behavior/wasm.zig");
+    }
+
+    if (builtin.zig_backend == .stage2_spirv) {
+        _ = @import("behavior/spirv.zig");
     }
 
     if (builtin.zig_backend != .stage2_spirv and builtin.os.tag != .wasi) {

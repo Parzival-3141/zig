@@ -1,12 +1,14 @@
-const std = @import("std");
 const builtin = @import("builtin");
+const native_abi = builtin.abi;
+const native_arch = builtin.cpu.arch;
+const native_os = builtin.os.tag;
+const native_endian = builtin.cpu.arch.endian();
+
+const std = @import("std");
 const c = @This();
 const maxInt = std.math.maxInt;
 const assert = std.debug.assert;
 const page_size = std.heap.page_size_min;
-const native_abi = builtin.abi;
-const native_arch = builtin.cpu.arch;
-const native_os = builtin.os.tag;
 const linux = std.os.linux;
 const emscripten = std.os.emscripten;
 const wasi = std.os.wasi;
@@ -14,7 +16,7 @@ const windows = std.os.windows;
 const ws2_32 = std.os.windows.ws2_32;
 const darwin = @import("c/darwin.zig");
 const freebsd = @import("c/freebsd.zig");
-const solaris = @import("c/solaris.zig");
+const illumos = @import("c/illumos.zig");
 const netbsd = @import("c/netbsd.zig");
 const dragonfly = @import("c/dragonfly.zig");
 const haiku = @import("c/haiku.zig");
@@ -70,6 +72,11 @@ pub inline fn versionCheck(comptime version: std.SemanticVersion) bool {
     };
 }
 
+/// Get the errno if rc is -1 and SUCCESS if rc is not -1.
+pub fn errno(rc: anytype) E {
+    return if (rc == -1) @fromBackingInt(@intCast(_errno().*)) else .SUCCESS;
+}
+
 pub const ino_t = switch (native_os) {
     .linux => linux.ino_t,
     .emscripten => emscripten.ino_t,
@@ -87,12 +94,36 @@ pub const off_t = switch (native_os) {
     else => i64,
 };
 
+/// For use with `utimensat` and `futimens`.
+pub const UTIME = switch (native_os) {
+    .dragonfly, .freebsd, .illumos, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .wasi => struct {
+        pub const NOW: timespec = .{ .sec = 0, .nsec = -1 };
+        pub const OMIT: timespec = .{ .sec = 0, .nsec = -2 };
+    },
+    .emscripten => emscripten.UTIME,
+    .haiku => struct {
+        pub const NOW: timespec = .{ .sec = 0, .nsec = 1000000000 };
+        pub const OMIT: timespec = .{ .sec = 0, .nsec = 1000000001 };
+    },
+    .linux => linux.UTIME,
+    .netbsd => struct {
+        pub const NOW: timespec = .{ .sec = 0, .nsec = 0x3fffffff };
+        pub const OMIT: timespec = .{ .sec = 0, .nsec = 0x3ffffffe };
+    },
+    .openbsd, .serenity => struct {
+        pub const NOW: timespec = .{ .sec = 0, .nsec = -2 };
+        pub const OMIT: timespec = .{ .sec = 0, .nsec = -1 };
+    },
+    else => void,
+};
+
 pub const timespec = switch (native_os) {
     .linux => linux.timespec,
     .emscripten => emscripten.timespec,
+    // lib/libc/include/wasm-wasi-musl/__struct_timespec.h
     .wasi => extern struct {
         sec: time_t,
-        nsec: isize,
+        nsec: c_long,
 
         pub fn fromTimestamp(tm: wasi.timestamp_t) timespec {
             const sec: wasi.timestamp_t = tm / 1_000_000_000;
@@ -109,41 +140,30 @@ pub const timespec = switch (native_os) {
         }
     },
     // https://github.com/SerenityOS/serenity/blob/0a78056453578c18e0a04a0b45ebfb1c96d59005/Kernel/API/POSIX/time.h#L17-L20
-    .windows, .serenity => extern struct {
+    .dragonfly, .freebsd, .netbsd, .openbsd, .illumos, .haiku, .serenity, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .windows => extern struct {
         sec: time_t,
         nsec: c_long,
-    },
-    .dragonfly, .freebsd, .macos, .ios, .tvos, .watchos, .visionos => extern struct {
-        sec: isize,
-        nsec: isize,
-    },
-    .netbsd, .solaris, .illumos => extern struct {
-        sec: i64,
-        nsec: isize,
-    },
-    .openbsd, .haiku => extern struct {
-        sec: time_t,
-        nsec: isize,
     },
     else => void,
 };
 
 pub const dev_t = switch (native_os) {
-    .linux => linux.dev_t,
     .emscripten => emscripten.dev_t,
     .wasi => wasi.device_t,
-    .openbsd, .haiku, .solaris, .illumos, .macos, .ios, .tvos, .watchos, .visionos => i32,
+    .openbsd, .haiku, .illumos, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => i32,
+    // glibc and musl define dev_t as u64, while in Linux kernel it is u32.
     // https://github.com/SerenityOS/serenity/blob/b98f537f117b341788023ab82e0c11ca9ae29a57/Kernel/API/POSIX/sys/types.h#L43
-    .netbsd, .freebsd, .serenity => u64,
+    .linux, .netbsd, .freebsd, .serenity => u64,
     else => void,
 };
 
 pub const mode_t = switch (native_os) {
     .linux => linux.mode_t,
     .emscripten => emscripten.mode_t,
-    .openbsd, .haiku, .netbsd, .solaris, .illumos, .wasi, .windows => u32,
+    .openbsd, .haiku, .netbsd, .illumos, .windows => u32,
     // https://github.com/SerenityOS/serenity/blob/b98f537f117b341788023ab82e0c11ca9ae29a57/Kernel/API/POSIX/sys/types.h#L44
-    .freebsd, .macos, .ios, .tvos, .watchos, .visionos, .dragonfly, .serenity => u16,
+    .freebsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .dragonfly, .serenity => u16,
+    .wasi => if (builtin.link_libc) u32 else u0, // WASI libc emulates mode.
     else => u0,
 };
 
@@ -153,9 +173,10 @@ pub const nlink_t = switch (native_os) {
     .wasi => c_ulonglong,
     // https://github.com/SerenityOS/serenity/blob/b98f537f117b341788023ab82e0c11ca9ae29a57/Kernel/API/POSIX/sys/types.h#L45
     .freebsd, .serenity => u64,
-    .openbsd, .netbsd, .solaris, .illumos => u32,
+    .openbsd, .netbsd, .dragonfly, .illumos, .windows => u32,
     .haiku => i32,
-    else => void,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => u16,
+    else => u0,
 };
 
 pub const uid_t = switch (native_os) {
@@ -192,7 +213,7 @@ pub const passwd = switch (native_os) {
         dir: ?[*:0]const u8, // home directory
         shell: ?[*:0]const u8, // shell program
     },
-    .netbsd, .openbsd, .macos => extern struct {
+    .netbsd, .openbsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
         name: ?[*:0]const u8, // user name
         passwd: ?[*:0]const u8, // encrypted password
         uid: uid_t, // user uid
@@ -221,7 +242,7 @@ pub const passwd = switch (native_os) {
 };
 
 pub const group = switch (native_os) {
-    .linux, .freebsd, .openbsd, .dragonfly, .netbsd, .macos => extern struct {
+    .linux, .freebsd, .openbsd, .dragonfly, .netbsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
         name: ?[*:0]const u8,
         passwd: ?[*:0]const u8,
         gid: gid_t,
@@ -273,7 +294,7 @@ pub const CLOCK = clockid_t;
 pub const clockid_t = switch (native_os) {
     .linux, .emscripten => linux.clockid_t,
     .wasi => wasi.clockid_t,
-    .macos, .ios, .tvos, .watchos, .visionos => enum(u32) {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => enum(u32) {
         REALTIME = 0,
         MONOTONIC = 6,
         MONOTONIC_RAW = 4,
@@ -310,7 +331,7 @@ pub const clockid_t = switch (native_os) {
         THREAD_CPUTIME_ID = 14,
         PROCESS_CPUTIME_ID = 15,
     },
-    .solaris, .illumos => enum(u32) {
+    .illumos => enum(u32) {
         VIRTUAL = 1,
         THREAD_CPUTIME_ID = 2,
         REALTIME = 3,
@@ -455,9 +476,9 @@ pub const E = switch (native_os) {
         DQUOT = 10069,
         _,
     },
-    .macos, .ios, .tvos, .watchos, .visionos => darwin.E,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => darwin.E,
     .freebsd => freebsd.E,
-    .solaris, .illumos => enum(u16) {
+    .illumos => enum(u16) {
         /// No error occurred.
         SUCCESS = 0,
         /// Not super-user
@@ -831,7 +852,7 @@ pub const F = switch (native_os) {
         pub const GETFL = 3;
         pub const SETFL = 4;
     },
-    .macos, .ios, .tvos, .watchos, .visionos => struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
         /// duplicate file descriptor
         pub const DUPFD = 0;
         /// get file descriptor flags
@@ -1002,7 +1023,7 @@ pub const F = switch (native_os) {
 
         pub const GETOWNER_UIDS = 17;
     },
-    .solaris, .illumos => struct {
+    .illumos => struct {
         /// Unlock a previously locked region
         pub const ULOCK = 0;
         /// Lock a region for exclusive use
@@ -1241,7 +1262,7 @@ pub const R_OK = switch (native_os) {
 pub const Flock = switch (native_os) {
     .linux => linux.Flock,
     .emscripten => emscripten.Flock,
-    .openbsd, .dragonfly, .netbsd, .macos, .ios, .tvos, .watchos, .visionos => extern struct {
+    .openbsd, .dragonfly, .netbsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
         start: off_t,
         len: off_t,
         pid: pid_t,
@@ -1263,7 +1284,7 @@ pub const Flock = switch (native_os) {
         /// Remote system id or zero for local.
         sysid: i32,
     },
-    .solaris, .illumos => extern struct {
+    .illumos => extern struct {
         type: c_short,
         whence: c_short,
         start: off_t,
@@ -1292,8 +1313,8 @@ pub const Flock = switch (native_os) {
 };
 pub const HOST_NAME_MAX = switch (native_os) {
     .linux => linux.HOST_NAME_MAX,
-    .macos, .ios, .tvos, .watchos, .visionos => 72,
-    .openbsd, .haiku, .dragonfly, .netbsd, .solaris, .illumos, .freebsd => 255,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => 72,
+    .openbsd, .haiku, .dragonfly, .netbsd, .illumos, .freebsd => 255,
     // https://github.com/SerenityOS/serenity/blob/c87557e9c1865fa1a6440de34ff6ce6fc858a2b7/Kernel/API/POSIX/sys/limits.h#L22
     .serenity => 64,
     else => {},
@@ -1302,15 +1323,23 @@ pub const IOV_MAX = switch (native_os) {
     .linux => linux.IOV_MAX,
     .emscripten => emscripten.IOV_MAX,
     // https://github.com/SerenityOS/serenity/blob/098af0f846a87b651731780ff48420205fd33754/Kernel/API/POSIX/sys/uio.h#L16
-    .openbsd, .haiku, .solaris, .illumos, .wasi, .serenity => 1024,
-    .macos, .ios, .tvos, .watchos, .visionos => 16,
+    .openbsd, .haiku, .illumos, .wasi, .serenity => 1024,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => 16,
     .dragonfly, .netbsd, .freebsd => KERN.IOV_MAX,
     else => {},
 };
 pub const CTL = switch (native_os) {
     .freebsd => struct {
+        pub const SYSCTL = 0;
         pub const KERN = 1;
+        pub const VM = 2;
+        pub const VFS = 3;
+        pub const NET = 4;
         pub const DEBUG = 5;
+        pub const HW = 6;
+        pub const MACHDEP = 7;
+        pub const USER = 8;
+        pub const P1003_1B = 9;
     },
     .netbsd => struct {
         pub const KERN = 1;
@@ -1342,6 +1371,84 @@ pub const CTL = switch (native_os) {
 
         pub const DDB = 9;
         pub const VFS = 10;
+    },
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
+        pub const UNSPEC = 0;
+        pub const KERN = 1;
+        pub const VM = 2;
+        pub const VFS = 3;
+        pub const NET = 4;
+        pub const DEBUG = 5;
+        pub const HW = 6;
+        pub const MACHDEP = 7;
+        pub const USER = 8;
+        pub const MAXID = 9;
+    },
+    else => void,
+};
+pub const CPU = switch (native_os) {
+    .openbsd => switch (native_arch) {
+        .aarch64, .aarch64_be => struct {
+            pub const COMPATIBLE = 1;
+            pub const ID_AA64ISAR0 = 2;
+            pub const ID_AA64ISAR1 = 3;
+            pub const ID_AA64ISAR2 = 4;
+            pub const ID_AA64MMFR0 = 5;
+            pub const ID_AA64MMFR1 = 6;
+            pub const ID_AA64MMFR2 = 7;
+            pub const AA64PFR0 = 8;
+            pub const AA64PFR1 = 9;
+            pub const AA64SMFR0 = 10;
+            pub const AA64ZFR0 = 11;
+            pub const LIDACTION = 12;
+            pub const LED_BLINK = 13;
+        },
+        else => void,
+    },
+    else => void,
+};
+pub const HW = switch (native_os) {
+    .freebsd => struct {
+        pub const MACHINE = 1;
+        pub const MODEL = 2;
+        pub const NCPU = 3;
+        pub const BYTEORDER = 4;
+        pub const PHYSMEM = 5;
+        pub const USERMEM = 6;
+        pub const PAGESIZE = 7;
+        pub const DISKNAMES = 8;
+        pub const DISKSTATS = 9;
+        pub const FLOATINGPT = 10;
+        pub const MACHINE_ARCH = 11;
+        pub const REALMEM = 12;
+    },
+    .openbsd => struct {
+        pub const MACHINE = 1;
+        pub const MODEL = 2;
+        pub const NCPU = 3;
+        pub const BYTEORDER = 4;
+        pub const PHYSMEM = 5;
+        pub const USERMEM = 6;
+        pub const PAGESIZE = 7;
+        pub const DISKNAMES = 8;
+        pub const DISKSTATS = 9;
+        pub const DISKCOUNT = 10;
+        pub const SENSORS = 11;
+        pub const CPUSPEED = 12;
+        pub const SETPERF = 13;
+        pub const VENDOR = 14;
+        pub const PRODUCT = 15;
+        pub const VERSION = 16;
+        pub const SERIALNO = 17;
+        pub const UUID = 18;
+        pub const PHYSMEM64 = 19;
+        pub const USERMEM64 = 20;
+        pub const NCPUFOUND = 21;
+        pub const ALLOWPOWERDOWN = 22;
+        pub const PERFPOLICY = 23;
+        pub const SMT = 24;
+        pub const NCPUONLINE = 25;
+        pub const POWER = 26;
     },
     else => void,
 };
@@ -1517,12 +1624,85 @@ pub const KERN = switch (native_os) {
         pub const PROC_ENV = 3;
         pub const PROC_NENV = 4;
     },
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
+        pub const OSTYPE = 1;
+        pub const OSRELEASE = 2;
+        pub const OSREV = 3;
+        pub const VERSION = 4;
+        pub const MAXVNODES = 5;
+        pub const MAXPROC = 6;
+        pub const MAXFILES = 7;
+        pub const ARGMAX = 8;
+        pub const SECURELVL = 9;
+        pub const HOSTNAME = 10;
+        pub const HOSTID = 11;
+        pub const CLOCKRATE = 12;
+        pub const VNODE = 13;
+        pub const PROC = 14;
+        pub const FILE = 15;
+        pub const PROF = 16;
+        pub const POSIX1 = 17;
+        pub const NGROUPS = 18;
+        pub const JOB_CONTROL = 19;
+        pub const SAVED_IDS = 20;
+        pub const BOOTTIME = 21;
+        pub const NISDOMAINNAME = 22;
+        pub const DOMAINNAME = 22;
+        pub const MAXPARTITIONS = 23;
+        pub const KDEBUG = 24;
+        pub const UPDATEINTERVAL = 25;
+        pub const OSRELDATE = 26;
+        pub const NTP_PLL = 27;
+        pub const BOOTFILE = 28;
+        pub const MAXFILESPERPROC = 29;
+        pub const MAXPROCPERUID = 30;
+        pub const DUMPDEV = 31;
+        pub const IPC = 32;
+        pub const DUMMY = 33;
+        pub const PS_STRINGS = 34;
+        pub const USRSTACK32 = 35;
+        pub const LOGSIGEXIT = 36;
+        pub const SYMFILE = 37;
+        pub const PROCARGS = 38;
+        pub const NETBOOT = 40;
+        pub const SYSV = 42;
+        pub const AFFINITY = 43;
+        pub const TRANSLATE = 44;
+        pub const CLASSIC = 44;
+        pub const EXEC = 45;
+        pub const CLASSICHANDLER = 45;
+        pub const AIOMAX = 46;
+        pub const AIOPROCMAX = 47;
+        pub const AIOTHREADS = 48;
+        pub const PROCARGS2 = 49;
+        pub const COREFILE = 50;
+        pub const COREDUMP = 51;
+        pub const SUGID_COREDUMP = 52;
+        pub const PROCDELAYTERM = 53;
+        pub const SHREG_PRIVATIZABLE = 54;
+        pub const LOW_PRI_WINDOW = 56;
+        pub const LOW_PRI_DELAY = 57;
+        pub const POSIX = 58;
+        pub const USRSTACK64 = 59;
+        pub const NX_PROTECTION = 60;
+        pub const TFP = 61;
+        pub const PROCNAME = 62;
+        pub const THALTSTACK = 63;
+        pub const SPECULATIVE_READS = 64;
+        pub const OSVERSION = 65;
+        pub const SAFEBOOT = 66;
+        pub const RAGEVNODE = 68;
+        pub const TTY = 69;
+        pub const CHECKOPENEVT = 70;
+        pub const THREADNAME = 71;
+        pub const MAXID = 72;
+    },
     else => void,
 };
 pub const MADV = switch (native_os) {
     .linux => linux.MADV,
     .emscripten => emscripten.MADV,
-    .macos, .ios, .tvos, .watchos, .visionos => struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
         pub const NORMAL = 0;
         pub const RANDOM = 1;
         pub const SEQUENTIAL = 2;
@@ -1549,7 +1729,7 @@ pub const MADV = switch (native_os) {
         pub const CORE = 9;
         pub const PROTECT = 10;
     },
-    .solaris, .illumos => struct {
+    .illumos => struct {
         /// no further special treatment
         pub const NORMAL = 0;
         /// expect random page references
@@ -1597,12 +1777,39 @@ pub const MADV = switch (native_os) {
         pub const SEQUENTIAL = 0x5;
         pub const RANDOM = 0x6;
     },
+    .netbsd, .openbsd => struct {
+        pub const NORMAL = 0;
+        pub const RANDOM = 1;
+        pub const SEQUENTIAL = 2;
+        pub const WILLNEED = 3;
+        pub const DONTNEED = 4;
+        pub const SPACEAVAIL = 5;
+        pub const FREE = 6;
+    },
+    else => void,
+};
+pub const MCL = switch (native_os) {
+    .linux => linux.MCL,
+    // https://github.com/freebsd/freebsd-src/blob/39fea5c8dc598021e900c4feaf0e18111fda57b2/sys/sys/mman.h#L133
+    // https://github.com/DragonFlyBSD/DragonFlyBSD/blob/088552723935447397400336f5ddb7aa5f5de660/sys/sys/mman.h#L118
+    // https://github.com/NetBSD/src/blob/fd2741deca927c18e3ba15acdf78b8b14b2abe36/sys/sys/mman.h#L179
+    // https://github.com/openbsd/src/blob/39404228f6d36c0ca4be5f04ab5385568ebd6aa3/sys/sys/mman.h#L129
+    // https://github.com/illumos/illumos-gate/blob/5280477614f83fea20fc938729df6adb3e44340d/usr/src/uts/common/sys/mman.h#L343
+    .freebsd, .dragonfly, .netbsd, .openbsd, .illumos => packed struct(u32) {
+        CURRENT: bool = false,
+        FUTURE: bool = false,
+        _: u30 = 0,
+    },
+    else => void,
+};
+pub const MLOCK = switch (native_os) {
+    .linux => linux.MLOCK,
     else => void,
 };
 pub const MSF = switch (native_os) {
     .linux => linux.MSF,
     .emscripten => emscripten.MSF,
-    .macos, .ios, .tvos, .watchos, .visionos => struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
         pub const ASYNC = 0x1;
         pub const INVALIDATE = 0x2;
         /// invalidate, leave mapped
@@ -1611,7 +1818,17 @@ pub const MSF = switch (native_os) {
         pub const DEACTIVATE = 0x8;
         pub const SYNC = 0x10;
     },
-    .openbsd, .haiku, .dragonfly, .netbsd, .solaris, .illumos, .freebsd => struct {
+    .freebsd, .dragonfly => struct {
+        pub const SYNC = 0;
+        pub const ASYNC = 1;
+        pub const INVALIDATE = 2;
+    },
+    .openbsd, .haiku => struct {
+        pub const ASYNC = 1;
+        pub const SYNC = 2;
+        pub const INVALIDATE = 4;
+    },
+    .netbsd, .illumos => struct {
         pub const ASYNC = 1;
         pub const INVALIDATE = 2;
         pub const SYNC = 4;
@@ -1631,7 +1848,7 @@ pub const NAME_MAX = switch (native_os) {
     // character, but POSIX definition says that NAME_MAX does not include the
     // terminating null.
     // https://github.com/SerenityOS/serenity/blob/c87557e9c1865fa1a6440de34ff6ce6fc858a2b7/Kernel/API/POSIX/sys/limits.h#L20
-    .haiku, .openbsd, .dragonfly, .netbsd, .solaris, .illumos, .freebsd, .macos, .ios, .tvos, .watchos, .visionos, .serenity => 255,
+    .haiku, .openbsd, .dragonfly, .netbsd, .illumos, .freebsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .serenity => 255,
     else => {},
 };
 pub const PATH_MAX = switch (native_os) {
@@ -1639,7 +1856,7 @@ pub const PATH_MAX = switch (native_os) {
     .emscripten => emscripten.PATH_MAX,
     .wasi => 4096,
     .windows => 260,
-    .openbsd, .haiku, .dragonfly, .netbsd, .solaris, .illumos, .freebsd, .macos, .ios, .tvos, .watchos, .visionos, .serenity => 1024,
+    .openbsd, .haiku, .dragonfly, .netbsd, .illumos, .freebsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .serenity => 1024,
     else => {},
 };
 
@@ -1656,7 +1873,7 @@ pub const POLL = switch (native_os) {
         pub const NVAL = 0x4000;
     },
     .windows => ws2_32.POLL,
-    .macos, .ios, .tvos, .watchos, .visionos => struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
         pub const IN = 0x001;
         pub const PRI = 0x002;
         pub const OUT = 0x004;
@@ -1702,7 +1919,7 @@ pub const POLL = switch (native_os) {
 
         pub const STANDARD = IN | PRI | OUT | RDNORM | RDBAND | WRBAND | ERR | HUP | NVAL;
     },
-    .solaris, .illumos => struct {
+    .illumos => struct {
         pub const IN = 0x0001;
         pub const PRI = 0x0002;
         pub const OUT = 0x0004;
@@ -1793,151 +2010,28 @@ pub const PROT = switch (native_os) {
     .linux => linux.PROT,
     .emscripten => emscripten.PROT,
     // https://github.com/SerenityOS/serenity/blob/6d59d4d3d9e76e39112842ec487840828f1c9bfe/Kernel/API/POSIX/sys/mman.h#L28-L31
-    .openbsd, .haiku, .dragonfly, .netbsd, .solaris, .illumos, .freebsd, .windows, .serenity => struct {
-        /// page can not be accessed
-        pub const NONE = 0x0;
-        /// page can be read
-        pub const READ = 0x1;
-        /// page can be written
-        pub const WRITE = 0x2;
-        /// page can be executed
-        pub const EXEC = 0x4;
+    .openbsd, .haiku, .dragonfly, .netbsd, .illumos, .freebsd, .windows, .serenity => packed struct(u32) {
+        READ: bool = false,
+        WRITE: bool = false,
+        EXEC: bool = false,
+        _: u29 = 0,
     },
-    .macos, .ios, .tvos, .watchos, .visionos => struct {
-        /// [MC2] no permissions
-        pub const NONE: vm_prot_t = 0x00;
-        /// [MC2] pages can be read
-        pub const READ: vm_prot_t = 0x01;
-        /// [MC2] pages can be written
-        pub const WRITE: vm_prot_t = 0x02;
-        /// [MC2] pages can be executed
-        pub const EXEC: vm_prot_t = 0x04;
-        /// When a caller finds that they cannot obtain write permission on a
-        /// mapped entry, the following flag can be used. The entry will be
-        /// made "needs copy" effectively copying the object (using COW),
-        /// and write permission will be added to the maximum protections for
-        /// the associated entry.
-        pub const COPY: vm_prot_t = 0x10;
-    },
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => vm_prot_t,
     else => void,
 };
 
-pub const REG = switch (native_os) {
-    .linux => linux.REG,
-    .emscripten => emscripten.REG,
-    .freebsd => switch (builtin.cpu.arch) {
-        .aarch64 => struct {
-            pub const FP = 29;
-            pub const SP = 31;
-            pub const PC = 32;
-        },
-        .arm => struct {
-            pub const FP = 11;
-            pub const SP = 13;
-            pub const PC = 15;
-        },
-        .x86_64 => struct {
-            pub const RBP = 12;
-            pub const RIP = 21;
-            pub const RSP = 24;
-        },
-        else => struct {},
-    },
-    .solaris, .illumos => struct {
-        pub const R15 = 0;
-        pub const R14 = 1;
-        pub const R13 = 2;
-        pub const R12 = 3;
-        pub const R11 = 4;
-        pub const R10 = 5;
-        pub const R9 = 6;
-        pub const R8 = 7;
-        pub const RDI = 8;
-        pub const RSI = 9;
-        pub const RBP = 10;
-        pub const RBX = 11;
-        pub const RDX = 12;
-        pub const RCX = 13;
-        pub const RAX = 14;
-        pub const RIP = 17;
-        pub const RSP = 20;
-    },
-    .netbsd => switch (builtin.cpu.arch) {
-        .aarch64, .aarch64_be => struct {
-            pub const FP = 29;
-            pub const SP = 31;
-            pub const PC = 32;
-        },
-        .arm, .armeb => struct {
-            pub const FP = 11;
-            pub const SP = 13;
-            pub const PC = 15;
-        },
-        .x86 => struct {
-            pub const GS = 0;
-            pub const FS = 1;
-            pub const ES = 2;
-            pub const DS = 3;
-            pub const EDI = 4;
-            pub const ESI = 5;
-            pub const EBP = 6;
-            pub const ESP = 7;
-            pub const EBX = 8;
-            pub const EDX = 9;
-            pub const ECX = 10;
-            pub const EAX = 11;
-            pub const TRAPNO = 12;
-            pub const ERR = 13;
-            pub const EIP = 14;
-            pub const CS = 15;
-            pub const EFL = 16;
-            pub const UESP = 17;
-            pub const SS = 18;
-        },
-        .x86_64 => struct {
-            pub const RDI = 0;
-            pub const RSI = 1;
-            pub const RDX = 2;
-            pub const RCX = 3;
-            pub const R8 = 4;
-            pub const R9 = 5;
-            pub const R10 = 6;
-            pub const R11 = 7;
-            pub const R12 = 8;
-            pub const R13 = 9;
-            pub const R14 = 10;
-            pub const R15 = 11;
-            pub const RBP = 12;
-            pub const RBX = 13;
-            pub const RAX = 14;
-            pub const GS = 15;
-            pub const FS = 16;
-            pub const ES = 17;
-            pub const DS = 18;
-            pub const TRAPNO = 19;
-            pub const ERR = 20;
-            pub const RIP = 21;
-            pub const CS = 22;
-            pub const RFLAGS = 23;
-            pub const RSP = 24;
-            pub const SS = 25;
-        },
-        else => struct {},
-    },
-    else => struct {},
-};
 pub const RLIM = switch (native_os) {
     .linux => linux.RLIM,
     .emscripten => emscripten.RLIM,
     // https://github.com/SerenityOS/serenity/blob/aae106e37b48f2158e68902293df1e4bf7b80c0f/Userland/Libraries/LibC/sys/resource.h#L52
-    .openbsd, .haiku, .dragonfly, .netbsd, .freebsd, .macos, .ios, .tvos, .watchos, .visionos, .serenity => struct {
+    .openbsd, .haiku, .dragonfly, .netbsd, .freebsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .serenity => struct {
         /// No limit
         pub const INFINITY: rlim_t = (1 << 63) - 1;
 
         pub const SAVED_MAX = INFINITY;
         pub const SAVED_CUR = INFINITY;
     },
-    .solaris, .illumos => struct {
+    .illumos => struct {
         /// No limit
         pub const INFINITY: rlim_t = (1 << 63) - 3;
         pub const SAVED_MAX: rlim_t = (1 << 63) - 2;
@@ -1987,7 +2081,7 @@ pub const S = switch (native_os) {
             return m & IFMT == IFSOCK;
         }
     },
-    .macos, .ios, .tvos, .watchos, .visionos => struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
         pub const IFMT = 0o170000;
 
         pub const IFIFO = 0o010000;
@@ -2107,7 +2201,7 @@ pub const S = switch (native_os) {
             return m & IFMT == IFWHT;
         }
     },
-    .solaris, .illumos => struct {
+    .illumos => struct {
         pub const IFMT = 0o170000;
 
         pub const IFIFO = 0o010000;
@@ -2387,6 +2481,8 @@ pub const S = switch (native_os) {
         pub const IWOTH = 0o002;
         pub const IXOTH = 0o001;
 
+        pub const BLKSIZE = 512;
+
         pub fn ISFIFO(m: u32) bool {
             return m & IFMT == IFIFO;
         }
@@ -2480,7 +2576,7 @@ pub const S = switch (native_os) {
 pub const SA = switch (native_os) {
     .linux => linux.SA,
     .emscripten => emscripten.SA,
-    .macos, .ios, .tvos, .watchos, .visionos => struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
         /// take signal on signal stack
         pub const ONSTACK = 0x0001;
         /// restart system on signal return
@@ -2509,7 +2605,7 @@ pub const SA = switch (native_os) {
         pub const NOCLDWAIT = 0x0020;
         pub const SIGINFO = 0x0040;
     },
-    .solaris, .illumos => struct {
+    .illumos => struct {
         pub const ONSTACK = 0x00000001;
         pub const RESETHAND = 0x00000002;
         pub const RESTART = 0x00000004;
@@ -2570,7 +2666,7 @@ pub const SA = switch (native_os) {
     else => void,
 };
 pub const sigval_t = switch (native_os) {
-    .netbsd, .solaris, .illumos => extern union {
+    .netbsd, .illumos => extern union {
         int: i32,
         ptr: ?*anyopaque,
     },
@@ -2586,7 +2682,7 @@ pub const _SC = if (builtin.abi.isAndroid()) enum(c_int) {
     PAGESIZE = 39,
     NPROCESSORS_ONLN = 97,
 } else switch (native_os) {
-    .driverkit, .ios, .macos, .tvos, .visionos, .watchos => enum(c_int) {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => enum(c_int) {
         PAGESIZE = 29,
     },
     .dragonfly => enum(c_int) {
@@ -2610,9 +2706,11 @@ pub const _SC = if (builtin.abi.isAndroid()) enum(c_int) {
     .openbsd => enum(c_int) {
         PAGESIZE = 28,
     },
-    .solaris, .illumos => enum(c_int) {
+    .illumos => enum(c_int) {
         PAGESIZE = 11,
         NPROCESSORS_ONLN = 15,
+        SIGRT_MIN = 40,
+        SIGRT_MAX = 41,
     },
     // https://github.com/SerenityOS/serenity/blob/1dfc9e2df39dd23f1de92530677c845aae4345f2/Kernel/API/POSIX/unistd.h#L36-L52
     .serenity => enum(c_int) {
@@ -2644,12 +2742,12 @@ pub const SEEK = switch (native_os) {
         pub const END: wasi.whence_t = .END;
     },
     // https://github.com/SerenityOS/serenity/blob/808ce594db1f2190e5212a250e900bde2ffe710b/Kernel/API/POSIX/stdio.h#L15-L17
-    .openbsd, .haiku, .netbsd, .freebsd, .macos, .ios, .tvos, .watchos, .visionos, .windows, .serenity => struct {
+    .openbsd, .haiku, .netbsd, .freebsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .windows, .serenity => struct {
         pub const SET = 0;
         pub const CUR = 1;
         pub const END = 2;
     },
-    .dragonfly, .solaris, .illumos => struct {
+    .dragonfly, .illumos => struct {
         pub const SET = 0;
         pub const CUR = 1;
         pub const END = 2;
@@ -2673,23 +2771,24 @@ pub const SHUT = switch (native_os) {
 pub const SIG = switch (native_os) {
     .linux => linux.SIG,
     .emscripten => emscripten.SIG,
-    .windows => struct {
+    .windows => enum(u32) {
         /// interrupt
-        pub const INT = 2;
+        INT = 2,
         /// illegal instruction - invalid function image
-        pub const ILL = 4;
+        ILL = 4,
         /// floating point exception
-        pub const FPE = 8;
+        FPE = 8,
         /// segment violation
-        pub const SEGV = 11;
+        SEGV = 11,
         /// Software termination signal from kill
-        pub const TERM = 15;
+        TERM = 15,
         /// Ctrl-Break sequence
-        pub const BREAK = 21;
+        BREAK = 21,
         /// abnormal termination triggered by abort call
-        pub const ABRT = 22;
+        ABRT = 22,
         /// SIGABRT compatible with other platforms, same as SIGABRT
-        pub const ABRT_COMPAT = 6;
+        ABRT_COMPAT = 6,
+        _,
 
         // Signal action codes
         /// default signal action
@@ -2705,7 +2804,7 @@ pub const SIG = switch (native_os) {
         /// Signal error value (returned by signal call on error)
         pub const ERR = -1;
     },
-    .macos, .ios, .tvos, .watchos, .visionos => struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => enum(u32) {
         pub const ERR: ?Sigaction.handler_fn = @ptrFromInt(maxInt(usize));
         pub const DFL: ?Sigaction.handler_fn = @ptrFromInt(0);
         pub const IGN: ?Sigaction.handler_fn = @ptrFromInt(1);
@@ -2717,113 +2816,75 @@ pub const SIG = switch (native_os) {
         pub const UNBLOCK = 2;
         /// set specified signal set
         pub const SETMASK = 3;
+
+        pub const IOT: SIG = .ABRT;
+        pub const POLL: SIG = .EMT;
+
         /// hangup
-        pub const HUP = 1;
+        HUP = 1,
         /// interrupt
-        pub const INT = 2;
+        INT = 2,
         /// quit
-        pub const QUIT = 3;
+        QUIT = 3,
         /// illegal instruction (not reset when caught)
-        pub const ILL = 4;
+        ILL = 4,
         /// trace trap (not reset when caught)
-        pub const TRAP = 5;
+        TRAP = 5,
         /// abort()
-        pub const ABRT = 6;
-        /// pollable event ([XSR] generated, not supported)
-        pub const POLL = 7;
-        /// compatibility
-        pub const IOT = ABRT;
+        ABRT = 6,
         /// EMT instruction
-        pub const EMT = 7;
+        EMT = 7,
         /// floating point exception
-        pub const FPE = 8;
+        FPE = 8,
         /// kill (cannot be caught or ignored)
-        pub const KILL = 9;
+        KILL = 9,
         /// bus error
-        pub const BUS = 10;
+        BUS = 10,
         /// segmentation violation
-        pub const SEGV = 11;
+        SEGV = 11,
         /// bad argument to system call
-        pub const SYS = 12;
+        SYS = 12,
         /// write on a pipe with no one to read it
-        pub const PIPE = 13;
+        PIPE = 13,
         /// alarm clock
-        pub const ALRM = 14;
+        ALRM = 14,
         /// software termination signal from kill
-        pub const TERM = 15;
+        TERM = 15,
         /// urgent condition on IO channel
-        pub const URG = 16;
+        URG = 16,
         /// sendable stop signal not from tty
-        pub const STOP = 17;
+        STOP = 17,
         /// stop signal from tty
-        pub const TSTP = 18;
+        TSTP = 18,
         /// continue a stopped process
-        pub const CONT = 19;
+        CONT = 19,
         /// to parent on child stop or exit
-        pub const CHLD = 20;
+        CHLD = 20,
         /// to readers pgrp upon background tty read
-        pub const TTIN = 21;
+        TTIN = 21,
         /// like TTIN for output if (tp->t_local&LTOSTOP)
-        pub const TTOU = 22;
+        TTOU = 22,
         /// input/output possible signal
-        pub const IO = 23;
+        IO = 23,
         /// exceeded CPU time limit
-        pub const XCPU = 24;
+        XCPU = 24,
         /// exceeded file size limit
-        pub const XFSZ = 25;
+        XFSZ = 25,
         /// virtual time alarm
-        pub const VTALRM = 26;
+        VTALRM = 26,
         /// profiling time alarm
-        pub const PROF = 27;
+        PROF = 27,
         /// window size changes
-        pub const WINCH = 28;
+        WINCH = 28,
         /// information request
-        pub const INFO = 29;
+        INFO = 29,
         /// user defined signal 1
-        pub const USR1 = 30;
+        USR1 = 30,
         /// user defined signal 2
-        pub const USR2 = 31;
+        USR2 = 31,
+        _,
     },
-    .freebsd => struct {
-        pub const HUP = 1;
-        pub const INT = 2;
-        pub const QUIT = 3;
-        pub const ILL = 4;
-        pub const TRAP = 5;
-        pub const ABRT = 6;
-        pub const IOT = ABRT;
-        pub const EMT = 7;
-        pub const FPE = 8;
-        pub const KILL = 9;
-        pub const BUS = 10;
-        pub const SEGV = 11;
-        pub const SYS = 12;
-        pub const PIPE = 13;
-        pub const ALRM = 14;
-        pub const TERM = 15;
-        pub const URG = 16;
-        pub const STOP = 17;
-        pub const TSTP = 18;
-        pub const CONT = 19;
-        pub const CHLD = 20;
-        pub const TTIN = 21;
-        pub const TTOU = 22;
-        pub const IO = 23;
-        pub const XCPU = 24;
-        pub const XFSZ = 25;
-        pub const VTALRM = 26;
-        pub const PROF = 27;
-        pub const WINCH = 28;
-        pub const INFO = 29;
-        pub const USR1 = 30;
-        pub const USR2 = 31;
-        pub const THR = 32;
-        pub const LWP = THR;
-        pub const LIBRT = 33;
-
-        pub const RTMIN = 65;
-        pub const RTMAX = 126;
-
+    .freebsd => enum(u32) {
         pub const BLOCK = 1;
         pub const UNBLOCK = 2;
         pub const SETMASK = 3;
@@ -2847,8 +2908,49 @@ pub const SIG = switch (native_os) {
         pub inline fn VALID(sig: usize) usize {
             return sig <= MAXSIG and sig > 0;
         }
+
+        pub const IOT: SIG = .ABRT;
+        pub const LWP: SIG = .THR;
+
+        pub const RTMIN = 65;
+        pub const RTMAX = 126;
+
+        HUP = 1,
+        INT = 2,
+        QUIT = 3,
+        ILL = 4,
+        TRAP = 5,
+        ABRT = 6,
+        EMT = 7,
+        FPE = 8,
+        KILL = 9,
+        BUS = 10,
+        SEGV = 11,
+        SYS = 12,
+        PIPE = 13,
+        ALRM = 14,
+        TERM = 15,
+        URG = 16,
+        STOP = 17,
+        TSTP = 18,
+        CONT = 19,
+        CHLD = 20,
+        TTIN = 21,
+        TTOU = 22,
+        IO = 23,
+        XCPU = 24,
+        XFSZ = 25,
+        VTALRM = 26,
+        PROF = 27,
+        WINCH = 28,
+        INFO = 29,
+        USR1 = 30,
+        USR2 = 31,
+        THR = 32,
+        LIBRT = 33,
+        _,
     },
-    .solaris, .illumos => struct {
+    .illumos => enum(u32) {
         pub const DFL: ?Sigaction.handler_fn = @ptrFromInt(0);
         pub const ERR: ?Sigaction.handler_fn = @ptrFromInt(maxInt(usize));
         pub const IGN: ?Sigaction.handler_fn = @ptrFromInt(1);
@@ -2857,54 +2959,9 @@ pub const SIG = switch (native_os) {
         pub const WORDS = 4;
         pub const MAXSIG = 75;
 
-        pub const SIG_BLOCK = 1;
-        pub const SIG_UNBLOCK = 2;
-        pub const SIG_SETMASK = 3;
-
-        pub const HUP = 1;
-        pub const INT = 2;
-        pub const QUIT = 3;
-        pub const ILL = 4;
-        pub const TRAP = 5;
-        pub const IOT = 6;
-        pub const ABRT = 6;
-        pub const EMT = 7;
-        pub const FPE = 8;
-        pub const KILL = 9;
-        pub const BUS = 10;
-        pub const SEGV = 11;
-        pub const SYS = 12;
-        pub const PIPE = 13;
-        pub const ALRM = 14;
-        pub const TERM = 15;
-        pub const USR1 = 16;
-        pub const USR2 = 17;
-        pub const CLD = 18;
-        pub const CHLD = 18;
-        pub const PWR = 19;
-        pub const WINCH = 20;
-        pub const URG = 21;
-        pub const POLL = 22;
-        pub const IO = .POLL;
-        pub const STOP = 23;
-        pub const TSTP = 24;
-        pub const CONT = 25;
-        pub const TTIN = 26;
-        pub const TTOU = 27;
-        pub const VTALRM = 28;
-        pub const PROF = 29;
-        pub const XCPU = 30;
-        pub const XFSZ = 31;
-        pub const WAITING = 32;
-        pub const LWP = 33;
-        pub const FREEZE = 34;
-        pub const THAW = 35;
-        pub const CANCEL = 36;
-        pub const LOST = 37;
-        pub const XRES = 38;
-        pub const JVM1 = 39;
-        pub const JVM2 = 40;
-        pub const INFO = 41;
+        pub const BLOCK = 1;
+        pub const UNBLOCK = 2;
+        pub const SETMASK = 3;
 
         pub const RTMIN = 42;
         pub const RTMAX = 74;
@@ -2921,8 +2978,55 @@ pub const SIG = switch (native_os) {
         pub inline fn VALID(sig: usize) usize {
             return sig <= MAXSIG and sig > 0;
         }
+
+        pub const POLL: SIG = .IO;
+        pub const IOT: SIG = .ABRT;
+        pub const CLD: SIG = .CHLD;
+
+        HUP = 1,
+        INT = 2,
+        QUIT = 3,
+        ILL = 4,
+        TRAP = 5,
+        ABRT = 6,
+        EMT = 7,
+        FPE = 8,
+        KILL = 9,
+        BUS = 10,
+        SEGV = 11,
+        SYS = 12,
+        PIPE = 13,
+        ALRM = 14,
+        TERM = 15,
+        USR1 = 16,
+        USR2 = 17,
+        CHLD = 18,
+        PWR = 19,
+        WINCH = 20,
+        URG = 21,
+        IO = 22,
+        STOP = 23,
+        TSTP = 24,
+        CONT = 25,
+        TTIN = 26,
+        TTOU = 27,
+        VTALRM = 28,
+        PROF = 29,
+        XCPU = 30,
+        XFSZ = 31,
+        WAITING = 32,
+        LWP = 33,
+        FREEZE = 34,
+        THAW = 35,
+        CANCEL = 36,
+        LOST = 37,
+        XRES = 38,
+        JVM1 = 39,
+        JVM2 = 40,
+        INFO = 41,
+        _,
     },
-    .netbsd => struct {
+    .netbsd => enum(u32) {
         pub const DFL: ?Sigaction.handler_fn = @ptrFromInt(0);
         pub const IGN: ?Sigaction.handler_fn = @ptrFromInt(1);
         pub const ERR: ?Sigaction.handler_fn = @ptrFromInt(maxInt(usize));
@@ -2933,40 +3037,6 @@ pub const SIG = switch (native_os) {
         pub const BLOCK = 1;
         pub const UNBLOCK = 2;
         pub const SETMASK = 3;
-
-        pub const HUP = 1;
-        pub const INT = 2;
-        pub const QUIT = 3;
-        pub const ILL = 4;
-        pub const TRAP = 5;
-        pub const ABRT = 6;
-        pub const IOT = ABRT;
-        pub const EMT = 7;
-        pub const FPE = 8;
-        pub const KILL = 9;
-        pub const BUS = 10;
-        pub const SEGV = 11;
-        pub const SYS = 12;
-        pub const PIPE = 13;
-        pub const ALRM = 14;
-        pub const TERM = 15;
-        pub const URG = 16;
-        pub const STOP = 17;
-        pub const TSTP = 18;
-        pub const CONT = 19;
-        pub const CHLD = 20;
-        pub const TTIN = 21;
-        pub const TTOU = 22;
-        pub const IO = 23;
-        pub const XCPU = 24;
-        pub const XFSZ = 25;
-        pub const VTALRM = 26;
-        pub const PROF = 27;
-        pub const WINCH = 28;
-        pub const INFO = 29;
-        pub const USR1 = 30;
-        pub const USR2 = 31;
-        pub const PWR = 32;
 
         pub const RTMIN = 33;
         pub const RTMAX = 63;
@@ -2983,8 +3053,44 @@ pub const SIG = switch (native_os) {
         pub inline fn VALID(sig: usize) usize {
             return sig <= MAXSIG and sig > 0;
         }
+
+        pub const IOT: SIG = .ABRT;
+
+        HUP = 1,
+        INT = 2,
+        QUIT = 3,
+        ILL = 4,
+        TRAP = 5,
+        ABRT = 6,
+        EMT = 7,
+        FPE = 8,
+        KILL = 9,
+        BUS = 10,
+        SEGV = 11,
+        SYS = 12,
+        PIPE = 13,
+        ALRM = 14,
+        TERM = 15,
+        URG = 16,
+        STOP = 17,
+        TSTP = 18,
+        CONT = 19,
+        CHLD = 20,
+        TTIN = 21,
+        TTOU = 22,
+        IO = 23,
+        XCPU = 24,
+        XFSZ = 25,
+        VTALRM = 26,
+        PROF = 27,
+        WINCH = 28,
+        INFO = 29,
+        USR1 = 30,
+        USR2 = 31,
+        PWR = 32,
+        _,
     },
-    .dragonfly => struct {
+    .dragonfly => enum(u32) {
         pub const DFL: ?Sigaction.handler_fn = @ptrFromInt(0);
         pub const IGN: ?Sigaction.handler_fn = @ptrFromInt(1);
         pub const ERR: ?Sigaction.handler_fn = @ptrFromInt(maxInt(usize));
@@ -2993,137 +3099,144 @@ pub const SIG = switch (native_os) {
         pub const UNBLOCK = 2;
         pub const SETMASK = 3;
 
-        pub const IOT = ABRT;
-        pub const HUP = 1;
-        pub const INT = 2;
-        pub const QUIT = 3;
-        pub const ILL = 4;
-        pub const TRAP = 5;
-        pub const ABRT = 6;
-        pub const EMT = 7;
-        pub const FPE = 8;
-        pub const KILL = 9;
-        pub const BUS = 10;
-        pub const SEGV = 11;
-        pub const SYS = 12;
-        pub const PIPE = 13;
-        pub const ALRM = 14;
-        pub const TERM = 15;
-        pub const URG = 16;
-        pub const STOP = 17;
-        pub const TSTP = 18;
-        pub const CONT = 19;
-        pub const CHLD = 20;
-        pub const TTIN = 21;
-        pub const TTOU = 22;
-        pub const IO = 23;
-        pub const XCPU = 24;
-        pub const XFSZ = 25;
-        pub const VTALRM = 26;
-        pub const PROF = 27;
-        pub const WINCH = 28;
-        pub const INFO = 29;
-        pub const USR1 = 30;
-        pub const USR2 = 31;
-        pub const THR = 32;
-        pub const CKPT = 33;
-        pub const CKPTEXIT = 34;
-
         pub const WORDS = 4;
+
+        pub const IOT: SIG = .ABRT;
+
+        HUP = 1,
+        INT = 2,
+        QUIT = 3,
+        ILL = 4,
+        TRAP = 5,
+        ABRT = 6,
+        EMT = 7,
+        FPE = 8,
+        KILL = 9,
+        BUS = 10,
+        SEGV = 11,
+        SYS = 12,
+        PIPE = 13,
+        ALRM = 14,
+        TERM = 15,
+        URG = 16,
+        STOP = 17,
+        TSTP = 18,
+        CONT = 19,
+        CHLD = 20,
+        TTIN = 21,
+        TTOU = 22,
+        IO = 23,
+        XCPU = 24,
+        XFSZ = 25,
+        VTALRM = 26,
+        PROF = 27,
+        WINCH = 28,
+        INFO = 29,
+        USR1 = 30,
+        USR2 = 31,
+        THR = 32,
+        CKPT = 33,
+        CKPTEXIT = 34,
+        _,
     },
-    .haiku => struct {
+    .haiku => enum(u32) {
         pub const DFL: ?Sigaction.handler_fn = @ptrFromInt(0);
         pub const IGN: ?Sigaction.handler_fn = @ptrFromInt(1);
         pub const ERR: ?Sigaction.handler_fn = @ptrFromInt(maxInt(usize));
 
         pub const HOLD: ?Sigaction.handler_fn = @ptrFromInt(3);
 
-        pub const HUP = 1;
-        pub const INT = 2;
-        pub const QUIT = 3;
-        pub const ILL = 4;
-        pub const CHLD = 5;
-        pub const ABRT = 6;
-        pub const IOT = ABRT;
-        pub const PIPE = 7;
-        pub const FPE = 8;
-        pub const KILL = 9;
-        pub const STOP = 10;
-        pub const SEGV = 11;
-        pub const CONT = 12;
-        pub const TSTP = 13;
-        pub const ALRM = 14;
-        pub const TERM = 15;
-        pub const TTIN = 16;
-        pub const TTOU = 17;
-        pub const USR1 = 18;
-        pub const USR2 = 19;
-        pub const WINCH = 20;
-        pub const KILLTHR = 21;
-        pub const TRAP = 22;
-        pub const POLL = 23;
-        pub const PROF = 24;
-        pub const SYS = 25;
-        pub const URG = 26;
-        pub const VTALRM = 27;
-        pub const XCPU = 28;
-        pub const XFSZ = 29;
-        pub const BUS = 30;
-        pub const RESERVED1 = 31;
-        pub const RESERVED2 = 32;
-
         pub const BLOCK = 1;
         pub const UNBLOCK = 2;
         pub const SETMASK = 3;
+
+        pub const IO: SIG = .POLL;
+        pub const IOT: SIG = .ABRT;
+
+        HUP = 1,
+        INT = 2,
+        QUIT = 3,
+        ILL = 4,
+        CHLD = 5,
+        ABRT = 6,
+        PIPE = 7,
+        FPE = 8,
+        KILL = 9,
+        STOP = 10,
+        SEGV = 11,
+        CONT = 12,
+        TSTP = 13,
+        ALRM = 14,
+        TERM = 15,
+        TTIN = 16,
+        TTOU = 17,
+        USR1 = 18,
+        USR2 = 19,
+        WINCH = 20,
+        KILLTHR = 21,
+        TRAP = 22,
+        POLL = 23,
+        PROF = 24,
+        SYS = 25,
+        URG = 26,
+        VTALRM = 27,
+        XCPU = 28,
+        XFSZ = 29,
+        BUS = 30,
+        RESERVED1 = 31,
+        RESERVED2 = 32,
+        _,
     },
-    .openbsd => struct {
+    .openbsd => enum(u32) {
         pub const DFL: ?Sigaction.handler_fn = @ptrFromInt(0);
         pub const IGN: ?Sigaction.handler_fn = @ptrFromInt(1);
         pub const ERR: ?Sigaction.handler_fn = @ptrFromInt(maxInt(usize));
         pub const CATCH: ?Sigaction.handler_fn = @ptrFromInt(2);
         pub const HOLD: ?Sigaction.handler_fn = @ptrFromInt(3);
 
-        pub const HUP = 1;
-        pub const INT = 2;
-        pub const QUIT = 3;
-        pub const ILL = 4;
-        pub const TRAP = 5;
-        pub const ABRT = 6;
-        pub const IOT = ABRT;
-        pub const EMT = 7;
-        pub const FPE = 8;
-        pub const KILL = 9;
-        pub const BUS = 10;
-        pub const SEGV = 11;
-        pub const SYS = 12;
-        pub const PIPE = 13;
-        pub const ALRM = 14;
-        pub const TERM = 15;
-        pub const URG = 16;
-        pub const STOP = 17;
-        pub const TSTP = 18;
-        pub const CONT = 19;
-        pub const CHLD = 20;
-        pub const TTIN = 21;
-        pub const TTOU = 22;
-        pub const IO = 23;
-        pub const XCPU = 24;
-        pub const XFSZ = 25;
-        pub const VTALRM = 26;
-        pub const PROF = 27;
-        pub const WINCH = 28;
-        pub const INFO = 29;
-        pub const USR1 = 30;
-        pub const USR2 = 31;
-        pub const PWR = 32;
-
         pub const BLOCK = 1;
         pub const UNBLOCK = 2;
         pub const SETMASK = 3;
+
+        pub const IOT: SIG = .ABRT;
+
+        HUP = 1,
+        INT = 2,
+        QUIT = 3,
+        ILL = 4,
+        TRAP = 5,
+        ABRT = 6,
+        EMT = 7,
+        FPE = 8,
+        KILL = 9,
+        BUS = 10,
+        SEGV = 11,
+        SYS = 12,
+        PIPE = 13,
+        ALRM = 14,
+        TERM = 15,
+        URG = 16,
+        STOP = 17,
+        TSTP = 18,
+        CONT = 19,
+        CHLD = 20,
+        TTIN = 21,
+        TTOU = 22,
+        IO = 23,
+        XCPU = 24,
+        XFSZ = 25,
+        VTALRM = 26,
+        PROF = 27,
+        WINCH = 28,
+        INFO = 29,
+        USR1 = 30,
+        USR2 = 31,
+        PWR = 32,
+        _,
     },
     // https://github.com/SerenityOS/serenity/blob/046c23f567a17758d762a33bdf04bacbfd088f9f/Kernel/API/POSIX/signal.h
     // https://github.com/SerenityOS/serenity/blob/046c23f567a17758d762a33bdf04bacbfd088f9f/Kernel/API/POSIX/signal_numbers.h
-    .serenity => struct {
+    .serenity => enum(u32) {
         pub const DFL: ?Sigaction.handler_fn = @ptrFromInt(0);
         pub const ERR: ?Sigaction.handler_fn = @ptrFromInt(maxInt(usize));
         pub const IGN: ?Sigaction.handler_fn = @ptrFromInt(1);
@@ -3132,39 +3245,40 @@ pub const SIG = switch (native_os) {
         pub const UNBLOCK = 2;
         pub const SETMASK = 3;
 
-        pub const INVAL = 0;
-        pub const HUP = 1;
-        pub const INT = 2;
-        pub const QUIT = 3;
-        pub const ILL = 4;
-        pub const TRAP = 5;
-        pub const ABRT = 6;
-        pub const BUS = 7;
-        pub const FPE = 8;
-        pub const KILL = 9;
-        pub const USR1 = 10;
-        pub const SEGV = 11;
-        pub const USR2 = 12;
-        pub const PIPE = 13;
-        pub const ALRM = 14;
-        pub const TERM = 15;
-        pub const STKFLT = 16;
-        pub const CHLD = 17;
-        pub const CONT = 18;
-        pub const STOP = 19;
-        pub const TSTP = 20;
-        pub const TTIN = 21;
-        pub const TTOU = 22;
-        pub const URG = 23;
-        pub const XCPU = 24;
-        pub const XFSZ = 25;
-        pub const VTALRM = 26;
-        pub const PROF = 27;
-        pub const WINCH = 28;
-        pub const IO = 29;
-        pub const INFO = 30;
-        pub const SYS = 31;
-        pub const CANCEL = 32;
+        INVAL = 0,
+        HUP = 1,
+        INT = 2,
+        QUIT = 3,
+        ILL = 4,
+        TRAP = 5,
+        ABRT = 6,
+        BUS = 7,
+        FPE = 8,
+        KILL = 9,
+        USR1 = 10,
+        SEGV = 11,
+        USR2 = 12,
+        PIPE = 13,
+        ALRM = 14,
+        TERM = 15,
+        STKFLT = 16,
+        CHLD = 17,
+        CONT = 18,
+        STOP = 19,
+        TSTP = 20,
+        TTIN = 21,
+        TTOU = 22,
+        URG = 23,
+        XCPU = 24,
+        XFSZ = 25,
+        VTALRM = 26,
+        PROF = 27,
+        WINCH = 28,
+        IO = 29,
+        INFO = 30,
+        SYS = 31,
+        CANCEL = 32,
+        _,
     },
     else => void,
 };
@@ -3172,7 +3286,7 @@ pub const SIG = switch (native_os) {
 pub const SIOCGIFINDEX = switch (native_os) {
     .linux => linux.SIOCGIFINDEX,
     .emscripten => emscripten.SIOCGIFINDEX,
-    .solaris, .illumos => solaris.SIOCGLIFINDEX,
+    .illumos => illumos.SIOCGLIFINDEX,
     // https://github.com/SerenityOS/serenity/blob/cb10f70394fb7e9cfc77f827adb2e46d199bc3a5/Kernel/API/Ioctl.h#L118
     .serenity => 34,
     else => void,
@@ -3201,8 +3315,8 @@ pub const SYS = switch (native_os) {
 
 /// A common format for the Sigaction struct across a variety of Linux flavors.
 const common_linux_Sigaction = extern struct {
-    pub const handler_fn = *align(1) const fn (i32) callconv(.c) void;
-    pub const sigaction_fn = *const fn (i32, *const siginfo_t, ?*anyopaque) callconv(.c) void;
+    pub const handler_fn = *align(1) const fn (SIG) callconv(.c) void;
+    pub const sigaction_fn = *const fn (SIG, *const siginfo_t, ?*anyopaque) callconv(.c) void;
 
     handler: extern union {
         handler: ?handler_fn,
@@ -3215,7 +3329,18 @@ const common_linux_Sigaction = extern struct {
 
 /// Renamed from `sigaction` to `Sigaction` to avoid conflict with function name.
 pub const Sigaction = switch (native_os) {
-    .linux => switch (native_arch) {
+    .linux => if (builtin.abi.isAndroid() and builtin.target.ptrBitWidth() == 64) extern struct {
+        pub const handler_fn = *align(1) const fn (SIG) callconv(.c) void;
+        pub const sigaction_fn = *const fn (SIG, *const siginfo_t, ?*anyopaque) callconv(.c) void;
+
+        flags: c_uint,
+        handler: extern union {
+            handler: ?handler_fn,
+            sigaction: ?sigaction_fn,
+        },
+        mask: sigset_t,
+        restorer: ?*const fn () callconv(.c) void = null,
+    } else switch (native_arch) {
         .mips,
         .mipsel,
         .mips64,
@@ -3223,8 +3348,8 @@ pub const Sigaction = switch (native_os) {
         => if (builtin.target.abi.isMusl())
             common_linux_Sigaction
         else if (builtin.target.ptrBitWidth() == 64) extern struct {
-            pub const handler_fn = *align(1) const fn (i32) callconv(.c) void;
-            pub const sigaction_fn = *const fn (i32, *const siginfo_t, ?*anyopaque) callconv(.c) void;
+            pub const handler_fn = *align(1) const fn (SIG) callconv(.c) void;
+            pub const sigaction_fn = *const fn (SIG, *const siginfo_t, ?*anyopaque) callconv(.c) void;
 
             flags: c_uint,
             handler: extern union {
@@ -3234,8 +3359,8 @@ pub const Sigaction = switch (native_os) {
             mask: sigset_t,
             restorer: ?*const fn () callconv(.c) void = null,
         } else extern struct {
-            pub const handler_fn = *align(1) const fn (i32) callconv(.c) void;
-            pub const sigaction_fn = *const fn (i32, *const siginfo_t, ?*anyopaque) callconv(.c) void;
+            pub const handler_fn = *align(1) const fn (SIG) callconv(.c) void;
+            pub const sigaction_fn = *const fn (SIG, *const siginfo_t, ?*anyopaque) callconv(.c) void;
 
             flags: c_uint,
             handler: extern union {
@@ -3247,8 +3372,8 @@ pub const Sigaction = switch (native_os) {
             __resv: [1]c_int = .{0},
         },
         .s390x => if (builtin.abi == .gnu) extern struct {
-            pub const handler_fn = *align(1) const fn (i32) callconv(.c) void;
-            pub const sigaction_fn = *const fn (i32, *const siginfo_t, ?*anyopaque) callconv(.c) void;
+            pub const handler_fn = *align(1) const fn (SIG) callconv(.c) void;
+            pub const sigaction_fn = *const fn (SIG, *const siginfo_t, ?*anyopaque) callconv(.c) void;
 
             handler: extern union {
                 handler: ?handler_fn,
@@ -3259,12 +3384,25 @@ pub const Sigaction = switch (native_os) {
             restorer: ?*const fn () callconv(.c) void = null,
             mask: sigset_t,
         } else common_linux_Sigaction,
+        .sparc64 => if (builtin.abi == .gnu) extern struct {
+            pub const handler_fn = *align(1) const fn (SIG) callconv(.c) void;
+            pub const sigaction_fn = *const fn (SIG, *const siginfo_t, ?*anyopaque) callconv(.c) void;
+
+            handler: extern union {
+                handler: ?handler_fn,
+                sigaction: ?sigaction_fn,
+            },
+            mask: sigset_t,
+            __glibc_reserved0: c_int = 0,
+            flags: c_uint,
+            restorer: ?*const fn () callconv(.c) void = null,
+        } else common_linux_Sigaction,
         else => common_linux_Sigaction,
     },
     .emscripten => emscripten.Sigaction,
-    .netbsd, .macos, .ios, .tvos, .watchos, .visionos => extern struct {
-        pub const handler_fn = *align(1) const fn (i32) callconv(.c) void;
-        pub const sigaction_fn = *const fn (i32, *const siginfo_t, ?*anyopaque) callconv(.c) void;
+    .netbsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
+        pub const handler_fn = *align(1) const fn (SIG) callconv(.c) void;
+        pub const sigaction_fn = *const fn (SIG, *const siginfo_t, ?*anyopaque) callconv(.c) void;
 
         handler: extern union {
             handler: ?handler_fn,
@@ -3274,8 +3412,8 @@ pub const Sigaction = switch (native_os) {
         flags: c_uint,
     },
     .dragonfly, .freebsd => extern struct {
-        pub const handler_fn = *align(1) const fn (i32) callconv(.c) void;
-        pub const sigaction_fn = *const fn (i32, *const siginfo_t, ?*anyopaque) callconv(.c) void;
+        pub const handler_fn = *align(1) const fn (SIG) callconv(.c) void;
+        pub const sigaction_fn = *const fn (SIG, *const siginfo_t, ?*anyopaque) callconv(.c) void;
 
         /// signal handler
         handler: extern union {
@@ -3287,9 +3425,9 @@ pub const Sigaction = switch (native_os) {
         /// signal mask to apply
         mask: sigset_t,
     },
-    .solaris, .illumos => extern struct {
-        pub const handler_fn = *align(1) const fn (i32) callconv(.c) void;
-        pub const sigaction_fn = *const fn (i32, *const siginfo_t, ?*anyopaque) callconv(.c) void;
+    .illumos => extern struct {
+        pub const handler_fn = *align(1) const fn (SIG) callconv(.c) void;
+        pub const sigaction_fn = *const fn (SIG, *const siginfo_t, ?*anyopaque) callconv(.c) void;
 
         /// signal options
         flags: c_uint,
@@ -3302,13 +3440,13 @@ pub const Sigaction = switch (native_os) {
         mask: sigset_t,
     },
     .haiku => extern struct {
-        pub const handler_fn = *align(1) const fn (i32) callconv(.c) void;
-        pub const sigaction_fn = *const fn (i32, *const siginfo_t, ?*anyopaque) callconv(.c) void;
+        pub const handler_fn = *align(1) const fn (SIG) callconv(.c) void;
+        pub const sigaction_fn = *const fn (SIG, *const siginfo_t, ?*anyopaque) callconv(.c) void;
 
         /// signal handler
         handler: extern union {
-            handler: handler_fn,
-            sigaction: sigaction_fn,
+            handler: ?handler_fn,
+            sigaction: ?sigaction_fn,
         },
 
         /// signal mask to apply
@@ -3321,8 +3459,8 @@ pub const Sigaction = switch (native_os) {
         userdata: *allowzero anyopaque = undefined,
     },
     .openbsd => extern struct {
-        pub const handler_fn = *align(1) const fn (i32) callconv(.c) void;
-        pub const sigaction_fn = *const fn (i32, *const siginfo_t, ?*anyopaque) callconv(.c) void;
+        pub const handler_fn = *align(1) const fn (SIG) callconv(.c) void;
+        pub const sigaction_fn = *const fn (SIG, *const siginfo_t, ?*anyopaque) callconv(.c) void;
 
         /// signal handler
         handler: extern union {
@@ -3336,21 +3474,21 @@ pub const Sigaction = switch (native_os) {
     },
     // https://github.com/SerenityOS/serenity/blob/ec492a1a0819e6239ea44156825c4ee7234ca3db/Kernel/API/POSIX/signal.h#L39-L46
     .serenity => extern struct {
-        pub const handler_fn = *align(1) const fn (c_int) callconv(.c) void;
-        pub const sigaction_fn = *const fn (c_int, *const siginfo_t, ?*anyopaque) callconv(.c) void;
+        pub const handler_fn = *align(1) const fn (SIG) callconv(.c) void;
+        pub const sigaction_fn = *const fn (SIG, *const siginfo_t, ?*anyopaque) callconv(.c) void;
 
         handler: extern union {
             handler: ?handler_fn,
             sigaction: ?sigaction_fn,
         },
         mask: sigset_t,
-        flags: c_int,
+        flags: c_uint,
     },
     else => void,
 };
 pub const T = switch (native_os) {
     .linux => linux.T,
-    .macos, .ios, .tvos, .watchos, .visionos => struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
         pub const IOCGWINSZ = ior(0x40000000, 't', 104, @sizeOf(winsize));
 
         fn ior(inout: u32, group_arg: usize, num: usize, len: usize) usize {
@@ -3384,7 +3522,7 @@ pub const T = switch (native_os) {
         pub const IOCGPTN = 0x4004740f;
         pub const IOCSIG = 0x2004745f;
     },
-    .solaris, .illumos => struct {
+    .illumos => struct {
         pub const CGETA = tioc('T', 1);
         pub const CSETA = tioc('T', 2);
         pub const CSETAW = tioc('T', 3);
@@ -3741,7 +3879,7 @@ pub const T = switch (native_os) {
 };
 pub const IOCPARM_MASK = switch (native_os) {
     .windows => ws2_32.IOCPARM_MASK,
-    .macos, .ios, .tvos, .watchos, .visionos => 0x1fff,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => 0x1fff,
     else => void,
 };
 pub const TCSA = std.posix.TCSA;
@@ -3756,7 +3894,7 @@ pub const VDSO = switch (native_os) {
 pub const W = switch (native_os) {
     .linux => linux.W,
     .emscripten => emscripten.W,
-    .macos, .ios, .tvos, .watchos, .visionos => struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
         /// [XSI] no hang in wait/no child to reap
         pub const NOHANG = 0x00000001;
         /// [XSI] notify on stop, untraced child
@@ -3765,17 +3903,17 @@ pub const W = switch (native_os) {
         pub fn EXITSTATUS(x: u32) u8 {
             return @as(u8, @intCast(x >> 8));
         }
-        pub fn TERMSIG(x: u32) u32 {
-            return status(x);
+        pub fn TERMSIG(x: u32) SIG {
+            return @fromBackingInt(@intCast(status(x)));
         }
-        pub fn STOPSIG(x: u32) u32 {
-            return x >> 8;
+        pub fn STOPSIG(x: u32) SIG {
+            return @fromBackingInt(@intCast(x >> 8));
         }
         pub fn IFEXITED(x: u32) bool {
             return status(x) == 0;
         }
         pub fn IFSTOPPED(x: u32) bool {
-            return status(x) == stopped and STOPSIG(x) != 0x13;
+            return status(x) == stopped and @as(u32, @backingInt(STOPSIG(x))) != 0x13;
         }
         pub fn IFSIGNALED(x: u32) bool {
             return status(x) != stopped and status(x) != 0;
@@ -3798,14 +3936,14 @@ pub const W = switch (native_os) {
         pub fn EXITSTATUS(s: u32) u8 {
             return @as(u8, @intCast((s & 0xff00) >> 8));
         }
-        pub fn TERMSIG(s: u32) u32 {
-            return s & 0x7f;
+        pub fn TERMSIG(s: u32) SIG {
+            return @fromBackingInt(@intCast(s & 0x7f));
         }
-        pub fn STOPSIG(s: u32) u32 {
-            return EXITSTATUS(s);
+        pub fn STOPSIG(s: u32) SIG {
+            return @fromBackingInt(@intCast(EXITSTATUS(s)));
         }
         pub fn IFEXITED(s: u32) bool {
-            return TERMSIG(s) == 0;
+            return (s & 0x7f) == 0;
         }
         pub fn IFSTOPPED(s: u32) bool {
             return @as(u16, @truncate((((s & 0xffff) *% 0x10001) >> 8))) > 0x7f00;
@@ -3814,7 +3952,7 @@ pub const W = switch (native_os) {
             return (s & 0xffff) -% 1 < 0xff;
         }
     },
-    .solaris, .illumos => struct {
+    .illumos => struct {
         pub const EXITED = 0o001;
         pub const TRAPPED = 0o002;
         pub const UNTRACED = 0o004;
@@ -3826,14 +3964,14 @@ pub const W = switch (native_os) {
         pub fn EXITSTATUS(s: u32) u8 {
             return @as(u8, @intCast((s >> 8) & 0xff));
         }
-        pub fn TERMSIG(s: u32) u32 {
-            return s & 0x7f;
+        pub fn TERMSIG(s: u32) SIG {
+            return @fromBackingInt(@intCast(s & 0x7f));
         }
-        pub fn STOPSIG(s: u32) u32 {
-            return EXITSTATUS(s);
+        pub fn STOPSIG(s: u32) SIG {
+            return @fromBackingInt(@intCast(EXITSTATUS(s)));
         }
         pub fn IFEXITED(s: u32) bool {
-            return TERMSIG(s) == 0;
+            return (s & 0x7f) == 0;
         }
 
         pub fn IFCONTINUED(s: u32) bool {
@@ -3860,22 +3998,22 @@ pub const W = switch (native_os) {
         pub fn EXITSTATUS(s: u32) u8 {
             return @as(u8, @intCast((s >> 8) & 0xff));
         }
-        pub fn TERMSIG(s: u32) u32 {
-            return s & 0x7f;
+        pub fn TERMSIG(s: u32) SIG {
+            return @fromBackingInt(@intCast(s & 0x7f));
         }
-        pub fn STOPSIG(s: u32) u32 {
-            return EXITSTATUS(s);
+        pub fn STOPSIG(s: u32) SIG {
+            return @fromBackingInt(@intCast(EXITSTATUS(s)));
         }
         pub fn IFEXITED(s: u32) bool {
-            return TERMSIG(s) == 0;
+            return (s & 0x7f) == 0;
         }
 
         pub fn IFCONTINUED(s: u32) bool {
-            return ((s & 0x7f) == 0xffff);
+            return (s == CONTINUED);
         }
 
         pub fn IFSTOPPED(s: u32) bool {
-            return ((s & 0x7f != 0x7f) and !IFCONTINUED(s));
+            return (((s & 0x7f) == STOPPED) and !IFCONTINUED(s));
         }
 
         pub fn IFSIGNALED(s: u32) bool {
@@ -3894,14 +4032,14 @@ pub const W = switch (native_os) {
         pub fn EXITSTATUS(s: u32) u8 {
             return @as(u8, @intCast((s & 0xff00) >> 8));
         }
-        pub fn TERMSIG(s: u32) u32 {
-            return s & 0x7f;
+        pub fn TERMSIG(s: u32) SIG {
+            return @fromBackingInt(@intCast(s & 0x7f));
         }
-        pub fn STOPSIG(s: u32) u32 {
-            return EXITSTATUS(s);
+        pub fn STOPSIG(s: u32) SIG {
+            return @fromBackingInt(@intCast(EXITSTATUS(s)));
         }
         pub fn IFEXITED(s: u32) bool {
-            return TERMSIG(s) == 0;
+            return (s & 0x7f) == 0;
         }
         pub fn IFSTOPPED(s: u32) bool {
             return @as(u16, @truncate((((s & 0xffff) *% 0x10001) >> 8))) > 0x7f00;
@@ -3922,12 +4060,12 @@ pub const W = switch (native_os) {
             return @as(u8, @intCast(s & 0xff));
         }
 
-        pub fn TERMSIG(s: u32) u32 {
-            return (s >> 8) & 0xff;
+        pub fn TERMSIG(s: u32) SIG {
+            return @fromBackingInt(@intCast((s >> 8) & 0xff));
         }
 
-        pub fn STOPSIG(s: u32) u32 {
-            return (s >> 16) & 0xff;
+        pub fn STOPSIG(s: u32) SIG {
+            return @fromBackingInt(@intCast((s >> 16) & 0xff));
         }
 
         pub fn IFEXITED(s: u32) bool {
@@ -3950,14 +4088,14 @@ pub const W = switch (native_os) {
         pub fn EXITSTATUS(s: u32) u8 {
             return @as(u8, @intCast((s >> 8) & 0xff));
         }
-        pub fn TERMSIG(s: u32) u32 {
-            return (s & 0x7f);
+        pub fn TERMSIG(s: u32) SIG {
+            return @fromBackingInt(@intCast(s & 0x7f));
         }
-        pub fn STOPSIG(s: u32) u32 {
-            return EXITSTATUS(s);
+        pub fn STOPSIG(s: u32) SIG {
+            return @fromBackingInt(@intCast(EXITSTATUS(s)));
         }
         pub fn IFEXITED(s: u32) bool {
-            return TERMSIG(s) == 0;
+            return (s & 0x7f) == 0;
         }
 
         pub fn IFCONTINUED(s: u32) bool {
@@ -3985,16 +4123,16 @@ pub const W = switch (native_os) {
             return @intCast((s & 0xff00) >> 8);
         }
 
-        pub fn STOPSIG(s: u32) u32 {
-            return EXITSTATUS(s);
+        pub fn STOPSIG(s: u32) SIG {
+            return @fromBackingInt(@intCast(EXITSTATUS(s)));
         }
 
-        pub fn TERMSIG(s: u32) u32 {
-            return s & 0x7f;
+        pub fn TERMSIG(s: u32) SIG {
+            return @fromBackingInt(@intCast(s & 0x7f));
         }
 
         pub fn IFEXITED(s: u32) bool {
-            return TERMSIG(s) == 0;
+            return (s & 0x7f) == 0;
         }
 
         pub fn IFSTOPPED(s: u32) bool {
@@ -4011,12 +4149,23 @@ pub const W = switch (native_os) {
     },
     else => void,
 };
+pub const accept_filter_arg = switch (native_os) {
+    // https://github.com/freebsd/freebsd-src/blob/2024887abc7d1b931e00fbb0697658e98adf048d/sys/sys/socket.h#L205
+    // https://github.com/DragonFlyBSD/DragonFlyBSD/blob/6098912863ed4c7b3f70d7483910ce2956cf4ed3/sys/sys/socket.h#L164
+    // https://github.com/NetBSD/src/blob/cad5c68a8524927f65e22ad651de3905382be6e0/sys/sys/socket.h#L188
+    // https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/bsd/sys/socket.h#L504
+    .freebsd, .dragonfly, .netbsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
+        name: [16]u8,
+        arg: [240]u8,
+    },
+    else => void,
+};
 pub const clock_t = switch (native_os) {
     .linux => linux.clock_t,
     .emscripten => emscripten.clock_t,
-    .macos, .ios, .tvos, .watchos, .visionos => c_ulong,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => c_ulong,
     .freebsd => isize,
-    .openbsd, .solaris, .illumos => i64,
+    .openbsd, .illumos => i64,
     .netbsd => u32,
     .haiku => i32,
     // https://github.com/SerenityOS/serenity/blob/b98f537f117b341788023ab82e0c11ca9ae29a57/Kernel/API/POSIX/sys/types.h#L50
@@ -4037,7 +4186,7 @@ pub const dl_phdr_info = switch (native_os) {
         /// Module name.
         name: ?[*:0]const u8,
         /// Pointer to module's phdr.
-        phdr: [*]std.elf.Phdr,
+        phdr: [*]std.elf.ElfN.Phdr,
         /// Number of entries in phdr.
         phnum: u16,
         /// Total number of loads.
@@ -4047,10 +4196,10 @@ pub const dl_phdr_info = switch (native_os) {
         tls_modid: usize,
         tls_data: ?*anyopaque,
     },
-    .solaris, .illumos => extern struct {
+    .illumos => extern struct {
         addr: std.elf.Addr,
         name: ?[*:0]const u8,
-        phdr: [*]std.elf.Phdr,
+        phdr: [*]std.elf.ElfN.Phdr,
         phnum: std.elf.Half,
         /// Incremented when a new object is mapped into the process.
         adds: u64,
@@ -4061,7 +4210,7 @@ pub const dl_phdr_info = switch (native_os) {
     .openbsd, .haiku, .dragonfly, .netbsd, .serenity => extern struct {
         addr: usize,
         name: ?[*:0]const u8,
-        phdr: [*]std.elf.Phdr,
+        phdr: [*]std.elf.ElfN.Phdr,
         phnum: std.elf.Half,
     },
     else => void,
@@ -4073,7 +4222,7 @@ pub const epoll_event = switch (native_os) {
 pub const ifreq = switch (native_os) {
     .linux => linux.ifreq,
     .emscripten => emscripten.ifreq,
-    .solaris, .illumos => lifreq,
+    .illumos => lifreq,
     // https://github.com/SerenityOS/serenity/blob/9882848e0bf783dfc8e8a6d887a848d70d9c58f4/Kernel/API/POSIX/net/if.h#L49-L82
     .serenity => extern struct {
         // Not actually in a union, but the stdlib expects one for ifreq
@@ -4096,107 +4245,285 @@ pub const ifreq = switch (native_os) {
     },
     else => void,
 };
+pub const in_pktinfo = switch (native_os) {
+    .linux => linux.in_pktinfo,
+    // https://github.com/illumos/illumos-gate/blob/608eb926e14f4ba4736b2d59e891335f1cba9e1e/usr/src/uts/common/netinet/in.h#L1132
+    // https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/bsd/netinet/in.h#L696
+    .illumos, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
+        ifindex: u32,
+        spec_dst: u32,
+        addr: u32,
+    },
+    else => void,
+};
+pub const in6_pktinfo = switch (native_os) {
+    .linux => linux.in6_pktinfo,
+    // https://github.com/freebsd/freebsd-src/blob/9bfbc6826f72eb385bf52f4cde8080bccf7e3ebd/sys/netinet6/in6.h#L547
+    // https://github.com/DragonFlyBSD/DragonFlyBSD/blob/6098912863ed4c7b3f70d7483910ce2956cf4ed3/sys/netinet6/in6.h#L575
+    // https://github.com/NetBSD/src/blob/80bf25a5691072d4755e84567ccbdf0729370dea/sys/netinet6/in6.h#L468
+    // https://github.com/openbsd/src/blob/718a31b40d39fc6064de6355eb144e74633133fc/sys/netinet6/in6.h#L365
+    // https://github.com/illumos/illumos-gate/blob/608eb926e14f4ba4736b2d59e891335f1cba9e1e/usr/src/uts/common/netinet/in.h#L114IP1
+    // https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/bsd/netinet6/in6.h#L737
+    // https://github.com/haiku/haiku/blob/2aab5f5f14aeb3f34c3a3d9a9064cc3c0d914bea/headers/posix/netinet6/in6.h#L63
+    // https://github.com/SerenityOS/serenity/blob/5bd8af99be0bc4b2e14f361fd7d7590e6bcfa4d6/Kernel/API/POSIX/sys/socket.h#L122
+    .freebsd, .dragonfly, .netbsd, .openbsd, .illumos, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .haiku, .serenity => extern struct {
+        addr: [16]u8,
+        ifindex: u32,
+    },
+    else => void,
+};
 pub const itimerspec = switch (native_os) {
     .linux => linux.itimerspec,
-    .haiku => extern struct {
+    .dragonfly, .freebsd, .netbsd, .openbsd, .haiku, .illumos, .windows, .wasi => extern struct {
         interval: timespec,
         value: timespec,
     },
     else => void,
 };
+pub const linger = switch (native_os) {
+    .linux => linux.linger,
+    // https://github.com/freebsd/freebsd-src/blob/46347b3619757e3d683a87ca03efaf2ae242335f/sys/sys/socket.h#L200
+    .freebsd,
+    // https://github.com/DragonFlyBSD/DragonFlyBSD/blob/6098912863ed4c7b3f70d7483910ce2956cf4ed3/sys/sys/socket.h#L158
+    .dragonfly,
+    // https://github.com/NetBSD/src/blob/80bf25a5691072d4755e84567ccbdf0729370dea/sys/sys/socket.h#L183
+    .netbsd,
+    // https://github.com/openbsd/src/blob/718a31b40d39fc6064de6355eb144e74633133fc/sys/sys/socket.h#L126
+    .openbsd,
+    // https://github.com/illumos/illumos-gate/blob/608eb926e14f4ba4736b2d59e891335f1cba9e1e/usr/src/uts/common/sys/socket.h#L250
+    .illumos,
+    // https://github.com/haiku/haiku/blob/2aab5f5f14aeb3f34c3a3d9a9064cc3c0d914bea/headers/posix/sys/socket.h#L87
+    .haiku,
+    // https://github.com/SerenityOS/serenity/blob/5bd8af99be0bc4b2e14f361fd7d7590e6bcfa4d6/Kernel/API/POSIX/sys/socket.h#L122
+    .serenity,
+    // https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/bsd/sys/socket.h#L498
+    .driverkit,
+    .ios,
+    .maccatalyst,
+    .macos,
+    .tvos,
+    .visionos,
+    .watchos,
+    => extern struct {
+        onoff: i32, // non-zero to linger on close
+        linger: i32, // time to linger in seconds
+    },
+    else => void,
+};
+
 pub const msghdr = switch (native_os) {
-    .linux => linux.msghdr,
+    .linux => if (@bitSizeOf(usize) > @bitSizeOf(i32) and builtin.abi.isMusl()) posix_msghdr else linux.msghdr,
     .openbsd,
     .emscripten,
     .dragonfly,
     .freebsd,
     .netbsd,
     .haiku,
-    .solaris,
     .illumos,
-    .macos,
     .driverkit,
     .ios,
+    .maccatalyst,
+    .macos,
     .tvos,
     .visionos,
     .watchos,
-    => extern struct {
-        /// optional address
-        name: ?*sockaddr,
-        /// size of address
-        namelen: socklen_t,
-        /// scatter/gather array
-        iov: [*]iovec,
-        /// # elements in iov
-        iovlen: i32,
-        /// ancillary data
-        control: ?*anyopaque,
-        /// ancillary data buffer len
-        controllen: socklen_t,
-        /// flags on received message
-        flags: i32,
-    },
-    // https://github.com/SerenityOS/serenity/blob/ac44ec5ebc707f9dd0c3d4759a1e17e91db5d74f/Kernel/API/POSIX/sys/socket.h#L74-L82
-    .serenity => extern struct {
-        name: ?*anyopaque,
-        namelen: socklen_t,
-        iov: [*]iovec,
-        iovlen: c_int,
-        control: ?*anyopaque,
-        controllen: socklen_t,
-        flags: c_int,
-    },
+    .serenity, // https://github.com/SerenityOS/serenity/blob/ac44ec5ebc707f9dd0c3d4759a1e17e91db5d74f/Kernel/API/POSIX/sys/socket.h#L74-L82
+    => posix_msghdr,
     else => void,
 };
+
+/// There are several instances of struct fields that POSIX defines as either int or socklen_t, but
+/// on Linux are size_t. glibc ignores POSIX, and uses the Linux kernel's definitions. musl on the
+/// other hand aims to be POSIX-ly correct, and defines those fields in a manner aligning with
+/// POSIX.
+///
+/// musl works around this incompatibility between the 64-bit Linux ABI and the POSIX specification
+/// by adding padding fields on either side depending on host endianness:
+///
+///     #if __LONG_MAX > 0x7fffffff && __BYTE_ORDER == __BIG_ENDIAN
+///         int __pad2;
+///     #endif
+///         socklen_t msg_controllen;
+///     #if __LONG_MAX > 0x7fffffff && __BYTE_ORDER == __LITTLE_ENDIAN
+///         int __pad2;
+///     #endif
+///
+/// To emulate this quirk of musl, the MuslOnlyPadding field is used in these structs
+///
+///     pad0: MuslOnlyPadding(.big) = 0,
+///     msg_controllen: socklen_t,
+///     pad1: MuslOnlyPadding(.little) = 0,
+///
+/// On 32-bit and non-musl systems, these fields will be zero sized, and ignored.
+fn MuslOnlyPadding(endian: std.builtin.Endian) type {
+    return if (builtin.abi.isMusl() and @sizeOf(usize) == 8 and native_endian == endian) u32 else u0;
+}
+
+/// https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/sys_socket.h.html
+const posix_msghdr = extern struct {
+    name: ?*sockaddr,
+    namelen: socklen_t,
+    iov: [*]iovec,
+    pad0: MuslOnlyPadding(.big) = 0,
+    iovlen: u32,
+    pad1: MuslOnlyPadding(.little) = 0,
+    control: ?*anyopaque,
+    pad2: MuslOnlyPadding(.big) = 0,
+    controllen: socklen_t,
+    pad3: MuslOnlyPadding(.little) = 0,
+    flags: u32,
+};
+
 pub const msghdr_const = switch (native_os) {
-    .linux => linux.msghdr_const,
+    .linux => if (@bitSizeOf(usize) > @bitSizeOf(i32) and builtin.abi.isMusl()) posix_msghdr_const else linux.msghdr_const,
     .openbsd,
     .emscripten,
     .dragonfly,
     .freebsd,
     .netbsd,
     .haiku,
-    .solaris,
     .illumos,
-    .macos,
     .driverkit,
     .ios,
+    .maccatalyst,
+    .macos,
     .tvos,
     .visionos,
     .watchos,
-    => extern struct {
-        /// optional address
-        name: ?*const sockaddr,
-        /// size of address
-        namelen: socklen_t,
-        /// scatter/gather array
-        iov: [*]const iovec_const,
-        /// # elements in iov
-        iovlen: u32,
-        /// ancillary data
-        control: ?*const anyopaque,
-        /// ancillary data buffer len
-        controllen: socklen_t,
-        /// flags on received message
-        flags: i32,
-    },
-    .serenity => extern struct {
-        name: ?*const anyopaque,
-        namelen: socklen_t,
-        iov: [*]const iovec_const,
-        iovlen: c_uint,
-        control: ?*const anyopaque,
-        controllen: socklen_t,
-        flags: c_int,
-    },
+    .serenity,
+    => posix_msghdr_const,
     else => void,
 };
+
+const posix_msghdr_const = extern struct {
+    name: ?*const sockaddr,
+    namelen: socklen_t,
+    iov: [*]const iovec_const,
+    pad0: MuslOnlyPadding(.big) = 0,
+    iovlen: u32,
+    pad1: MuslOnlyPadding(.little) = 0,
+    control: ?*const anyopaque,
+    pad2: MuslOnlyPadding(.big) = 0,
+    controllen: socklen_t,
+    pad3: MuslOnlyPadding(.little) = 0,
+    flags: u32,
+};
+
+pub const mmsghdr = switch (native_os) {
+    .linux => linux.mmsghdr,
+    else => extern struct {
+        hdr: msghdr,
+        len: u32,
+    },
+};
+
+pub const cmsghdr = switch (native_os) {
+    .linux => if (@bitSizeOf(usize) > @bitSizeOf(i32) and builtin.abi.isMusl()) posix_cmsghdr else linux.cmsghdr,
+    // https://github.com/emscripten-core/emscripten/blob/96371ed7888fc78c040179f4d4faa82a6a07a116/system/lib/libc/musl/include/sys/socket.h#L44
+    .emscripten => linux.cmsghdr,
+    // https://github.com/freebsd/freebsd-src/blob/b197d2abcb6895d78bc9df8404e374397aa44748/sys/sys/socket.h#L492
+    .freebsd,
+    // https://github.com/DragonFlyBSD/DragonFlyBSD/blob/107c0518337ba90e7fa49e74845d8d44320c9a6d/sys/sys/socket.h#L452
+    .dragonfly,
+    // https://github.com/NetBSD/src/blob/ba8e1774fd9c0c26ecca461c07bc95d9ebb69579/sys/sys/socket.h#L528
+    .netbsd,
+    // https://github.com/openbsd/src/blob/master/sys/sys/socket.h#L527
+    .openbsd,
+    // https://github.com/illumos/illumos-gate/blob/afdf2e523873cb523df379676067bf9785a0f456/usr/src/uts/common/sys/socket.h#L460
+    .illumos,
+    // https://github.com/SerenityOS/serenity/blob/4ee360a348a5e2490eeaeeabb3eb19e70dd450eb/Kernel/API/POSIX/sys/socket.h#L68
+    .serenity,
+    // https://github.com/haiku/haiku/blob/b54f586058fd6623645512e4631468cede9933b9/headers/posix/sys/socket.h#L132
+    .haiku,
+    // https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/bsd/sys/socket.h#L1041
+    .driverkit,
+    .ios,
+    .maccatalyst,
+    .macos,
+    .tvos,
+    .visionos,
+    .watchos,
+    => posix_cmsghdr,
+
+    else => void,
+};
+
+const posix_cmsghdr = extern struct {
+    pad0: MuslOnlyPadding(.big) = 0,
+    len: socklen_t,
+    pad1: MuslOnlyPadding(.little) = 0,
+    level: c_int,
+    type: c_int,
+};
+
+// Alignment used by POSIX specified CMSG_* Macros
+// https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/sys_socket.h.html
+pub const cmsg_align = switch (native_os) {
+    .linux => linux.cmsg_align,
+    // https://github.com/emscripten-core/emscripten/blob/96371ed7888fc78c040179f4d4faa82a6a07a116/system/lib/libc/musl/include/sys/socket.h#L362
+    .emscripten => @sizeOf(usize),
+    // https://github.com/freebsd/freebsd-src/blob/b197d2abcb6895d78bc9df8404e374397aa44748/sys/sys/socket.h#L584
+    // https://github.com/freebsd/freebsd-src/blob/d2018cedb414ef17e77b7fc2fa19fd81328da46b/sys/sys/_align.h#L30
+    .freebsd => @sizeOf(*anyopaque),
+    // https://github.com/DragonFlyBSD/DragonFlyBSD/blob/d1f4fb943c73e2b61ddabff6aa48ce7551db72f4/sys/sys/socket.h#L441
+    // https://github.com/DragonFlyBSD/DragonFlyBSD/blob/d1f4fb943c73e2b61ddabff6aa48ce7551db72f4/sys/cpu/x86_64/include/alignbytes.h#L35
+    .dragonfly => switch (builtin.cpu.arch) {
+        .x86_64 => @sizeOf(c_long),
+        else => {},
+    },
+    // https://github.com/NetBSD/src/blob/ba8e1774fd9c0c26ecca461c07bc95d9ebb69579/sys/sys/socket.h#L544
+    .netbsd => switch (builtin.cpu.arch) {
+        // https://github.com/NetBSD/src/blob/ac016822f750dc9166c84b6d2657479992622192/sys/arch/arm/include/cdefs.h#L63
+        .aarch64, .aarch64_be => @sizeOf(i128),
+        .arm, .armeb => @sizeOf(c_longlong),
+        // https://github.com/NetBSD/src/blob/ac016822f750dc9166c84b6d2657479992622192/sys/arch/i386/include/cdefs.h#L9
+        .x86 => @sizeOf(c_int),
+        // https://github.com/NetBSD/src/blob/ac016822f750dc9166c84b6d2657479992622192/sys/arch/amd64/include/cdefs.h#L6
+        .x86_64 => @sizeOf(c_long),
+        // https://github.com/NetBSD/src/blob/ac016822f750dc9166c84b6d2657479992622192/sys/arch/mips/include/cdefs.h#L74
+        .mips, .mips64, .mipsel, .mips64el => 8,
+        // https://github.com/NetBSD/src/blob/ac016822f750dc9166c84b6d2657479992622192/sys/arch/sparc/include/cdefs.h#L8
+        .sparc64 => 16,
+        // https://github.com/NetBSD/src/blob/ac016822f750dc9166c84b6d2657479992622192/sys/arch/sparc/include/cdefs.h#L10
+        .sparc => 8,
+        // https://github.com/NetBSD/src/blob/ac016822f750dc9166c84b6d2657479992622192/sys/arch/alpha/include/cdefs.h#L6
+        .alpha => 8,
+        // https://github.com/NetBSD/src/blob/ac016822f750dc9166c84b6d2657479992622192/sys/arch/m68k/include/cdefs.h#L6
+        .m68k => @sizeOf(c_int),
+        // https://github.com/NetBSD/src/blob/ac016822f750dc9166c84b6d2657479992622192/sys/arch/hppa/include/cdefs.h#L12
+        .hppa => 8,
+        // https://github.com/NetBSD/src/blob/ac016822f750dc9166c84b6d2657479992622192/sys/arch/riscv/include/cdefs.h#L5
+        .riscv32, .riscv32be, .riscv64, .riscv64be => @as(comptime_int, builtin.target.cMaxIntAlignment()),
+        // https://github.com/NetBSD/src/blob/ac016822f750dc9166c84b6d2657479992622192/sys/arch/powerpc/include/cdefs.h#L6
+        .powerpc, .powerpcle, .powerpc64, .powerpc64le => @sizeOf(f64),
+        // https://github.com/NetBSD/src/blob/ac016822f750dc9166c84b6d2657479992622192/sys/arch/or1k/include/cdefs.h#L6
+        .or1k => @as(comptime_int, builtin.target.cMaxIntAlignment()),
+        else => {},
+    },
+    // https://github.com/openbsd/src/blob/4a7ecdb29021f26ee0ef397afdd2931e20e63071/sys/sys/socket.h#L564
+    // https://github.com/openbsd/src/blob/4a7ecdb29021f26ee0ef397afdd2931e20e63071/sys/arch/amd64/include/_types.h#L50
+    .openbsd => @sizeOf(c_long),
+    // https://github.com/illumos/illumos-gate/blob/c1e950d976948602134f0e0e5dadf3d48a7ee996/usr/src/uts/common/sys/socket.h#L469
+    .illumos => 4,
+    // https://github.com/haiku/haiku/blob/b54f586058fd6623645512e4631468cede9933b9/headers/posix/sys/socket.h#L152
+    // https://github.com/haiku/haiku/blob/6059d64cb7cd145f0f1eb5b89c383f71e4b6bebf/headers/posix/sys/param.h#L28
+    .haiku => @sizeOf(c_long),
+    // https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/bsd/sys/socket.h#L1077
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => 4,
+    else => {},
+};
+comptime {
+    if (@TypeOf(cmsg_align) != void and @TypeOf(cmsghdr) != void) {
+        assert(cmsg_align >= @alignOf(cmsghdr));
+    }
+}
+
 pub const nfds_t = switch (native_os) {
     .linux => linux.nfds_t,
     .emscripten => emscripten.nfds_t,
-    .haiku, .solaris, .illumos, .wasi => usize,
+    .haiku, .illumos, .wasi => usize,
     .windows => c_ulong,
-    .openbsd, .dragonfly, .netbsd, .freebsd, .macos, .ios, .tvos, .watchos, .visionos => u32,
+    .openbsd, .dragonfly, .netbsd, .freebsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => u32,
     // https://github.com/SerenityOS/serenity/blob/265764ff2fec038855193296588a887fc322d76a/Kernel/API/POSIX/poll.h#L32
     .serenity => c_uint,
     else => void,
@@ -4221,18 +4548,18 @@ pub const pollfd = switch (native_os) {
     .serenity => extern struct {
         fd: fd_t,
         events: c_short,
-        revents: c_short,
+        revents: c_short = undefined,
     },
     else => extern struct {
         fd: fd_t,
         events: i16,
-        revents: i16,
+        revents: i16 = undefined,
     },
 };
 pub const rlim_t = switch (native_os) {
     .linux => linux.rlim_t,
     .emscripten => emscripten.rlim_t,
-    .openbsd, .netbsd, .solaris, .illumos, .macos, .ios, .tvos, .watchos, .visionos => u64,
+    .openbsd, .netbsd, .illumos, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => u64,
     .haiku, .dragonfly, .freebsd => i64,
     // https://github.com/SerenityOS/serenity/blob/aae106e37b48f2158e68902293df1e4bf7b80c0f/Userland/Libraries/LibC/sys/resource.h#L54
     .serenity => usize,
@@ -4252,7 +4579,7 @@ pub const rlimit = switch (native_os) {
 pub const rlimit_resource = switch (native_os) {
     .linux => linux.rlimit_resource,
     .emscripten => emscripten.rlimit_resource,
-    .openbsd, .macos, .ios, .tvos, .watchos, .visionos => enum(c_int) {
+    .openbsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => enum(c_int) {
         CPU = 0,
         FSIZE = 1,
         DATA = 2,
@@ -4286,7 +4613,7 @@ pub const rlimit_resource = switch (native_os) {
 
         pub const AS: rlimit_resource = .VMEM;
     },
-    .solaris, .illumos => enum(c_int) {
+    .illumos => enum(c_int) {
         CPU = 0,
         FSIZE = 1,
         DATA = 2,
@@ -4359,7 +4686,7 @@ pub const rlimit_resource = switch (native_os) {
 pub const rusage = switch (native_os) {
     .linux => linux.rusage,
     .emscripten => emscripten.rusage,
-    .macos, .ios, .tvos, .watchos, .visionos => extern struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
         utime: timeval,
         stime: timeval,
         maxrss: isize,
@@ -4380,7 +4707,7 @@ pub const rusage = switch (native_os) {
         pub const SELF = 0;
         pub const CHILDREN = -1;
     },
-    .solaris, .illumos => extern struct {
+    .illumos => extern struct {
         utime: timeval,
         stime: timeval,
         maxrss: isize,
@@ -4424,14 +4751,57 @@ pub const rusage = switch (native_os) {
         pub const SELF = 1;
         pub const CHILDREN = 2;
     },
+    .freebsd, .openbsd => extern struct {
+        utime: timeval,
+        stime: timeval,
+        maxrss: c_long,
+        ixrss: c_long,
+        idrss: c_long,
+        isrss: c_long,
+        minflt: c_long,
+        majflt: c_long,
+        nswap: c_long,
+        inblock: c_long,
+        oublock: c_long,
+        msgsnd: c_long,
+        msgrcv: c_long,
+        nsignals: c_long,
+        nvcsw: c_long,
+        nivcsw: c_long,
+
+        pub const SELF = 0;
+        pub const CHILDREN = -1;
+        pub const THREAD = 1;
+    },
+    .dragonfly, .netbsd => extern struct {
+        utime: timeval,
+        stime: timeval,
+        maxrss: c_long,
+        ixrss: c_long,
+        idrss: c_long,
+        isrss: c_long,
+        minflt: c_long,
+        majflt: c_long,
+        nswap: c_long,
+        inblock: c_long,
+        oublock: c_long,
+        msgsnd: c_long,
+        msgrcv: c_long,
+        nsignals: c_long,
+        nvcsw: c_long,
+        nivcsw: c_long,
+
+        pub const SELF = 0;
+        pub const CHILDREN = -1;
+    },
     else => void,
 };
 
 pub const siginfo_t = switch (native_os) {
     .linux => linux.siginfo_t,
     .emscripten => emscripten.siginfo_t,
-    .macos, .ios, .tvos, .watchos, .visionos => extern struct {
-        signo: c_int,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
+        signo: SIG,
         errno: c_int,
         code: c_int,
         pid: pid_t,
@@ -4447,7 +4817,7 @@ pub const siginfo_t = switch (native_os) {
     },
     .freebsd => extern struct {
         // Signal number.
-        signo: c_int,
+        signo: SIG,
         // Errno association.
         errno: c_int,
         /// Signal code.
@@ -4489,8 +4859,8 @@ pub const siginfo_t = switch (native_os) {
             },
         },
     },
-    .solaris, .illumos => extern struct {
-        signo: c_int,
+    .illumos => extern struct {
+        signo: SIG,
         code: c_int,
         errno: c_int,
         // 64bit architectures insert 4bytes of padding here, this is done by
@@ -4509,8 +4879,8 @@ pub const siginfo_t = switch (native_os) {
                         stime: clock_t,
                     },
                 },
-                contract: solaris.ctid_t,
-                zone: solaris.zoneid_t,
+                contract: illumos.ctid_t,
+                zone: illumos.zoneid_t,
             },
             fault: extern struct {
                 addr: *allowzero anyopaque,
@@ -4547,7 +4917,7 @@ pub const siginfo_t = switch (native_os) {
         info: netbsd._ksiginfo,
     },
     .dragonfly => extern struct {
-        signo: c_int,
+        signo: SIG,
         errno: c_int,
         code: c_int,
         pid: c_int,
@@ -4559,7 +4929,7 @@ pub const siginfo_t = switch (native_os) {
         __spare__: [7]c_int,
     },
     .haiku => extern struct {
-        signo: i32,
+        signo: SIG,
         code: i32,
         errno: i32,
 
@@ -4568,7 +4938,7 @@ pub const siginfo_t = switch (native_os) {
         addr: *allowzero anyopaque,
     },
     .openbsd => extern struct {
-        signo: c_int,
+        signo: SIG,
         code: c_int,
         errno: c_int,
         data: extern union {
@@ -4592,18 +4962,10 @@ pub const siginfo_t = switch (native_os) {
             },
             __pad: [128 - 3 * @sizeOf(c_int)]u8,
         },
-
-        comptime {
-            if (@sizeOf(usize) == 4)
-                assert(@sizeOf(@This()) == 128)
-            else
-                // Take into account the padding between errno and data fields.
-                assert(@sizeOf(@This()) == 136);
-        }
     },
     // https://github.com/SerenityOS/serenity/blob/ec492a1a0819e6239ea44156825c4ee7234ca3db/Kernel/API/POSIX/signal.h#L27-L37
     .serenity => extern struct {
-        signo: c_int,
+        signo: SIG,
         code: c_int,
         errno: c_int,
         pid: pid_t,
@@ -4616,12 +4978,13 @@ pub const siginfo_t = switch (native_os) {
     else => void,
 };
 pub const sigset_t = switch (native_os) {
-    .linux => [1024 / @bitSizeOf(c_ulong)]c_ulong, // glibc and musl present a 1024-bit sigset_t, while kernel's is 128-bit or less.
+    // glibc and musl present a 1024-bit sigset_t, while kernel's (and bionic's) is 128-bit or less.
+    .linux => if (builtin.abi.isAndroid()) c_ulong else [1024 / @bitSizeOf(c_ulong)]c_ulong,
     .emscripten => emscripten.sigset_t,
     // https://github.com/SerenityOS/serenity/blob/ec492a1a0819e6239ea44156825c4ee7234ca3db/Kernel/API/POSIX/signal.h#L19
     .openbsd, .serenity => u32,
-    .macos, .ios, .tvos, .watchos, .visionos => darwin.sigset_t,
-    .dragonfly, .netbsd, .solaris, .illumos, .freebsd => extern struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => darwin.sigset_t,
+    .dragonfly, .netbsd, .illumos, .freebsd => extern struct {
         __bits: [SIG.WORDS]u32,
     },
     .haiku => u64,
@@ -4650,7 +5013,7 @@ pub const addrinfo = if (builtin.abi.isAndroid()) extern struct {
 } else switch (native_os) {
     .linux, .emscripten => linux.addrinfo,
     .windows => ws2_32.addrinfo,
-    .freebsd, .macos, .ios, .tvos, .watchos, .visionos => extern struct {
+    .freebsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
         flags: AI,
         family: i32,
         socktype: i32,
@@ -4660,7 +5023,7 @@ pub const addrinfo = if (builtin.abi.isAndroid()) extern struct {
         addr: ?*sockaddr,
         next: ?*addrinfo,
     },
-    .solaris, .illumos => extern struct {
+    .illumos => extern struct {
         flags: AI,
         family: i32,
         socktype: i32,
@@ -4716,7 +5079,7 @@ pub const addrinfo = if (builtin.abi.isAndroid()) extern struct {
 pub const sockaddr = switch (native_os) {
     .linux, .emscripten => linux.sockaddr,
     .windows => ws2_32.sockaddr,
-    .macos, .ios, .tvos, .watchos, .visionos => extern struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
         len: u8,
         family: sa_family_t,
         data: [14]u8,
@@ -4798,7 +5161,7 @@ pub const sockaddr = switch (native_os) {
             path: [104]u8,
         };
     },
-    .solaris, .illumos => extern struct {
+    .illumos => extern struct {
         /// address family
         family: sa_family_t,
 
@@ -5058,9 +5421,9 @@ pub const in_port_t = u16;
 pub const sa_family_t = switch (native_os) {
     .linux, .emscripten => linux.sa_family_t,
     .windows => ws2_32.ADDRESS_FAMILY,
-    .openbsd, .haiku, .dragonfly, .netbsd, .freebsd, .macos, .ios, .tvos, .watchos, .visionos => u8,
+    .openbsd, .haiku, .dragonfly, .netbsd, .freebsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => u8,
     // https://github.com/SerenityOS/serenity/blob/ac44ec5ebc707f9dd0c3d4759a1e17e91db5d74f/Kernel/API/POSIX/sys/socket.h#L66
-    .solaris, .illumos, .serenity => u16,
+    .illumos, .serenity => u16,
     else => void,
 };
 pub const AF = if (builtin.abi.isAndroid()) struct {
@@ -5111,7 +5474,7 @@ pub const AF = if (builtin.abi.isAndroid()) struct {
 } else switch (native_os) {
     .linux, .emscripten => linux.AF,
     .windows => ws2_32.AF,
-    .macos, .ios, .tvos, .watchos, .visionos => struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
         pub const UNSPEC = 0;
         pub const LOCAL = 1;
         pub const UNIX = LOCAL;
@@ -5198,7 +5561,7 @@ pub const AF = if (builtin.abi.isAndroid()) struct {
         pub const INET6_SDP = 42;
         pub const MAX = 42;
     },
-    .solaris, .illumos => struct {
+    .illumos => struct {
         pub const UNSPEC = 0;
         pub const UNIX = 1;
         pub const LOCAL = UNIX;
@@ -5397,7 +5760,7 @@ pub const PF = if (builtin.abi.isAndroid()) struct {
     pub const PF_MAX = AF.MAX;
 } else switch (native_os) {
     .linux, .emscripten => linux.PF,
-    .macos, .ios, .tvos, .watchos, .visionos => struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
         pub const UNSPEC = AF.UNSPEC;
         pub const LOCAL = AF.LOCAL;
         pub const UNIX = PF.LOCAL;
@@ -5478,7 +5841,7 @@ pub const PF = if (builtin.abi.isAndroid()) struct {
         pub const INET6_SDP = AF.INET6_SDP;
         pub const MAX = AF.MAX;
     },
-    .solaris, .illumos => struct {
+    .illumos => struct {
         pub const UNSPEC = AF.UNSPEC;
         pub const UNIX = AF.UNIX;
         pub const LOCAL = UNIX;
@@ -5631,7 +5994,7 @@ pub const PF = if (builtin.abi.isAndroid()) struct {
 pub const DT = switch (native_os) {
     .linux => linux.DT,
     // https://github.com/SerenityOS/serenity/blob/1262a7d1424d0d2e89d80644409721cbf056ab17/Kernel/API/POSIX/dirent.h#L16-L35
-    .netbsd, .freebsd, .openbsd, .macos, .ios, .tvos, .watchos, .visionos, .serenity => struct {
+    .netbsd, .freebsd, .openbsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .serenity => struct {
         pub const UNKNOWN = 0;
         pub const FIFO = 1;
         pub const CHR = 2;
@@ -5660,7 +6023,7 @@ pub const MSG = switch (native_os) {
     .linux => linux.MSG,
     .emscripten => emscripten.MSG,
     .windows => ws2_32.MSG,
-    .driverkit, .macos, .ios, .tvos, .watchos, .visionos => darwin.MSG,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => darwin.MSG,
     .haiku => struct {
         pub const OOB = 0x0001;
         pub const PEEK = 0x0002;
@@ -5741,13 +6104,43 @@ pub const MSG = switch (native_os) {
         pub const WAITFORONE = 0x1000;
         pub const CMSG_CLOFORK = 0x2000;
     },
+    .dragonfly => struct {
+        pub const OOB = 0x0001;
+        pub const PEEK = 0x0002;
+        pub const DONTROUTE = 0x0004;
+        pub const EOR = 0x0008;
+        pub const TRUNC = 0x0010;
+        pub const CTRUNC = 0x0020;
+        pub const WAITALL = 0x0040;
+        pub const DONTWAIT = 0x0080;
+        pub const NOSIGNAL = 0x0400;
+        pub const SYNC = 0x0800;
+        pub const CMSG_CLOEXEC = 0x1000;
+        pub const CMSG_CLOFORK = 0x2000;
+        pub const FBLOCKING = 0x10000;
+        pub const FNONBLOCKING = 0x20000;
+    },
+    .illumos => struct {
+        pub const OOB = 0x0001;
+        pub const PEEK = 0x0002;
+        pub const DONTROUTE = 0x0004;
+        pub const EOR = 0x0008;
+        pub const CTRUNC = 0x0010;
+        pub const TRUNC = 0x0020;
+        pub const WAITALL = 0x0040;
+        pub const DONTWAIT = 0x0080;
+        pub const NOTIFICATION = 0x0100;
+        pub const NOSIGNAL = 0x0200;
+        pub const CMSG_CLOEXEC = 0x1000;
+        pub const CMSG_CLOFORK = 0x2000;
+    },
     else => void,
 };
 pub const SOCK = switch (native_os) {
     .linux => linux.SOCK,
     .emscripten => emscripten.SOCK,
     .windows => ws2_32.SOCK,
-    .macos, .ios, .tvos, .watchos, .visionos => struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
         pub const STREAM = 1;
         pub const DGRAM = 2;
         pub const RAW = 3;
@@ -5774,7 +6167,7 @@ pub const SOCK = switch (native_os) {
         pub const CLOEXEC = 0x10000000;
         pub const NONBLOCK = 0x20000000;
     },
-    .solaris, .illumos => struct {
+    .illumos => struct {
         /// Datagram.
         pub const DGRAM = 1;
         /// STREAM.
@@ -5848,10 +6241,16 @@ pub const SOCK = switch (native_os) {
     else => void,
 };
 pub const TCP = switch (native_os) {
-    .macos => darwin.TCP,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => darwin.TCP,
     .linux => linux.TCP,
+    .freebsd => freebsd.TCP,
+    .netbsd => netbsd.TCP,
+    .openbsd => openbsd.TCP,
+    .dragonfly => dragonfly.TCP,
     .emscripten => emscripten.TCP,
     .windows => ws2_32.TCP,
+    .illumos => illumos.TCP,
+    .haiku => haiku.TCP,
     // https://github.com/SerenityOS/serenity/blob/61ac554a3403838f79ca746bd1c65ded6f97d124/Kernel/API/POSIX/netinet/tcp.h#L13-L14
     .serenity => struct {
         pub const NODELAY = 10;
@@ -5862,13 +6261,14 @@ pub const TCP = switch (native_os) {
 pub const IPPROTO = switch (native_os) {
     .linux, .emscripten => linux.IPPROTO,
     .windows => ws2_32.IPPROTO,
-    .macos, .ios, .tvos, .watchos, .visionos => struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
         pub const ICMP = 1;
         pub const ICMPV6 = 58;
         pub const TCP = 6;
         pub const UDP = 17;
         pub const IP = 0;
         pub const IPV6 = 41;
+        pub const RAW = 255;
     },
     .freebsd => struct {
         /// dummy for IP
@@ -6104,7 +6504,7 @@ pub const IPPROTO = switch (native_os) {
         /// Reserved
         pub const RESERVED_254 = 254;
     },
-    .solaris, .illumos => struct {
+    .illumos => struct {
         /// dummy for IP
         pub const IP = 0;
         /// Hop by hop header for IPv6
@@ -6375,7 +6775,7 @@ pub const IPPROTO = switch (native_os) {
         /// dummy for IP
         pub const IP = 0;
         /// IP6 hop-by-hop options
-        pub const HOPOPTS = IP;
+        pub const HOPOPTS = IPPROTO.IP;
         /// control message protocol
         pub const ICMP = 1;
         /// group mgmt protocol
@@ -6457,14 +6857,50 @@ pub const IPPROTO = switch (native_os) {
     },
     else => void,
 };
+pub const IP = switch (native_os) {
+    .linux => linux.IP,
+    .freebsd => freebsd.IP,
+    .dragonfly => dragonfly.IP,
+    .netbsd => netbsd.IP,
+    .openbsd => openbsd.IP,
+    .illumos => illumos.IP,
+    .haiku => haiku.IP,
+    .serenity => serenity.IP,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => darwin.IP,
+    else => void,
+};
+pub const IPV6 = switch (native_os) {
+    .linux => linux.IPV6,
+    .freebsd => freebsd.IPV6,
+    .dragonfly => dragonfly.IPV6,
+    .netbsd => netbsd.IPV6,
+    .openbsd => openbsd.IPV6,
+    .illumos => illumos.IPV6,
+    .haiku => haiku.IPV6,
+    .serenity => serenity.IPV6,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => darwin.IPV6,
+    else => void,
+};
+pub const IPTOS = switch (native_os) {
+    .linux => linux.IPTOS,
+    .freebsd => freebsd.IPTOS,
+    .dragonfly => dragonfly.IPTOS,
+    .netbsd => netbsd.IPTOS,
+    .openbsd => openbsd.IPTOS,
+    .illumos => illumos.IPTOS,
+    .haiku => haiku.IPTOS,
+    .serenity => serenity.IPTOS,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => darwin.IPTOS,
+    else => void,
+};
 pub const SOL = switch (native_os) {
     .linux => linux.SOL,
     .emscripten => emscripten.SOL,
     .windows => ws2_32.SOL,
-    .openbsd, .haiku, .dragonfly, .netbsd, .freebsd, .macos, .ios, .tvos, .watchos, .visionos => struct {
+    .openbsd, .haiku, .dragonfly, .netbsd, .freebsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
         pub const SOCKET = 0xffff;
     },
-    .solaris, .illumos => struct {
+    .illumos => struct {
         pub const SOCKET = 0xffff;
         pub const ROUTE = 0xfffe;
         pub const PACKET = 0xfffd;
@@ -6480,7 +6916,7 @@ pub const SO = switch (native_os) {
     .linux => linux.SO,
     .emscripten => emscripten.SO,
     .windows => ws2_32.SO,
-    .macos, .ios, .tvos, .watchos, .visionos => struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
         pub const DEBUG = 0x0001;
         pub const ACCEPTCONN = 0x0002;
         pub const REUSEADDR = 0x0004;
@@ -6488,7 +6924,7 @@ pub const SO = switch (native_os) {
         pub const DONTROUTE = 0x0010;
         pub const BROADCAST = 0x0020;
         pub const USELOOPBACK = 0x0040;
-        pub const LINGER = 0x1080;
+        pub const LINGER = 0x0080;
         pub const OOBINLINE = 0x0100;
         pub const REUSEPORT = 0x0200;
         pub const ACCEPTFILTER = 0x1000;
@@ -6507,6 +6943,7 @@ pub const SO = switch (native_os) {
         pub const NOADDRERR = 0x1023;
         pub const NWRITE = 0x1024;
         pub const REUSESHAREUID = 0x1025;
+        pub const LINGER_SEC = 0x1080;
     },
     .freebsd => struct {
         pub const DEBUG = 0x00000001;
@@ -6548,7 +6985,7 @@ pub const SO = switch (native_os) {
         pub const MAX_PACING_RATE = 0x1018;
         pub const DOMAIN = 0x1019;
     },
-    .solaris, .illumos => struct {
+    .illumos => struct {
         pub const DEBUG = 0x0001;
         pub const ACCEPTCONN = 0x0002;
         pub const REUSEADDR = 0x0004;
@@ -6719,23 +7156,78 @@ pub const SOMAXCONN = switch (native_os) {
     .linux => linux.SOMAXCONN,
     .windows => ws2_32.SOMAXCONN,
     // https://github.com/SerenityOS/serenity/blob/ac44ec5ebc707f9dd0c3d4759a1e17e91db5d74f/Kernel/API/POSIX/sys/socket.h#L128
-    .solaris, .illumos, .serenity => 128,
+    .illumos, .serenity => 128,
     // https://github.com/freebsd/freebsd-src/blob/9ab31f821ad1c6bad474510447387c50bef2c24c/sys/sys/socket.h#L434
     // https://github.com/DragonFlyBSD/DragonFlyBSD/blob/fd3d1949d526ffa646e57037770acd6f2f3bb617/sys/sys/socket.h#L393
     // https://github.com/NetBSD/src/blob/a673fb3f8487e974c669216064f7588207229fea/sys/sys/socket.h#L472
     // https://github.com/openbsd/src/blob/8ba9cd88f10123fef7af805b8e5ccc2463ad8fa4/sys/sys/socket.h#L483
     // https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/bsd/sys/socket.h#L815
-    .freebsd, .dragonfly, .netbsd, .openbsd, .driverkit, .macos, .ios, .tvos, .watchos, .visionos => 128,
+    .freebsd, .dragonfly, .netbsd, .openbsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => 128,
     else => void,
 };
+pub const SCM = switch (native_os) {
+    .linux, .emscripten => linux.SCM,
+    // https://github.com/illumos/illumos-gate/blob/489f6310fe8952e87fc1dce8af87990fcfd90f18/usr/src/uts/common/sys/socket.h#L196
+    .illumos => struct {
+        pub const RIGHTS = 0x1010;
+        pub const UCRED = 0x1012;
+        pub const TIMESTAMP = SO.TIMESTAMP;
+    },
+    // https://github.com/haiku/haiku/blob/e3d01e53a25446d5ba4999d0ff6dff29a2418657/headers/posix/sys/socket.h#L156
+    .haiku => struct {
+        pub const RIGHTS = 1;
+    },
+    // https://github.com/SerenityOS/serenity/blob/c6618f36bf0949bd76177f202659b1f3079e0792/Kernel/API/POSIX/sys/socket.h#L171
+    .serenity => struct {
+        pub const TIMESTAMP = 0;
+        pub const RIGHTS = 1;
+    },
+    // https://github.com/freebsd/freebsd-src/blob/614e9b33bf5594d9d09b5d296afa4f3aa6971823/sys/sys/socket.h#L593
+    .freebsd => struct {
+        pub const RIGHTS = 1;
+        pub const TIMESTAMP = 2;
+        pub const CREDS = 3;
+        pub const BINTIME = 4;
+        pub const REALTIME = 5;
+        pub const MONOTONIC = 6;
+        pub const TIME_INFO = 7;
+        pub const CREDS2 = 8;
+    },
+    // https://github.com/DragonFlyBSD/DragonFlyBSD/blob/6098912863ed4c7b3f70d7483910ce2956cf4ed3/sys/sys/socket.h#L520
+    .dragonfly => struct {
+        pub const RIGHTS = 1;
+        pub const TIMESTAMP = 2;
+        pub const CREDS = 3;
+    },
+    // https://github.com/NetBSD/src/blob/3311177ea898ab8322292ba0e48faa9b2e834cb6/sys/sys/socket.h#L578
+    .netbsd => struct {
+        pub const RIGHTS = 0x01;
+        pub const TIMESTAMP = 0x08;
+        pub const CREDS = 0x10;
+    },
+    // https://github.com/openbsd/src/blob/1b1dd04c9634112eb763374379af99a68ace4328/sys/sys/socket.h#L566
+    .openbsd => struct {
+        pub const RIGHTS = 0x01;
+        pub const TIMESTAMP = 0x04;
+    },
+    // https://github.com/apple/darwin-xnu/blob/2ff845c2e033bd0ff64b5b6aa6063a1f8f65aa32/bsd/sys/socket.h#L1114
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
+        pub const RIGHTS = 1;
+        pub const TIMESTAMP = 2;
+        pub const CREDS = 3;
+        pub const TIMESTAMP_MONOTONIC = 4;
+    },
+    else => void,
+};
+
 pub const IFNAMESIZE = switch (native_os) {
     .linux => linux.IFNAMESIZE,
     .emscripten => emscripten.IFNAMESIZE,
     .windows => 30,
     // https://github.com/SerenityOS/serenity/blob/9882848e0bf783dfc8e8a6d887a848d70d9c58f4/Kernel/API/POSIX/net/if.h#L50
-    .openbsd, .dragonfly, .netbsd, .freebsd, .macos, .ios, .tvos, .watchos, .visionos, .serenity => 16,
-    .solaris, .illumos => 32,
-    else => void,
+    .openbsd, .dragonfly, .netbsd, .freebsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .serenity => 16,
+    .illumos => 32,
+    else => {},
 };
 
 pub const stack_t = switch (native_os) {
@@ -6763,17 +7255,19 @@ pub const stack_t = switch (native_os) {
 };
 pub const time_t = switch (native_os) {
     .linux => linux.time_t,
+    .dragonfly, .illumos, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => c_long,
     .emscripten => emscripten.time_t,
-    .haiku, .dragonfly => isize,
+    .freebsd, .haiku => if (native_arch == .x86) c_int else c_longlong,
     // https://github.com/SerenityOS/serenity/blob/b98f537f117b341788023ab82e0c11ca9ae29a57/Kernel/API/POSIX/sys/types.h#L47
-    else => i64,
+    // lib/libc/include/wasm-wasi-musl/__typedef_time_t.h
+    .netbsd, .openbsd, .serenity, .wasi => c_longlong,
+    else => void,
 };
 pub const suseconds_t = switch (native_os) {
+    .dragonfly, .freebsd, .openbsd, .illumos => c_long,
+    .netbsd, .haiku, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => c_int,
     // https://github.com/SerenityOS/serenity/blob/b98f537f117b341788023ab82e0c11ca9ae29a57/Kernel/API/POSIX/sys/types.h#L49
-    .solaris, .illumos, .serenity => i64,
-    .freebsd, .dragonfly => c_long,
-    .netbsd => c_int,
-    .haiku => i32,
+    .serenity, .wasi => c_longlong,
     else => void,
 };
 
@@ -6784,233 +7278,22 @@ pub const timeval = switch (native_os) {
         sec: c_long,
         usec: c_long,
     },
-    .macos, .ios, .tvos, .watchos, .visionos => extern struct {
-        sec: c_long,
-        usec: i32,
-    },
     // https://github.com/SerenityOS/serenity/blob/6b6eca0631c893c5f8cfb8274cdfe18e2d0637c0/Kernel/API/POSIX/sys/time.h#L15-L18
-    .dragonfly, .netbsd, .freebsd, .solaris, .illumos, .serenity => extern struct {
+    .dragonfly, .freebsd, .netbsd, .openbsd, .haiku, .illumos, .serenity, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .wasi => extern struct {
         /// seconds
         sec: time_t,
         /// microseconds
         usec: suseconds_t,
-    },
-    .openbsd => extern struct {
-        sec: time_t,
-        usec: c_long,
     },
     else => void,
 };
 pub const timezone = switch (native_os) {
     .linux => linux.timezone,
     .emscripten => emscripten.timezone,
-    .openbsd, .macos, .ios, .tvos, .watchos, .visionos => extern struct {
-        minuteswest: i32,
-        dsttime: i32,
-    },
     // https://github.com/SerenityOS/serenity/blob/ba776390b5878ec0be1a9e595a3471a6cfe0a0cf/Userland/Libraries/LibC/sys/time.h#L19-L22
-    .serenity => extern struct {
+    .dragonfly, .freebsd, .netbsd, .openbsd, .haiku, .illumos, .serenity, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .windows, .wasi => extern struct {
         minuteswest: c_int,
         dsttime: c_int,
-    },
-    else => void,
-};
-
-pub const ucontext_t = switch (native_os) {
-    .linux => linux.ucontext_t, // std.os.linux.ucontext_t is currently glibc-compatible, but it should probably not be.
-    .emscripten => emscripten.ucontext_t,
-    .macos, .ios, .tvos, .watchos, .visionos => extern struct {
-        onstack: c_int,
-        sigmask: sigset_t,
-        stack: stack_t,
-        link: ?*ucontext_t,
-        mcsize: u64,
-        mcontext: *mcontext_t,
-        __mcontext_data: mcontext_t,
-    },
-    .freebsd => extern struct {
-        sigmask: sigset_t,
-        mcontext: mcontext_t,
-        link: ?*ucontext_t,
-        stack: stack_t,
-        flags: c_int,
-        __spare__: [4]c_int,
-    },
-    .solaris, .illumos => extern struct {
-        flags: u64,
-        link: ?*ucontext_t,
-        sigmask: sigset_t,
-        stack: stack_t,
-        mcontext: mcontext_t,
-        brand_data: [3]?*anyopaque,
-        filler: [2]i64,
-    },
-    .netbsd => extern struct {
-        flags: u32,
-        link: ?*ucontext_t,
-        sigmask: sigset_t,
-        stack: stack_t,
-        mcontext: mcontext_t,
-        __pad: [
-            switch (builtin.cpu.arch) {
-                .x86 => 4,
-                .mips, .mipsel, .mips64, .mips64el => 14,
-                .arm, .armeb, .thumb, .thumbeb => 1,
-                .sparc, .sparc64 => if (@sizeOf(usize) == 4) 43 else 8,
-                else => 0,
-            }
-        ]u32,
-    },
-    .dragonfly => extern struct {
-        sigmask: sigset_t,
-        mcontext: mcontext_t,
-        link: ?*ucontext_t,
-        stack: stack_t,
-        cofunc: ?*fn (?*ucontext_t, ?*anyopaque) void,
-        arg: ?*void,
-        _spare: [4]c_int,
-    },
-    // https://github.com/SerenityOS/serenity/blob/87eac0e424cff4a1f941fb704b9362a08654c24d/Kernel/API/POSIX/ucontext.h#L19-L24
-    .haiku, .serenity => extern struct {
-        link: ?*ucontext_t,
-        sigmask: sigset_t,
-        stack: stack_t,
-        mcontext: mcontext_t,
-    },
-    .openbsd => openbsd.ucontext_t,
-    else => void,
-};
-pub const mcontext_t = switch (native_os) {
-    .linux => linux.mcontext_t,
-    .emscripten => emscripten.mcontext_t,
-    .macos, .ios, .tvos, .watchos, .visionos => darwin.mcontext_t,
-    .freebsd => switch (builtin.cpu.arch) {
-        .x86_64 => extern struct {
-            onstack: u64,
-            rdi: u64,
-            rsi: u64,
-            rdx: u64,
-            rcx: u64,
-            r8: u64,
-            r9: u64,
-            rax: u64,
-            rbx: u64,
-            rbp: u64,
-            r10: u64,
-            r11: u64,
-            r12: u64,
-            r13: u64,
-            r14: u64,
-            r15: u64,
-            trapno: u32,
-            fs: u16,
-            gs: u16,
-            addr: u64,
-            flags: u32,
-            es: u16,
-            ds: u16,
-            err: u64,
-            rip: u64,
-            cs: u64,
-            rflags: u64,
-            rsp: u64,
-            ss: u64,
-            len: u64,
-            fpformat: u64,
-            ownedfp: u64,
-            fpstate: [64]u64 align(16),
-            fsbase: u64,
-            gsbase: u64,
-            xfpustate: u64,
-            xfpustate_len: u64,
-            spare: [4]u64,
-        },
-        .aarch64 => extern struct {
-            gpregs: extern struct {
-                x: [30]u64,
-                lr: u64,
-                sp: u64,
-                elr: u64,
-                spsr: u32,
-                _pad: u32,
-            },
-            fpregs: extern struct {
-                q: [32]u128,
-                sr: u32,
-                cr: u32,
-                flags: u32,
-                _pad: u32,
-            },
-            flags: u32,
-            _pad: u32,
-            _spare: [8]u64,
-        },
-        else => struct {},
-    },
-    .solaris, .illumos => extern struct {
-        gregs: [28]u64,
-        fpregs: solaris.fpregset_t,
-    },
-    .netbsd => switch (builtin.cpu.arch) {
-        .aarch64, .aarch64_be => extern struct {
-            gregs: [35]u64,
-            fregs: [528]u8 align(16),
-            spare: [8]u64,
-        },
-        .x86 => extern struct {
-            gregs: [19]u32,
-            fpregs: [161]u32,
-            mc_tlsbase: u32,
-        },
-        .x86_64 => extern struct {
-            gregs: [26]u64,
-            mc_tlsbase: u64,
-            fpregs: [512]u8 align(8),
-        },
-        else => struct {},
-    },
-    .dragonfly => dragonfly.mcontext_t,
-    .haiku => haiku.mcontext_t,
-    .serenity => switch (native_arch) {
-        // https://github.com/SerenityOS/serenity/blob/200e91cd7f1ec5453799a2720d4dc114a59cc289/Kernel/Arch/aarch64/mcontext.h#L15-L19
-        .aarch64 => extern struct {
-            x: [31]u64,
-            sp: u64,
-            pc: u64,
-        },
-        // https://github.com/SerenityOS/serenity/blob/66f8d0f031ef25c409dbb4fecaa454800fecae0f/Kernel/Arch/riscv64/mcontext.h#L15-L18
-        .riscv64 => extern struct {
-            x: [31]u64,
-            pc: u64,
-        },
-        // https://github.com/SerenityOS/serenity/blob/7b9ea3efdec9f86a1042893e8107d0b23aad8727/Kernel/Arch/x86_64/mcontext.h#L15-L40
-        .x86_64 => extern struct {
-            rax: u64,
-            rcx: u64,
-            rdx: u64,
-            rbx: u64,
-            rsp: u64,
-            rbp: u64,
-            rsi: u64,
-            rdi: u64,
-            rip: u64,
-            r8: u64,
-            r9: u64,
-            r10: u64,
-            r11: u64,
-            r12: u64,
-            r13: u64,
-            r14: u64,
-            r15: u64,
-            rflags: u64,
-            cs: u32,
-            ss: u32,
-            ds: u32,
-            es: u32,
-            fs: u32,
-            gs: u32,
-        },
-        else => struct {},
     },
     else => void,
 };
@@ -7022,7 +7305,15 @@ pub const user_desc = switch (native_os) {
 pub const utsname = switch (native_os) {
     .linux => linux.utsname,
     .emscripten => emscripten.utsname,
-    .solaris, .illumos => extern struct {
+    .wasi => extern struct {
+        sysname: [64:0]u8,
+        nodename: [64:0]u8,
+        release: [64:0]u8,
+        version: [64:0]u8,
+        machine: [64:0]u8,
+        domainname: [64:0]u8,
+    },
+    .illumos => extern struct {
         sysname: [256:0]u8,
         nodename: [256:0]u8,
         release: [256:0]u8,
@@ -7030,7 +7321,7 @@ pub const utsname = switch (native_os) {
         machine: [256:0]u8,
         domainname: [256:0]u8,
     },
-    .macos => extern struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
         sysname: [255:0]u8,
         nodename: [255:0]u8,
         release: [255:0]u8,
@@ -7061,8 +7352,8 @@ pub const _errno = switch (native_os) {
     .emscripten => private.__errno_location,
     .wasi, .dragonfly => private.errnoFromThreadLocal,
     .windows => private._errno,
-    .macos, .ios, .tvos, .watchos, .visionos, .freebsd => private.__error,
-    .solaris, .illumos => private.___errno,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .freebsd => private.__error,
+    .illumos => private.___errno,
     .openbsd, .netbsd => private.__errno,
     .haiku => haiku._errnop,
     // https://github.com/SerenityOS/serenity/blob/a353ceecf13b6f156a078e32f1ddf1d21366934c/Userland/Libraries/LibC/errno.h#L33
@@ -7075,7 +7366,8 @@ pub const RTLD = switch (native_os) {
         LAZY: bool = false,
         NOW: bool = false,
         NOLOAD: bool = false,
-        _3: u5 = 0,
+        DEEPBIND: bool = false,
+        _4: u4 = 0,
         GLOBAL: bool = false,
         _9: u3 = 0,
         NODELETE: bool = false,
@@ -7108,7 +7400,7 @@ pub const RTLD = switch (native_os) {
         NOLOAD: bool = false,
         _: u18 = 0,
     },
-    .solaris, .illumos => packed struct(u32) {
+    .illumos => packed struct(u32) {
         LAZY: bool = false,
         NOW: bool = false,
         NOLOAD: bool = false,
@@ -7131,7 +7423,7 @@ pub const RTLD = switch (native_os) {
         TRACE: bool = false,
         _: u22 = 0,
     },
-    .macos, .ios, .tvos, .watchos, .visionos => packed struct(u32) {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => packed struct(u32) {
         LAZY: bool = false,
         NOW: bool = false,
         LOCAL: bool = false,
@@ -7150,7 +7442,7 @@ pub const RTLD = switch (native_os) {
         NOW: bool = false,
         GLOBAL: bool = false,
         LOCAL: bool = false,
-        _: std.meta.Int(.unsigned, @bitSizeOf(c_int) - 6) = 0,
+        _: @Int(.unsigned, @bitSizeOf(c_int) - 6) = 0,
     },
     else => void,
 };
@@ -7163,7 +7455,7 @@ pub const dirent = switch (native_os) {
         type: u8,
         name: [256]u8,
     },
-    .macos, .ios, .tvos, .watchos, .visionos => extern struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
         ino: u64,
         seekoff: u64,
         reclen: u16,
@@ -7187,7 +7479,7 @@ pub const dirent = switch (native_os) {
         /// Name of entry.
         name: [255:0]u8,
     },
-    .solaris, .illumos => extern struct {
+    .illumos => extern struct {
         /// Inode number of entry.
         ino: ino_t,
         /// Offset of this entry on disk.
@@ -7236,7 +7528,7 @@ pub const dirent = switch (native_os) {
     else => void,
 };
 pub const MAXNAMLEN = switch (native_os) {
-    .netbsd, .solaris, .illumos => 511,
+    .netbsd, .illumos => 511,
     // https://github.com/SerenityOS/serenity/blob/1262a7d1424d0d2e89d80644409721cbf056ab17/Kernel/API/POSIX/dirent.h#L37
     .haiku, .serenity => NAME_MAX,
     .openbsd => 255,
@@ -7285,9 +7577,10 @@ pub const AI = if (builtin.abi.isAndroid()) packed struct(u32) {
         NUMERICSERV: bool = false,
         _4: u6 = 0,
         ADDRCONFIG: bool = false,
-        _: u21 = 0,
+        SRV: bool = false,
+        _: u20 = 0,
     },
-    .solaris, .illumos => packed struct(u32) {
+    .illumos => packed struct(u32) {
         V4MAPPED: bool = false,
         ALL: bool = false,
         ADDRCONFIG: bool = false,
@@ -7301,13 +7594,13 @@ pub const AI = if (builtin.abi.isAndroid()) packed struct(u32) {
         PASSIVE: bool = false,
         CANONNAME: bool = false,
         NUMERICHOST: bool = false,
-        _3: u1 = 0,
+        EXT: bool = false,
         NUMERICSERV: bool = false,
-        _5: u1 = 0,
+        FQDN: bool = false,
         ADDRCONFIG: bool = false,
         _: u25 = 0,
     },
-    .macos, .ios, .tvos, .watchos, .visionos => packed struct(u32) {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => packed struct(u32) {
         PASSIVE: bool = false,
         CANONNAME: bool = false,
         NUMERICHOST: bool = false,
@@ -7329,7 +7622,7 @@ pub const AI = if (builtin.abi.isAndroid()) packed struct(u32) {
         V4MAPPED: bool = false,
         ALL: bool = false,
         ADDRCONFIG: bool = false,
-        _: std.meta.Int(.unsigned, @bitSizeOf(c_int) - 7) = 0,
+        _: @Int(.unsigned, @bitSizeOf(c_int) - 7) = 0,
     },
     else => void,
 };
@@ -7345,7 +7638,7 @@ pub const NI = switch (native_os) {
         NUMERICSCOPE: bool = false,
         _: u23 = 0,
     },
-    .solaris, .illumos => packed struct(u32) {
+    .illumos => packed struct(u32) {
         NOFQDN: bool = false,
         NUMERICHOST: bool = false,
         NAMEREQD: bool = false,
@@ -7362,7 +7655,44 @@ pub const NI = switch (native_os) {
         NAMEREQD: bool = false,
         NOFQDN: bool = false,
         DGRAM: bool = false,
-        _: std.meta.Int(.unsigned, @bitSizeOf(c_int) - 5) = 0,
+        _: @Int(.unsigned, @bitSizeOf(c_int) - 5) = 0,
+    },
+    .freebsd, .haiku => packed struct(u32) {
+        NOFQDN: bool = false,
+        NUMERICHOST: bool = false,
+        NAMEREQD: bool = false,
+        NUMERICSERV: bool = false,
+        DGRAM: bool = false,
+        NUMERICSCOPE: bool = false,
+        _: u26 = 0,
+    },
+    .dragonfly, .netbsd => packed struct(u32) {
+        NOFQDN: bool = false,
+        NUMERICHOST: bool = false,
+        NAMEREQD: bool = false,
+        NUMERICSERV: bool = false,
+        DGRAM: bool = false,
+        _5: u1 = 0,
+        NUMERICSCOPE: bool = false,
+        _: u25 = 0,
+    },
+    .openbsd => packed struct(u32) {
+        NUMERICHOST: bool = false,
+        NUMERICSERV: bool = false,
+        NOFQDN: bool = false,
+        NAMEREQD: bool = false,
+        DGRAM: bool = false,
+        _: u27 = 0,
+    },
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => packed struct(u32) {
+        NOFQDN: bool = false,
+        NUMERICHOST: bool = false,
+        NAMEREQD: bool = false,
+        NUMERICSERV: bool = false,
+        DGRAM: bool = false,
+        _5: u3 = 0,
+        NUMERICSCOPE: bool = false,
+        _: u23 = 0,
     },
     else => void,
 };
@@ -7424,7 +7754,7 @@ pub const EAI = if (builtin.abi.isAndroid()) enum(c_int) {
 
         _,
     },
-    .haiku, .dragonfly, .netbsd, .freebsd, .macos, .ios, .tvos, .watchos, .visionos => enum(c_int) {
+    .haiku, .dragonfly, .netbsd, .freebsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => enum(c_int) {
         /// address family for hostname not supported
         ADDRFAMILY = 1,
         /// temporary failure in name resolution
@@ -7455,7 +7785,7 @@ pub const EAI = if (builtin.abi.isAndroid()) enum(c_int) {
         OVERFLOW = 14,
         _,
     },
-    .solaris, .illumos => enum(c_int) {
+    .illumos => enum(c_int) {
         /// address family for hostname not supported
         ADDRFAMILY = 1,
         /// name could not be resolved at this time
@@ -7538,166 +7868,6 @@ pub const EAI = if (builtin.abi.isAndroid()) enum(c_int) {
 pub const dl_iterate_phdr_callback = *const fn (info: *dl_phdr_info, size: usize, data: ?*anyopaque) callconv(.c) c_int;
 
 pub const Stat = switch (native_os) {
-    .linux => switch (native_arch) {
-        .sparc64 => extern struct {
-            dev: u64,
-            __pad1: u16,
-            ino: ino_t,
-            mode: u32,
-            nlink: u32,
-
-            uid: u32,
-            gid: u32,
-            rdev: u64,
-            __pad2: u16,
-
-            size: off_t,
-            blksize: isize,
-            blocks: i64,
-
-            atim: timespec,
-            mtim: timespec,
-            ctim: timespec,
-            __reserved: [2]usize,
-
-            pub fn atime(self: @This()) timespec {
-                return self.atim;
-            }
-
-            pub fn mtime(self: @This()) timespec {
-                return self.mtim;
-            }
-
-            pub fn ctime(self: @This()) timespec {
-                return self.ctim;
-            }
-        },
-        .mips, .mipsel => if (builtin.target.abi.isMusl()) extern struct {
-            dev: dev_t,
-            __pad0: [2]i32,
-            ino: ino_t,
-            mode: mode_t,
-            nlink: nlink_t,
-            uid: uid_t,
-            gid: gid_t,
-            rdev: dev_t,
-            __pad1: [2]i32,
-            size: off_t,
-            atim: timespec,
-            mtim: timespec,
-            ctim: timespec,
-            blksize: blksize_t,
-            __pad3: i32,
-            blocks: blkcnt_t,
-            __pad4: [14]i32,
-
-            pub fn atime(self: @This()) timespec {
-                return self.atim;
-            }
-
-            pub fn mtime(self: @This()) timespec {
-                return self.mtim;
-            }
-
-            pub fn ctime(self: @This()) timespec {
-                return self.ctim;
-            }
-        } else extern struct {
-            dev: u32,
-            __pad0: [3]u32,
-            ino: ino_t,
-            mode: mode_t,
-            nlink: nlink_t,
-            uid: uid_t,
-            gid: gid_t,
-            rdev: u32,
-            __pad1: [3]u32,
-            size: off_t,
-            atim: timespec,
-            mtim: timespec,
-            ctim: timespec,
-            blksize: blksize_t,
-            __pad3: u32,
-            blocks: blkcnt_t,
-            __pad4: [14]u32,
-
-            pub fn atime(self: @This()) timespec {
-                return self.atim;
-            }
-
-            pub fn mtime(self: @This()) timespec {
-                return self.mtim;
-            }
-
-            pub fn ctime(self: @This()) timespec {
-                return self.ctim;
-            }
-        },
-        .mips64, .mips64el => if (builtin.target.abi.isMusl()) extern struct {
-            dev: dev_t,
-            __pad0: [3]i32,
-            ino: ino_t,
-            mode: mode_t,
-            nlink: nlink_t,
-            uid: uid_t,
-            gid: gid_t,
-            rdev: dev_t,
-            __pad1: [2]u32,
-            size: off_t,
-            __pad2: i32,
-            atim: timespec,
-            mtim: timespec,
-            ctim: timespec,
-            blksize: blksize_t,
-            __pad3: u32,
-            blocks: blkcnt_t,
-            __pad4: [14]i32,
-
-            pub fn atime(self: @This()) timespec {
-                return self.atim;
-            }
-
-            pub fn mtime(self: @This()) timespec {
-                return self.mtim;
-            }
-
-            pub fn ctime(self: @This()) timespec {
-                return self.ctim;
-            }
-        } else extern struct {
-            dev: dev_t,
-            __pad0: [3]u32,
-            ino: ino_t,
-            mode: mode_t,
-            nlink: nlink_t,
-            uid: uid_t,
-            gid: gid_t,
-            rdev: dev_t,
-            __pad1: [3]u32,
-            size: off_t,
-            atim: timespec,
-            mtim: timespec,
-            ctim: timespec,
-            blksize: blksize_t,
-            __pad3: u32,
-            blocks: blkcnt_t,
-            __pad4: [14]i32,
-
-            pub fn atime(self: @This()) timespec {
-                return self.atim;
-            }
-
-            pub fn mtime(self: @This()) timespec {
-                return self.mtim;
-            }
-
-            pub fn ctime(self: @This()) timespec {
-                return self.ctim;
-            }
-        },
-
-        else => std.os.linux.Stat, // libc stat is the same as kernel stat.
-    },
     .emscripten => emscripten.Stat,
     .wasi => extern struct {
         // Match wasi-libc's `struct stat` in lib/libc/include/wasm-wasi-musl/__struct_stat.h
@@ -7758,7 +7928,7 @@ pub const Stat = switch (native_os) {
             };
         }
     },
-    .macos, .ios, .tvos, .watchos, .visionos => extern struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
         dev: i32,
         mode: u16,
         nlink: u16,
@@ -7795,7 +7965,7 @@ pub const Stat = switch (native_os) {
         }
     },
     .freebsd => freebsd.Stat,
-    .solaris, .illumos => extern struct {
+    .illumos => extern struct {
         dev: dev_t,
         ino: ino_t,
         mode: mode_t,
@@ -7985,9 +8155,23 @@ pub const Stat = switch (native_os) {
     else => void,
 };
 
+pub const pthread_spinlock_t = switch (native_os) {
+    .openbsd => openbsd.pthread_spinlock_t,
+    .freebsd => extern struct {
+        inner: ?*anyopaque = null,
+    },
+    .netbsd => extern struct {
+        pts_magic: c_uint,
+        spin: pthread_spin_t,
+        pts_flags: c_int,
+    },
+    .windows => isize,
+    else => c_int,
+};
+
 pub const pthread_mutex_t = switch (native_os) {
     .linux => extern struct {
-        data: [data_len]u8 align(@alignOf(usize)) = [_]u8{0} ** data_len,
+        data: [data_len]u8 align(@alignOf(usize)) = @splat(0),
 
         const data_len = switch (native_abi) {
             .musl, .musleabi, .musleabihf => if (@sizeOf(usize) == 8) 40 else 24,
@@ -8001,9 +8185,9 @@ pub const pthread_mutex_t = switch (native_os) {
             else => @compileError("unsupported ABI"),
         };
     },
-    .macos, .ios, .tvos, .watchos, .visionos => extern struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
         sig: c_long = 0x32AAABA7,
-        data: [data_len]u8 = [_]u8{0} ** data_len,
+        data: [data_len]u8 = @splat(0),
 
         const data_len = if (@sizeOf(usize) == 8) 56 else 40;
     },
@@ -8029,7 +8213,7 @@ pub const pthread_mutex_t = switch (native_os) {
         owner: i32 = -1,
         owner_count: i32 = 0,
     },
-    .solaris, .illumos => extern struct {
+    .illumos => extern struct {
         flag1: u16 = 0,
         flag2: u8 = 0,
         ceiling: u8 = 0,
@@ -8039,10 +8223,10 @@ pub const pthread_mutex_t = switch (native_os) {
         data: u64 = 0,
     },
     .fuchsia => extern struct {
-        data: [40]u8 align(@alignOf(usize)) = [_]u8{0} ** 40,
+        data: [40]u8 align(@alignOf(usize)) = @splat(0),
     },
     .emscripten => extern struct {
-        data: [24]u8 align(4) = [_]u8{0} ** 24,
+        data: [24]u8 align(4) = @splat(0),
     },
     // https://github.com/SerenityOS/serenity/blob/b98f537f117b341788023ab82e0c11ca9ae29a57/Kernel/API/POSIX/sys/types.h#L68-L73
     .serenity => extern struct {
@@ -8056,11 +8240,11 @@ pub const pthread_mutex_t = switch (native_os) {
 
 pub const pthread_cond_t = switch (native_os) {
     .linux => extern struct {
-        data: [48]u8 align(@alignOf(usize)) = [_]u8{0} ** 48,
+        data: [48]u8 align(@alignOf(usize)) = @splat(0),
     },
-    .macos, .ios, .tvos, .watchos, .visionos => extern struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
         sig: c_long = 0x3CB0B1BB,
-        data: [data_len]u8 = [_]u8{0} ** data_len,
+        data: [data_len]u8 = @splat(0),
         const data_len = if (@sizeOf(usize) == 8) 40 else 24;
     },
     .freebsd, .dragonfly, .openbsd => extern struct {
@@ -8084,14 +8268,14 @@ pub const pthread_cond_t = switch (native_os) {
         waiter_count: i32 = 0,
         lock: i32 = 0,
     },
-    .solaris, .illumos => extern struct {
-        flag: [4]u8 = [_]u8{0} ** 4,
+    .illumos => extern struct {
+        flag: [4]u8 = @splat(0),
         type: u16 = 0,
         magic: u16 = 0x4356,
         data: u64 = 0,
     },
     .fuchsia, .emscripten => extern struct {
-        data: [48]u8 align(@alignOf(usize)) = [_]u8{0} ** 48,
+        data: [48]u8 align(@alignOf(usize)) = @splat(0),
     },
     // https://github.com/SerenityOS/serenity/blob/b98f537f117b341788023ab82e0c11ca9ae29a57/Kernel/API/POSIX/sys/types.h#L80-L84
     .serenity => extern struct {
@@ -8106,20 +8290,20 @@ pub const pthread_rwlock_t = switch (native_os) {
     .linux => switch (native_abi) {
         .android, .androideabi => switch (@sizeOf(usize)) {
             4 => extern struct {
-                data: [40]u8 align(@alignOf(usize)) = [_]u8{0} ** 40,
+                data: [40]u8 align(@alignOf(usize)) = @splat(0),
             },
             8 => extern struct {
-                data: [56]u8 align(@alignOf(usize)) = [_]u8{0} ** 56,
+                data: [56]u8 align(@alignOf(usize)) = @splat(0),
             },
             else => @compileError("impossible pointer size"),
         },
         else => extern struct {
-            data: [56]u8 align(@alignOf(usize)) = [_]u8{0} ** 56,
+            data: [56]u8 align(@alignOf(usize)) = @splat(0),
         },
     },
-    .macos, .ios, .tvos, .watchos, .visionos => extern struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
         sig: c_long = 0x2DA8B3B4,
-        data: [192]u8 = [_]u8{0} ** 192,
+        data: [192]u8 = @splat(0),
     },
     .freebsd, .dragonfly, .openbsd => extern struct {
         ptr: ?*anyopaque = null,
@@ -8143,7 +8327,7 @@ pub const pthread_rwlock_t = switch (native_os) {
         owner: ?pthread_t = null,
         private: ?*anyopaque = null,
     },
-    .solaris, .illumos => extern struct {
+    .illumos => extern struct {
         readers: i32 = 0,
         type: u16 = 0,
         magic: u16 = 0x5257,
@@ -8152,10 +8336,10 @@ pub const pthread_rwlock_t = switch (native_os) {
         writercv: pthread_cond_t = .{},
     },
     .fuchsia => extern struct {
-        size: [56]u8 align(@alignOf(usize)) = [_]u8{0} ** 56,
+        size: [56]u8 align(@alignOf(usize)) = @splat(0),
     },
     .emscripten => extern struct {
-        size: [32]u8 align(4) = [_]u8{0} ** 32,
+        size: [32]u8 align(4) = @splat(0),
     },
     // https://github.com/SerenityOS/serenity/blob/b98f537f117b341788023ab82e0c11ca9ae29a57/Kernel/API/POSIX/sys/types.h#L86
     .serenity => extern struct {
@@ -8169,7 +8353,7 @@ pub const pthread_attr_t = switch (native_os) {
         __size: [56]u8,
         __align: c_long,
     },
-    .macos, .ios, .tvos, .watchos, .visionos => extern struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
         __sig: c_long,
         __opaque: [56]u8,
     },
@@ -8177,7 +8361,7 @@ pub const pthread_attr_t = switch (native_os) {
     .freebsd, .openbsd, .serenity => extern struct {
         inner: ?*anyopaque = null,
     },
-    .solaris, .illumos => extern struct {
+    .illumos => extern struct {
         mutexattr: ?*anyopaque = null,
     },
     .netbsd => extern struct {
@@ -8197,9 +8381,9 @@ pub const pthread_attr_t = switch (native_os) {
 
 pub const pthread_key_t = switch (native_os) {
     .linux, .emscripten => c_uint,
-    .macos, .ios, .tvos, .watchos, .visionos => c_ulong,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => c_ulong,
     // https://github.com/SerenityOS/serenity/blob/b98f537f117b341788023ab82e0c11ca9ae29a57/Kernel/API/POSIX/sys/types.h#L65
-    .openbsd, .solaris, .illumos, .serenity => c_int,
+    .openbsd, .illumos, .serenity => c_int,
     else => void,
 };
 
@@ -8230,7 +8414,7 @@ pub const sem_t = switch (native_os) {
     .linux, .emscripten => extern struct {
         __size: [4 * @sizeOf(usize)]u8 align(@alignOf(usize)),
     },
-    .macos, .ios, .tvos, .watchos, .visionos => c_int,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => c_int,
     .freebsd => extern struct {
         _magic: u32,
         _kern: extern struct {
@@ -8239,12 +8423,12 @@ pub const sem_t = switch (native_os) {
         },
         _padding: u32,
     },
-    .solaris, .illumos => extern struct {
+    .illumos => extern struct {
         count: u32 = 0,
         type: u16 = 0,
         magic: u16 = 0x534d,
-        __pad1: [3]u64 = [_]u64{0} ** 3,
-        __pad2: [2]u64 = [_]u64{0} ** 2,
+        __pad1: [3]u64 = @splat(0),
+        __pad2: [2]u64 = @splat(0),
     },
     .openbsd, .netbsd, .dragonfly => ?*opaque {},
     .haiku => extern struct {
@@ -8274,7 +8458,7 @@ pub const Kevent = switch (native_os) {
         data: i64,
         udata: usize,
     },
-    .macos, .ios, .tvos, .watchos, .visionos => extern struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
         ident: usize,
         filter: i16,
         flags: u16,
@@ -8308,7 +8492,7 @@ pub const Kevent = switch (native_os) {
         /// Opaque user data identifier.
         udata: usize,
         /// Future extensions.
-        _ext: [4]u64 = [_]u64{0} ** 4,
+        _ext: [4]u64 = @splat(0),
     },
     .dragonfly => extern struct {
         ident: usize,
@@ -8330,12 +8514,12 @@ pub const Kevent = switch (native_os) {
 };
 
 pub const port_t = switch (native_os) {
-    .solaris, .illumos => c_int,
+    .illumos => c_int,
     else => void,
 };
 
 pub const port_event = switch (native_os) {
-    .solaris, .illumos => extern struct {
+    .illumos => extern struct {
         events: u32,
         /// Event source.
         source: u16,
@@ -8354,7 +8538,7 @@ pub const AT = switch (native_os) {
         /// Remove directory instead of unlinking file
         pub const REMOVEDIR = 0x200;
     },
-    .macos, .ios, .tvos, .watchos, .visionos => struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
         pub const FDCWD = -2;
         /// Use effective ids in access check
         pub const EACCESS = 0x0010;
@@ -8423,7 +8607,7 @@ pub const AT = switch (native_os) {
         pub const REMOVEDIR = 0x04;
         pub const EACCESS = 0x08;
     },
-    .solaris, .illumos => struct {
+    .illumos => struct {
         /// Magic value that specify the use of the current working directory
         /// to determine the target of relative file paths in the openat() and
         /// similar syscalls.
@@ -8495,6 +8679,7 @@ pub const O = switch (native_os) {
         CLOEXEC: bool = false,
         SYNC: bool = false,
         PATH: bool = false,
+        /// This is typically invalid without also setting `DIRECTORY`.
         TMPFILE: bool = false,
         _: u9 = 0,
     },
@@ -8520,7 +8705,7 @@ pub const O = switch (native_os) {
         // ignored in C code.  Thus no mapping in Zig.
         _: u3 = 0,
     },
-    .solaris, .illumos => packed struct(u32) {
+    .illumos => packed struct(u32) {
         ACCMODE: std.posix.ACCMODE = .RDONLY,
         NDELAY: bool = false,
         APPEND: bool = false,
@@ -8609,7 +8794,7 @@ pub const O = switch (native_os) {
         DIRECTORY: bool = false,
         _: u10 = 0,
     },
-    .macos, .ios, .tvos, .watchos, .visionos => packed struct(u32) {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => packed struct(u32) {
         ACCMODE: std.posix.ACCMODE = .RDONLY,
         NONBLOCK: bool = false,
         APPEND: bool = false,
@@ -8621,7 +8806,8 @@ pub const O = switch (native_os) {
         CREAT: bool = false,
         TRUNC: bool = false,
         EXCL: bool = false,
-        _12: u3 = 0,
+        RESOLVE_BENEATH: bool = false,
+        _13: u2 = 0,
         EVTONLY: bool = false,
         _16: u1 = 0,
         NOCTTY: bool = false,
@@ -8674,17 +8860,21 @@ pub const O = switch (native_os) {
         CREAT: bool = false,
         TRUNC: bool = false,
         EXCL: bool = false,
-        DSYNC: bool = false,
-        _13: u2 = 0,
+        _12: u3 = 0,
         NOCTTY: bool = false,
         DIRECT: bool = false,
         DIRECTORY: bool = false,
-        NOATIME: bool = false,
-        _19: u1 = 0,
+        EXEC: bool = false,
+        TTY_INIT: bool = false,
         CLOEXEC: bool = false,
+        VERIFY: bool = false,
         PATH: bool = false,
-        TMPFILE: bool = false,
-        _: u9 = 0,
+        RESOLVE_BENEATH: bool = false,
+        DSYNC: bool = false,
+        EMPTY_PATH: bool = false,
+        XATTR: bool = false,
+        CLOFORK: bool = false,
+        _28: u4 = 0,
     },
     // https://github.com/SerenityOS/serenity/blob/2808b0376406a40e31293bb3bcb9170374e90506/Kernel/API/POSIX/fcntl.h#L28-L43
     .serenity => packed struct(c_int) {
@@ -8701,8 +8891,13 @@ pub const O = switch (native_os) {
         CLOEXEC: bool = false,
         DIRECT: bool = false,
         SYNC: bool = false,
-        _: std.meta.Int(.unsigned, @bitSizeOf(c_int) - 14) = 0,
+        _: @Int(.unsigned, @bitSizeOf(c_int) - 14) = 0,
     },
+    else => void,
+};
+
+pub const EXECVEAT = switch (native_os) {
+    .linux => linux.EXECVEAT,
     else => void,
 };
 
@@ -8731,7 +8926,7 @@ pub const MAP = switch (native_os) {
         FIXED_NOREPLACE: bool = false,
         _: u11 = 0,
     },
-    .solaris, .illumos => packed struct(u32) {
+    .illumos => packed struct(u32) {
         TYPE: enum(u4) {
             SHARED = 0x01,
             PRIVATE = 0x02,
@@ -8788,7 +8983,7 @@ pub const MAP = switch (native_os) {
         NORESERVE: bool = false,
         _: u27 = 0,
     },
-    .macos, .ios, .tvos, .watchos, .visionos => packed struct(u32) {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => packed struct(u32) {
         TYPE: enum(u4) {
             SHARED = 0x01,
             PRIVATE = 0x02,
@@ -8855,7 +9050,7 @@ pub const MAP = switch (native_os) {
         RANDOMIZED: bool = false,
         PURGEABLE: bool = false,
         FIXED_NOREPLACE: bool = false,
-        _: std.meta.Int(.unsigned, @bitSizeOf(c_int) - 11) = 0,
+        _: @Int(.unsigned, @bitSizeOf(c_int) - 11) = 0,
     },
     else => void,
 };
@@ -8873,7 +9068,7 @@ pub const cc_t = u8;
 /// Indices into the `cc` array in the `termios` struct.
 pub const V = switch (native_os) {
     .linux => linux.V,
-    .macos, .ios, .tvos, .watchos, .visionos, .netbsd, .openbsd => enum {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .netbsd, .openbsd => enum {
         EOF,
         EOL,
         EOL2,
@@ -8928,7 +9123,7 @@ pub const V = switch (native_os) {
         STOP,
         SUSP,
     },
-    .solaris, .illumos => enum {
+    .illumos => enum {
         INTR,
         QUIT,
         ERASE,
@@ -8992,10 +9187,16 @@ pub const V = switch (native_os) {
 };
 
 pub const NCCS = switch (native_os) {
-    .linux => linux.NCCS,
-    .macos, .ios, .tvos, .watchos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => 20,
+    .linux => if (native_abi.isGnu())
+        32
+    else if (native_abi.isMusl())
+        if (native_arch.isPowerpc()) 19 else 32
+    else
+        linux.NCCS,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly => 20,
     .haiku => 11,
-    .solaris, .illumos => 19,
+    .hurd => 20,
+    .illumos => 19,
     // https://github.com/SerenityOS/serenity/blob/d277cdfd4c7ed21d5248a83217ae03b9f890c3c8/Kernel/API/POSIX/termios.h#L15
     .emscripten, .wasi, .serenity => 32,
     else => void,
@@ -9003,7 +9204,7 @@ pub const NCCS = switch (native_os) {
 
 pub const termios = switch (native_os) {
     .linux => linux.termios,
-    .macos, .ios, .tvos, .watchos, .visionos => extern struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
         iflag: tc_iflag_t,
         oflag: tc_oflag_t,
         cflag: tc_cflag_t,
@@ -9032,7 +9233,7 @@ pub const termios = switch (native_os) {
         ospeed: speed_t,
         cc: [NCCS]cc_t,
     },
-    .solaris, .illumos => extern struct {
+    .illumos => extern struct {
         iflag: tc_iflag_t,
         oflag: tc_oflag_t,
         cflag: tc_cflag_t,
@@ -9054,7 +9255,7 @@ pub const termios = switch (native_os) {
 
 pub const tc_iflag_t = switch (native_os) {
     .linux => linux.tc_iflag_t,
-    .macos, .ios, .tvos, .watchos, .visionos => packed struct(u64) {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => packed struct(u64) {
         IGNBRK: bool = false,
         BRKINT: bool = false,
         IGNPAR: bool = false,
@@ -9122,7 +9323,7 @@ pub const tc_iflag_t = switch (native_os) {
         IXOFF: bool = false,
         _: u19 = 0,
     },
-    .solaris, .illumos => packed struct(u32) {
+    .illumos => packed struct(u32) {
         IGNBRK: bool = false,
         BRKINT: bool = false,
         IGNPAR: bool = false,
@@ -9165,7 +9366,7 @@ pub const tc_iflag_t = switch (native_os) {
 
 pub const tc_oflag_t = switch (native_os) {
     .linux => linux.tc_oflag_t,
-    .macos, .ios, .tvos, .watchos, .visionos => packed struct(u64) {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => packed struct(u64) {
         OPOST: bool = false,
         ONLCR: bool = false,
         OXTABS: bool = false,
@@ -9215,7 +9416,7 @@ pub const tc_oflag_t = switch (native_os) {
         ONLRET: bool = false,
         _: u25 = 0,
     },
-    .solaris, .illumos => packed struct(u32) {
+    .illumos => packed struct(u32) {
         OPOST: bool = false,
         OLCUC: bool = false,
         ONLCR: bool = false,
@@ -9263,7 +9464,7 @@ pub const CSIZE = switch (native_os) {
 
 pub const tc_cflag_t = switch (native_os) {
     .linux => linux.tc_cflag_t,
-    .macos, .ios, .tvos, .watchos, .visionos => packed struct(u64) {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => packed struct(u64) {
         CIGNORE: bool = false,
         _1: u5 = 0,
         CSTOPB: bool = false,
@@ -9362,7 +9563,7 @@ pub const tc_cflag_t = switch (native_os) {
         RTSFLOW: bool = false,
         _: u17 = 0,
     },
-    .solaris, .illumos => packed struct(u32) {
+    .illumos => packed struct(u32) {
         _0: u4 = 0,
         CSIZE: CSIZE = .CS5,
         CSTOPB: bool = false,
@@ -9412,7 +9613,7 @@ pub const tc_cflag_t = switch (native_os) {
 
 pub const tc_lflag_t = switch (native_os) {
     .linux => linux.tc_lflag_t,
-    .macos, .ios, .tvos, .watchos, .visionos => packed struct(u64) {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => packed struct(u64) {
         ECHOKE: bool = false,
         ECHOE: bool = false,
         ECHOK: bool = false,
@@ -9500,7 +9701,7 @@ pub const tc_lflag_t = switch (native_os) {
         PENDIN: bool = false,
         _: u17 = 0,
     },
-    .solaris, .illumos => packed struct(u32) {
+    .illumos => packed struct(u32) {
         ISIG: bool = false,
         ICANON: bool = false,
         XCASE: bool = false,
@@ -9548,8 +9749,8 @@ pub const tc_lflag_t = switch (native_os) {
         ECHOPRT: bool = false,
         ECHOKE: bool = false,
         FLUSHO: bool = false,
+        _13: u1 = 0,
         PENDIN: bool = false,
-        _14: u6 = 0,
         IEXTEN: bool = false,
         EXTPROC: bool = false,
         _: u15 = 0,
@@ -9559,7 +9760,7 @@ pub const tc_lflag_t = switch (native_os) {
 
 pub const speed_t = switch (native_os) {
     .linux => linux.speed_t,
-    .macos, .ios, .tvos, .watchos, .visionos, .openbsd => enum(u64) {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .openbsd => enum(u64) {
         B0 = 0,
         B50 = 50,
         B75 = 75,
@@ -9668,7 +9869,7 @@ pub const speed_t = switch (native_os) {
         B230400 = 0x12,
         B31250 = 0x13,
     },
-    .solaris, .illumos => enum(c_uint) {
+    .illumos => enum(c_uint) {
         B0 = 0,
         B50 = 1,
         B75 = 2,
@@ -9754,21 +9955,22 @@ pub const NSIG = switch (native_os) {
     .windows => 23,
     .haiku => 65,
     .netbsd, .freebsd => 32,
-    .macos => darwin.NSIG,
-    .solaris, .illumos => 75,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => darwin.NSIG,
+    .illumos => 75,
     // https://github.com/SerenityOS/serenity/blob/046c23f567a17758d762a33bdf04bacbfd088f9f/Kernel/API/POSIX/signal_numbers.h#L42
     .openbsd, .serenity => 33,
+    .dragonfly => 64,
     else => {},
 };
 
 pub const MINSIGSTKSZ = switch (native_os) {
-    .macos, .ios, .tvos, .watchos, .visionos => 32768,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => 32768,
     .freebsd => switch (builtin.cpu.arch) {
-        .x86, .x86_64 => 2048,
-        .arm, .aarch64 => 4096,
+        .powerpc64, .powerpc64le, .x86, .x86_64 => 2048,
+        .arm, .aarch64, .riscv64 => 4096,
         else => @compileError("unsupported arch"),
     },
-    .solaris, .illumos => 2048,
+    .illumos => 2048,
     .haiku, .netbsd => 8192,
     .openbsd => 1 << openbsd.MAX_PAGE_SHIFT,
     // https://github.com/SerenityOS/serenity/blob/ec492a1a0819e6239ea44156825c4ee7234ca3db/Kernel/API/POSIX/signal.h#L58
@@ -9776,9 +9978,9 @@ pub const MINSIGSTKSZ = switch (native_os) {
     else => {},
 };
 pub const SIGSTKSZ = switch (native_os) {
-    .macos, .ios, .tvos, .watchos, .visionos => 131072,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => 131072,
     .netbsd, .freebsd => MINSIGSTKSZ + 32768,
-    .solaris, .illumos => 8192,
+    .illumos => 8192,
     .haiku => 16384,
     .openbsd => MINSIGSTKSZ + (1 << openbsd.MAX_PAGE_SHIFT) * 4,
     // https://github.com/SerenityOS/serenity/blob/ec492a1a0819e6239ea44156825c4ee7234ca3db/Kernel/API/POSIX/signal.h#L59
@@ -9787,12 +9989,12 @@ pub const SIGSTKSZ = switch (native_os) {
 };
 pub const SS = switch (native_os) {
     .linux => linux.SS,
-    .openbsd, .macos, .ios, .tvos, .watchos, .visionos, .netbsd, .freebsd => struct {
+    .openbsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .netbsd, .freebsd => struct {
         pub const ONSTACK = 1;
         pub const DISABLE = 4;
     },
     // https://github.com/SerenityOS/serenity/blob/ec492a1a0819e6239ea44156825c4ee7234ca3db/Kernel/API/POSIX/signal.h#L54-L55
-    .haiku, .solaris, .illumos, .serenity => struct {
+    .haiku, .illumos, .serenity => struct {
         pub const ONSTACK = 0x1;
         pub const DISABLE = 0x2;
     },
@@ -9800,7 +10002,8 @@ pub const SS = switch (native_os) {
 };
 
 pub const EV = switch (native_os) {
-    .macos, .ios, .tvos, .watchos, .visionos => struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
+        // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/event.h
         /// add event to kq (implies enable)
         pub const ADD = 0x0001;
         /// delete event from kq
@@ -9836,11 +10039,14 @@ pub const EV = switch (native_os) {
         pub const FLAG0 = 0x1000;
         /// filter-specific flag
         pub const FLAG1 = 0x2000;
-        /// EOF detected
+        /// EOF detected (return value)
         pub const EOF = 0x8000;
-        /// error, data contains errno
+        /// error, data contains errno (return value)
         pub const ERROR = 0x4000;
+        /// use poll(2) semantics for EVFILT.READ
         pub const POLL = FLAG0;
+        /// on input, filter should actively return in the presence of OOB on the descriptor
+        /// on output, indicates the presence of OOB data on the descriptor
         pub const OOBAND = FLAG1;
     },
     .dragonfly => struct {
@@ -9871,15 +10077,19 @@ pub const EV = switch (native_os) {
         pub const ONESHOT = 0x0010;
         /// clear event state after reporting
         pub const CLEAR = 0x0020;
-        /// force immediate event output
-        /// ... with or without ERROR
-        /// ... use KEVENT_FLAG_ERROR_EVENTS
-        ///     on syscalls supporting flags
+        /// force EV_ERROR on success, data=0
         pub const RECEIPT = 0x0040;
         /// disable event after reporting
         pub const DISPATCH = 0x0080;
+        /// filter-specific flag
+        pub const FLAG1 = 0x2000;
+        /// error, data contains errno
+        pub const ERROR = 0x4000;
+        /// EOF detected
+        pub const EOF = 0x8000;
     },
     .freebsd => struct {
+        // https://cgit.freebsd.org/src/tree/sys/sys/event.h
         /// add event to kq (implies enable)
         pub const ADD = 0x0001;
         /// delete event from kq
@@ -9888,12 +10098,14 @@ pub const EV = switch (native_os) {
         pub const ENABLE = 0x0004;
         /// disable event (not reported)
         pub const DISABLE = 0x0008;
+        /// enable _ONESHOT and force trigger
+        pub const FORCEONESHOT = 0x0100;
+        /// do not update the udata field
+        pub const KEEPUDATA = 0x0200;
         /// only report one occurrence
         pub const ONESHOT = 0x0010;
         /// clear event state after reporting
         pub const CLEAR = 0x0020;
-        /// error, event data contains errno
-        pub const ERROR = 0x4000;
         /// force immediate event output
         /// ... with or without ERROR
         /// ... use KEVENT_FLAG_ERROR_EVENTS
@@ -9901,6 +10113,18 @@ pub const EV = switch (native_os) {
         pub const RECEIPT = 0x0040;
         /// disable event after reporting
         pub const DISPATCH = 0x0080;
+        /// reserved by system
+        pub const SYSFLAGS = 0xF000;
+        /// note should be dropped
+        pub const DROP = 0x1000;
+        /// filter-specific flag 1
+        pub const FLAG1 = 0x2000;
+        /// filter-specific flag 2
+        pub const FLAG2 = 0x4000;
+        /// EOF detected (return value)
+        pub const EOF = 0x8000;
+        /// error, event data contains errno (return value)
+        pub const ERROR = 0x4000;
     },
     .openbsd => struct {
         pub const ADD = 0x0001;
@@ -9940,7 +10164,7 @@ pub const EV = switch (native_os) {
 };
 
 pub const EVFILT = switch (native_os) {
-    .macos, .ios, .tvos, .watchos, .visionos => struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
         pub const READ = -1;
         pub const WRITE = -2;
         /// attached to aio requests
@@ -10019,9 +10243,12 @@ pub const EVFILT = switch (native_os) {
         /// Filesystem events
         pub const FS = 7;
         /// User events
-        pub const USER = 1;
+        pub const USER = 8;
+        /// Empty filter
+        pub const EMPTY = 9;
     },
     .freebsd => struct {
+        // https://cgit.freebsd.org/src/tree/sys/sys/event.h
         pub const READ = -1;
         pub const WRITE = -2;
         /// attached to aio requests
@@ -10038,12 +10265,18 @@ pub const EVFILT = switch (native_os) {
         pub const PROCDESC = -8;
         /// Filesystem events
         pub const FS = -9;
+        /// attached to lio requests
         pub const LIO = -10;
         /// User events
         pub const USER = -11;
         /// Sendfile events
         pub const SENDFILE = -12;
+        /// empty send socket buf
         pub const EMPTY = -13;
+        /// attached to struct prison
+        pub const JAIL = -14;
+        /// attached to jail descriptors
+        pub const JAILDESC = -15;
     },
     .openbsd => struct {
         pub const READ = -1;
@@ -10061,7 +10294,8 @@ pub const EVFILT = switch (native_os) {
 };
 
 pub const NOTE = switch (native_os) {
-    .macos, .ios, .tvos, .watchos, .visionos => struct {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => struct {
+        // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/event.h
         /// On input, TRIGGER causes the event to be triggered for output.
         pub const TRIGGER = 0x01000000;
         /// ignore input fflags
@@ -10093,7 +10327,7 @@ pub const NOTE = switch (native_os) {
         pub const RENAME = 0x00000020;
         /// vnode access was revoked
         pub const REVOKE = 0x00000040;
-        /// No specific vnode event: to test for EVFILT_READ      activation
+        /// No specific vnode event: to test for EVFILT_READ activation
         pub const NONE = 0x00000080;
         /// vnode was unlocked by flock(2)
         pub const FUNLOCK = 0x00000100;
@@ -10105,7 +10339,7 @@ pub const NOTE = switch (native_os) {
         pub const EXEC = 0x20000000;
         /// shared with EVFILT_SIGNAL
         pub const SIGNAL = 0x08000000;
-        /// exit status to be returned, valid for child       process only
+        /// exit status to be returned, valid for child process only
         pub const EXITSTATUS = 0x04000000;
         /// provide details on reasons for exit
         pub const EXIT_DETAIL = 0x02000000;
@@ -10116,11 +10350,11 @@ pub const NOTE = switch (native_os) {
         pub const EXIT_DECRYPTFAIL = 0x00010000;
         pub const EXIT_MEMORY = 0x00020000;
         pub const EXIT_CSERROR = 0x00040000;
-        /// will react on memory          pressure
+        /// will react on memory pressure
         pub const VM_PRESSURE = 0x80000000;
-        /// will quit on memory       pressure, possibly after cleaning up dirty state
+        /// will quit on memory pressure, possibly after cleaning up dirty state
         pub const VM_PRESSURE_TERMINATE = 0x40000000;
-        /// will quit immediately on      memory pressure
+        /// will quit immediately on memory pressure
         pub const VM_PRESSURE_SUDDEN_TERMINATE = 0x20000000;
         /// there was an error
         pub const VM_ERROR = 0x10000000;
@@ -10138,6 +10372,9 @@ pub const NOTE = switch (native_os) {
         pub const CRITICAL = 0x00000020;
         /// system does maximum timer coalescing
         pub const BACKGROUND = 0x00000040;
+        /// with ABSOLUTE: causes the timer to continue to tick across sleep, still uses gettimeofday epoch
+        /// with MACHTIME and ABSOLUTE: uses mach continuous time epoch
+        /// without ABSOLUTE: continues to tick across sleep
         pub const MACH_CONTINUOUS_TIME = 0x00000080;
         /// data is mach absolute time units
         pub const MACHTIME = 0x00000100;
@@ -10169,8 +10406,19 @@ pub const NOTE = switch (native_os) {
         pub const PCTRLMASK = 4026531840;
     },
     .netbsd => struct {
+        /// ignore input fflags
+        pub const FFNOP = 0x00000000;
+        /// AND fflags
+        pub const FFAND = 0x40000000;
+        /// OR fflags
+        pub const FFOR = 0x80000000;
+        /// copy fflags
+        pub const FFCOPY = 0xc0000000;
+        /// masks for operations
+        pub const FFCTRLMASK = 0xc0000000;
+        pub const FFLAGSMASK = 0x00ffffff;
         /// On input, TRIGGER causes the event to be triggered for output.
-        pub const TRIGGER = 0x08000000;
+        pub const TRIGGER = 0x01000000;
         /// low water mark
         pub const LOWAT = 0x00000001;
         /// vnode was removed
@@ -10187,6 +10435,14 @@ pub const NOTE = switch (native_os) {
         pub const RENAME = 0x00000020;
         /// vnode access was revoked
         pub const REVOKE = 0x00000040;
+        /// vnode was opened
+        pub const OPEN = 0x00000080;
+        /// file closed (no FWRITE)
+        pub const CLOSE = 0x00000100;
+        /// file closed (FWRITE)
+        pub const CLOSE_WRITE = 0x00000200;
+        /// file was read
+        pub const READ = 0x00000400;
         /// process exited
         pub const EXIT = 0x80000000;
         /// process forked
@@ -10196,6 +10452,24 @@ pub const NOTE = switch (native_os) {
         /// mask for signal & exit status
         pub const PDATAMASK = 0x000fffff;
         pub const PCTRLMASK = 0xf0000000;
+        /// follow across forks
+        pub const TRACK = 0x00000001;
+        /// could not track child
+        pub const TRACKERR = 0x00000002;
+        /// am a child process
+        pub const CHILD = 0x00000004;
+        /// shared with EVFILT_SIGNAL
+        pub const SIGNAL = 0x08000000;
+        /// data is milliseconds
+        pub const MSECONDS = 0x00000000;
+        /// data is seconds
+        pub const SECONDS = 0x00000001;
+        /// data is microseconds
+        pub const USECONDS = 0x00000002;
+        /// data is nanoseconds
+        pub const NSECONDS = 0x00000003;
+        /// timeout is absolute
+        pub const ABSTIME = 0x00000010;
     },
     .freebsd => struct {
         /// On input, TRIGGER causes the event to be triggered for output.
@@ -10301,6 +10575,12 @@ pub const FUTEX = switch (native_os) {
     else => void,
 };
 
+pub const MFD = switch (native_os) {
+    .linux => linux.MFD,
+    .freebsd => freebsd.MFD,
+    else => void,
+};
+
 // Unix-like systems
 pub const DIR = opaque {};
 pub extern "c" fn opendir(pathname: [*:0]const u8) ?*DIR;
@@ -10315,7 +10595,7 @@ pub extern "c" fn sigwait(set: ?*sigset_t, sig: ?*c_int) c_int;
 pub extern "c" fn alarm(seconds: c_uint) c_uint;
 
 pub const close = switch (native_os) {
-    .macos, .ios, .tvos, .watchos, .visionos => darwin.@"close$NOCANCEL",
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => darwin.@"close$NOCANCEL",
     else => private.close,
 };
 
@@ -10330,21 +10610,26 @@ pub const clock_gettime = switch (native_os) {
 };
 
 pub const fstat = switch (native_os) {
-    .macos => switch (native_arch) {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => switch (native_arch) {
         .x86_64 => private.@"fstat$INODE64",
         else => private.fstat,
     },
     .netbsd => private.__fstat50,
+    .linux => {},
     else => private.fstat,
 };
 
 pub const fstatat = switch (native_os) {
-    .macos => switch (native_arch) {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => switch (native_arch) {
         .x86_64 => private.@"fstatat$INODE64",
         else => private.fstatat,
     },
+    .linux => {},
     else => private.fstatat,
 };
+
+pub extern "c" fn statx(dirfd: fd_t, path: [*:0]const u8, flags: u32, mask: linux.STATX, buf: *linux.Statx) c_int;
+
 pub extern "c" fn getpwent() ?*passwd;
 pub extern "c" fn endpwent() void;
 pub extern "c" fn setpwent() void;
@@ -10355,13 +10640,13 @@ pub extern "c" fn getpwuid_r(uid: uid_t, pwd: *passwd, buf: [*]u8, buflen: usize
 pub extern "c" fn getgrent() ?*group;
 pub extern "c" fn setgrent() void;
 pub extern "c" fn endgrent() void;
-pub extern "c" fn getgrnam(name: [*:0]const u8) ?*passwd;
+pub extern "c" fn getgrnam(name: [*:0]const u8) ?*group;
 pub extern "c" fn getgrnam_r(name: [*:0]const u8, grp: *group, buf: [*]u8, buflen: usize, result: *?*group) c_int;
 pub extern "c" fn getgrgid(gid: gid_t) ?*group;
 pub extern "c" fn getgrgid_r(gid: gid_t, grp: *group, buf: [*]u8, buflen: usize, result: *?*group) c_int;
 pub extern "c" fn getrlimit64(resource: rlimit_resource, rlim: *rlimit) c_int;
 pub extern "c" fn lseek64(fd: fd_t, offset: i64, whence: c_int) i64;
-pub extern "c" fn mmap64(addr: ?*align(page_size) anyopaque, len: usize, prot: c_uint, flags: c_uint, fd: fd_t, offset: i64) *anyopaque;
+pub extern "c" fn mmap64(addr: ?*align(page_size) anyopaque, len: usize, prot: PROT, flags: MAP, fd: fd_t, offset: i64) *anyopaque;
 pub extern "c" fn open64(path: [*:0]const u8, oflag: O, ...) c_int;
 pub extern "c" fn openat64(fd: c_int, path: [*:0]const u8, oflag: O, ...) c_int;
 pub extern "c" fn pread64(fd: fd_t, buf: [*]u8, nbyte: usize, offset: i64) isize;
@@ -10372,8 +10657,11 @@ pub extern "c" fn sendfile64(out_fd: fd_t, in_fd: fd_t, offset: ?*i64, count: us
 pub extern "c" fn setrlimit64(resource: rlimit_resource, rlim: *const rlimit) c_int;
 
 pub const arc4random_buf = switch (native_os) {
-    .linux => if (builtin.abi.isAndroid()) private.arc4random_buf else {},
-    .dragonfly, .netbsd, .freebsd, .solaris, .openbsd, .macos, .ios, .tvos, .watchos, .visionos => private.arc4random_buf,
+    .linux => if (builtin.abi.isAndroid() or
+        (builtin.abi.isGnu() and versionCheck(.{ .major = 2, .minor = 36, .patch = 0 })))
+        private.arc4random_buf
+    else {},
+    .dragonfly, .netbsd, .freebsd, .illumos, .openbsd, .serenity, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => private.arc4random_buf,
     else => {},
 };
 pub const getentropy = switch (native_os) {
@@ -10418,20 +10706,144 @@ pub extern "c" fn inotify_init1(flags: c_uint) c_int;
 pub extern "c" fn inotify_add_watch(fd: fd_t, pathname: [*:0]const u8, mask: u32) c_int;
 pub extern "c" fn inotify_rm_watch(fd: fd_t, wd: c_int) c_int;
 
-pub extern "c" fn fstat64(fd: fd_t, buf: *Stat) c_int;
-pub extern "c" fn fstatat64(dirfd: fd_t, noalias path: [*:0]const u8, noalias stat_buf: *Stat, flags: u32) c_int;
 pub extern "c" fn fallocate64(fd: fd_t, mode: c_int, offset: off_t, len: off_t) c_int;
 pub extern "c" fn fopen64(noalias filename: [*:0]const u8, noalias modes: [*:0]const u8) ?*FILE;
 pub extern "c" fn ftruncate64(fd: c_int, length: off_t) c_int;
 pub extern "c" fn fallocate(fd: fd_t, mode: c_int, offset: off_t, len: off_t) c_int;
 pub const sendfile = switch (native_os) {
     .freebsd => freebsd.sendfile,
-    .macos, .ios, .tvos, .watchos, .visionos => darwin.sendfile,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => darwin.sendfile,
     .linux => private.sendfile,
     else => {},
 };
-/// See std.elf for constants for this
-pub extern "c" fn getauxval(__type: c_ulong) c_ulong;
+
+pub extern "c" fn getauxval(type: c_ulong) c_ulong;
+pub extern "c" fn elf_aux_info(aux: c_int, buf: *anyopaque, buflen: c_int) c_int;
+
+pub const HWCAP = switch (native_os) {
+    .freebsd => switch (native_arch) {
+        // FreeBSD deliberately matches the Linux ABI for AT_HWCAP...
+        else => std.os.linux.HWCAP,
+        // ... but because Linux went the SYS_riscv_hwprobe route, FreeBSD
+        // defines more bits than Linux does:
+        .riscv64 => struct {
+            pub const ISA_A = 1 << 0;
+            pub const ISA_B = 1 << 1;
+            pub const ISA_C = 1 << 2;
+            pub const ISA_D = 1 << 3;
+            pub const ISA_F = 1 << 5;
+            pub const ISA_H = 1 << 7;
+            pub const ISA_I = 1 << 8;
+            pub const ISA_M = 1 << 12;
+            pub const ISA_V = 1 << 21;
+        },
+    },
+    .illumos => switch (native_arch) {
+        .x86, .x86_64 => struct {
+            pub const FPU = 1 << 0;
+            pub const TSC = 1 << 1;
+            pub const CX8 = 1 << 2;
+            pub const SEP = 1 << 3;
+            pub const AMD_SYSC = 1 << 4;
+            pub const CMOV = 1 << 5;
+            pub const MMX = 1 << 6;
+            pub const AMD_MMX = 1 << 7;
+            pub const AMD_3DNow = 1 << 8;
+            pub const AMD_3DNowx = 1 << 9;
+            pub const FXSR = 1 << 10;
+            pub const SSE = 1 << 11;
+            pub const SSE2 = 1 << 12;
+            pub const PAUSE = 1 << 13;
+            pub const SSE3 = 1 << 14;
+            pub const MON = 1 << 15;
+            pub const CX16 = 1 << 16;
+            pub const AHF = 1 << 17;
+            pub const TSCP = 1 << 18;
+            pub const AMD_SSE4A = 1 << 19;
+            pub const POPCNT = 1 << 20;
+            pub const AMD_LZCNT = 1 << 21;
+            pub const SSSE3 = 1 << 22;
+            pub const SSE4_1 = 1 << 23;
+            pub const SSE4_2 = 1 << 24;
+            pub const MOVBE = 1 << 25;
+            pub const AES = 1 << 26;
+            pub const PCLMULQDQ = 1 << 27;
+            pub const XSAVE = 1 << 28;
+            pub const AVX = 1 << 29;
+            pub const VMX = 1 << 30;
+            pub const AMD_SVM = 1 << 31;
+
+            pub const @"2" = struct {
+                pub const F16C = 1 << 0;
+                pub const RDRAND = 1 << 1;
+                pub const BMI1 = 1 << 2;
+                pub const BMI2 = 1 << 3;
+                pub const FMA = 1 << 4;
+                pub const AVX2 = 1 << 5;
+                pub const ADX = 1 << 6;
+                pub const RDSEED = 1 << 7;
+                pub const AVX512F = 1 << 8;
+                pub const AVX512DQ = 1 << 9;
+                pub const AVX512IFMA = 1 << 10;
+                pub const AVX512PF = 1 << 11;
+                pub const AVX512ER = 1 << 12;
+                pub const AVX512CD = 1 << 13;
+                pub const AVX512BW = 1 << 14;
+                pub const AVX512VL = 1 << 15;
+                pub const AVX512VBMI = 1 << 16;
+                pub const AVX512VPOPCDQ = 1 << 17;
+                pub const AVX512_4NNIW = 1 << 18;
+                pub const AVX512_4FMAPS = 1 << 19;
+                pub const SHA = 1 << 20;
+                pub const FSGSBASE = 1 << 21;
+                pub const CLFLUSHOPT = 1 << 22;
+                pub const CLWB = 1 << 23;
+                pub const MONITORX = 1 << 24;
+                pub const CLZERO = 1 << 25;
+                pub const AVX512_VNNI = 1 << 26;
+                pub const VPCLMULQDQ = 1 << 27;
+                pub const VAES = 1 << 28;
+            };
+        },
+        else => struct {},
+    },
+    .linux => std.os.linux.HWCAP,
+    .openbsd => switch (native_arch) {
+        // Same deal as for FreeBSD.
+        else => std.os.linux.HWCAP,
+        .riscv64 => struct {
+            pub const ISA_A = 1 << 0;
+            pub const ISA_B = 1 << 1;
+            pub const ISA_C = 1 << 2;
+            pub const ISA_D = 1 << 3;
+            pub const ISA_F = 1 << 5;
+            pub const ISA_H = 1 << 7;
+            pub const ISA_I = 1 << 8;
+            pub const ISA_M = 1 << 12;
+            pub const ISA_V = 1 << 21;
+
+            pub const @"2" = struct {
+                pub const ISA_ZBA = 1 << 0;
+                pub const ISA_ZBB = 1 << 1;
+                pub const ISA_ZBC = 1 << 2;
+                pub const ISA_ZBS = 1 << 3;
+                pub const ISA_ZFH = 1 << 4;
+                pub const ISA_ZKT = 1 << 5;
+                pub const ISA_ZVBB = 1 << 6;
+                pub const ISA_ZVBC = 1 << 7;
+                pub const ISA_ZVFH = 1 << 8;
+                pub const ISA_ZVKG = 1 << 9;
+                pub const ISA_ZVKNED = 1 << 10;
+                pub const ISA_ZVKNHA = 1 << 11;
+                pub const ISA_ZVKNHB = 1 << 12;
+                pub const ISA_ZVKSED = 1 << 13;
+                pub const ISA_ZVKSH = 1 << 14;
+                pub const ISA_ZVKT = 1 << 15;
+            };
+        },
+    },
+    else => struct {},
+};
 
 pub extern "c" fn dl_iterate_phdr(callback: dl_iterate_phdr_callback, data: ?*anyopaque) c_int;
 
@@ -10442,7 +10854,7 @@ pub const sigaltstack = switch (native_os) {
 
 pub extern "c" fn memfd_create(name: [*:0]const u8, flags: c_uint) c_int;
 pub const pipe2 = switch (native_os) {
-    .dragonfly, .emscripten, .netbsd, .freebsd, .solaris, .illumos, .openbsd, .linux, .serenity => private.pipe2,
+    .dragonfly, .emscripten, .netbsd, .freebsd, .illumos, .openbsd, .linux, .serenity => private.pipe2,
     else => {},
 };
 pub const copy_file_range = switch (native_os) {
@@ -10467,7 +10879,7 @@ pub extern "c" fn madvise(
 ) c_int;
 
 pub const getdirentries = switch (native_os) {
-    .macos, .ios, .tvos, .watchos, .visionos => private.__getdirentries64,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => private.__getdirentries64,
     else => private.getdirentries,
 };
 
@@ -10486,6 +10898,31 @@ pub const gettimeofday = switch (native_os) {
     else => private.gettimeofday,
 };
 
+pub const mlock = switch (native_os) {
+    .windows, .wasi => {},
+    else => private.mlock,
+};
+
+pub const mlock2 = switch (native_os) {
+    .linux => private.mlock2,
+    else => {},
+};
+
+pub const munlock = switch (native_os) {
+    .windows, .wasi => {},
+    else => private.munlock,
+};
+
+pub const mlockall = switch (native_os) {
+    .linux, .freebsd, .dragonfly, .netbsd, .openbsd, .illumos => private.mlockall,
+    else => {},
+};
+
+pub const munlockall = switch (native_os) {
+    .linux, .freebsd, .dragonfly, .netbsd, .openbsd, .illumos => private.munlockall,
+    else => {},
+};
+
 pub const msync = switch (native_os) {
     .netbsd => private.__msync13,
     else => private.msync,
@@ -10497,7 +10934,7 @@ pub const nanosleep = switch (native_os) {
 };
 
 pub const readdir = switch (native_os) {
-    .macos => switch (native_arch) {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => switch (native_arch) {
         .x86_64 => private.@"readdir$INODE64",
         else => private.readdir,
     },
@@ -10506,7 +10943,7 @@ pub const readdir = switch (native_os) {
 };
 
 pub const realpath = switch (native_os) {
-    .macos, .ios, .tvos, .watchos, .visionos => private.@"realpath$DARWIN_EXTSN",
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => private.@"realpath$DARWIN_EXTSN",
     else => private.realpath,
 };
 
@@ -10521,22 +10958,38 @@ pub const sigaction = switch (native_os) {
 };
 
 /// Zig's version of SIGRTMIN.  Actually a function.
-pub fn sigrtmin() u8 {
-    return switch (native_os) {
-        .freebsd => 65,
-        .netbsd => 33,
-        else => @truncate(@as(c_uint, @bitCast(private.__libc_current_sigrtmin()))),
-    };
-}
+pub const sigrtmin = switch (native_os) {
+    .openbsd => {},
+    else => sigrt_private.sigrtmin,
+};
 
 /// Zig's version of SIGRTMAX.  Actually a function.
-pub fn sigrtmax() u8 {
-    return switch (native_os) {
-        .freebsd => 126,
-        .netbsd => 63,
-        else => @truncate(@as(c_uint, @bitCast(private.__libc_current_sigrtmax()))),
-    };
-}
+pub const sigrtmax = switch (native_os) {
+    .openbsd => {},
+    else => sigrt_private.sigrtmax,
+};
+
+const sigrt_private = struct {
+    pub fn sigrtmin() u8 {
+        return switch (native_os) {
+            .freebsd => 65,
+            .netbsd => 33,
+            .illumos => @truncate(sysconf(@backingInt(_SC.SIGRT_MIN))),
+            .haiku => @truncate(@as(c_uint, @bitCast(private.__signal_get_sigrtmin()))),
+            else => @truncate(@as(c_uint, @bitCast(private.__libc_current_sigrtmin()))),
+        };
+    }
+
+    pub fn sigrtmax() u8 {
+        return switch (native_os) {
+            .freebsd => 126,
+            .netbsd => 63,
+            .illumos => @truncate(sysconf(@backingInt(_SC.SIGRT_MAX))),
+            .haiku => @truncate(@as(c_uint, @bitCast(private.__signal_get_sigrtmax()))),
+            else => @truncate(@as(c_uint, @bitCast(private.__libc_current_sigrtmax()))),
+        };
+    }
+};
 
 pub const sigfillset = switch (native_os) {
     .netbsd => private.__sigfillset14,
@@ -10561,8 +11014,14 @@ pub const socket = switch (native_os) {
     else => private.socket,
 };
 
+pub const socketpair = switch (native_os) {
+    // https://devblogs.microsoft.com/commandline/af_unix-comes-to-windows/#unsupported\unavailable:
+    .windows => {},
+    else => private.socketpair,
+};
+
 pub const stat = switch (native_os) {
-    .macos => switch (native_arch) {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => switch (native_arch) {
         .x86_64 => private.@"stat$INODE64",
         else => private.stat,
     },
@@ -10574,7 +11033,7 @@ pub const _msize = switch (native_os) {
     else => {},
 };
 pub const malloc_size = switch (native_os) {
-    .macos, .ios, .tvos, .watchos, .visionos, .serenity => private.malloc_size,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .serenity => private.malloc_size,
     else => {},
 };
 pub const malloc_usable_size = switch (native_os) {
@@ -10582,16 +11041,16 @@ pub const malloc_usable_size = switch (native_os) {
     else => {},
 };
 pub const posix_memalign = switch (native_os) {
-    .dragonfly, .netbsd, .freebsd, .solaris, .openbsd, .linux, .macos, .ios, .tvos, .watchos, .visionos, .serenity => private.posix_memalign,
+    .dragonfly, .netbsd, .freebsd, .illumos, .openbsd, .linux, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .serenity => private.posix_memalign,
     else => {},
 };
 pub const sysconf = switch (native_os) {
-    .solaris => solaris.sysconf,
+    .illumos => illumos.sysconf,
     else => private.sysconf,
 };
 
 pub const sf_hdtr = switch (native_os) {
-    .freebsd, .macos, .ios, .tvos, .watchos, .visionos => extern struct {
+    .freebsd, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => extern struct {
         headers: ?[*]const iovec_const,
         hdr_cnt: c_int,
         trailers: ?[*]const iovec_const,
@@ -10621,13 +11080,14 @@ pub extern "c" fn fread(noalias ptr: [*]u8, size_of_type: usize, item_count: usi
 pub extern "c" fn printf(format: [*:0]const u8, ...) c_int;
 pub extern "c" fn abort() noreturn;
 pub extern "c" fn exit(code: c_int) noreturn;
+pub extern "c" fn _Exit(code: c_int) noreturn;
 pub extern "c" fn _exit(code: c_int) noreturn;
 pub extern "c" fn isatty(fd: fd_t) c_int;
 pub extern "c" fn lseek(fd: fd_t, offset: off_t, whence: whence_t) off_t;
 pub extern "c" fn open(path: [*:0]const u8, oflag: O, ...) c_int;
 pub extern "c" fn openat(fd: c_int, path: [*:0]const u8, oflag: O, ...) c_int;
 pub extern "c" fn ftruncate(fd: c_int, length: off_t) c_int;
-pub extern "c" fn raise(sig: c_int) c_int;
+pub extern "c" fn raise(sig: SIG) c_int;
 pub extern "c" fn read(fd: fd_t, buf: [*]u8, nbyte: usize) isize;
 pub extern "c" fn readv(fd: c_int, iov: [*]const iovec, iovcnt: c_uint) isize;
 pub extern "c" fn pread(fd: fd_t, buf: [*]u8, nbyte: usize, offset: off_t) isize;
@@ -10636,30 +11096,36 @@ pub extern "c" fn writev(fd: c_int, iov: [*]const iovec_const, iovcnt: c_uint) i
 pub extern "c" fn pwritev(fd: c_int, iov: [*]const iovec_const, iovcnt: c_uint, offset: off_t) isize;
 pub extern "c" fn write(fd: fd_t, buf: [*]const u8, nbyte: usize) isize;
 pub extern "c" fn pwrite(fd: fd_t, buf: [*]const u8, nbyte: usize, offset: off_t) isize;
-pub extern "c" fn mmap(addr: ?*align(page_size) anyopaque, len: usize, prot: c_uint, flags: MAP, fd: fd_t, offset: off_t) *anyopaque;
+pub extern "c" fn mmap(addr: ?*align(page_size) anyopaque, len: usize, prot: PROT, flags: MAP, fd: fd_t, offset: off_t) *anyopaque;
 pub extern "c" fn munmap(addr: *align(page_size) const anyopaque, len: usize) c_int;
 pub extern "c" fn mremap(addr: ?*align(page_size) const anyopaque, old_len: usize, new_len: usize, flags: MREMAP, ...) *anyopaque;
-pub extern "c" fn mprotect(addr: *align(page_size) anyopaque, len: usize, prot: c_uint) c_int;
+pub extern "c" fn mprotect(addr: *align(page_size) anyopaque, len: usize, prot: PROT) c_int;
 pub extern "c" fn link(oldpath: [*:0]const u8, newpath: [*:0]const u8) c_int;
-pub extern "c" fn linkat(oldfd: fd_t, oldpath: [*:0]const u8, newfd: fd_t, newpath: [*:0]const u8, flags: c_int) c_int;
+pub extern "c" fn linkat(oldfd: fd_t, oldpath: [*:0]const u8, newfd: fd_t, newpath: [*:0]const u8, flags: c_uint) c_int;
 pub extern "c" fn unlink(path: [*:0]const u8) c_int;
 pub extern "c" fn unlinkat(dirfd: fd_t, path: [*:0]const u8, flags: c_uint) c_int;
 pub extern "c" fn getcwd(buf: [*]u8, size: usize) ?[*]u8;
 pub extern "c" fn waitpid(pid: pid_t, status: ?*c_int, options: c_int) pid_t;
-pub extern "c" fn wait4(pid: pid_t, status: ?*c_int, options: c_int, ru: ?*rusage) pid_t;
+
+pub const wait4 = switch (native_os) {
+    .netbsd => private.__wait450,
+    else => private.wait4,
+};
+
 pub const fork = switch (native_os) {
     .dragonfly,
     .freebsd,
-    .ios,
     .linux,
+    .driverkit,
+    .ios,
+    .maccatalyst,
     .macos,
+    .tvos,
+    .visionos,
+    .watchos,
     .netbsd,
     .openbsd,
-    .solaris,
     .illumos,
-    .tvos,
-    .watchos,
-    .visionos,
     .haiku,
     .serenity,
     => private.fork,
@@ -10677,6 +11143,7 @@ pub extern "c" fn renameat(olddirfd: fd_t, old: [*:0]const u8, newdirfd: fd_t, n
 pub extern "c" fn chdir(path: [*:0]const u8) c_int;
 pub extern "c" fn fchdir(fd: fd_t) c_int;
 pub extern "c" fn execve(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
+pub extern "c" fn execveat(dirfd: fd_t, path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8, flags: EXECVEAT) c_int;
 pub extern "c" fn dup(fd: fd_t) c_int;
 pub extern "c" fn dup2(old_fd: fd_t, new_fd: fd_t) c_int;
 pub extern "c" fn dup3(old: c_int, new: c_int, flags: c_uint) c_int;
@@ -10686,6 +11153,7 @@ pub extern "c" fn chmod(path: [*:0]const u8, mode: mode_t) c_int;
 pub extern "c" fn fchmod(fd: fd_t, mode: mode_t) c_int;
 pub extern "c" fn fchmodat(fd: fd_t, path: [*:0]const u8, mode: mode_t, flags: c_uint) c_int;
 pub extern "c" fn fchown(fd: fd_t, owner: uid_t, group: gid_t) c_int;
+pub extern "c" fn fchownat(fd: fd_t, path: [*:0]const u8, owner: uid_t, group: gid_t, flags: c_uint) c_int;
 pub extern "c" fn umask(mode: mode_t) mode_t;
 
 pub extern "c" fn rmdir(path: [*:0]const u8) c_int;
@@ -10696,13 +11164,11 @@ pub extern "c" fn sysctlnametomib(name: [*:0]const u8, mibp: ?*c_int, sizep: ?*u
 pub extern "c" fn tcgetattr(fd: fd_t, termios_p: *termios) c_int;
 pub extern "c" fn tcsetattr(fd: fd_t, optional_action: TCSA, termios_p: *const termios) c_int;
 pub extern "c" fn fcntl(fd: fd_t, cmd: c_int, ...) c_int;
-pub extern "c" fn ioctl(fd: fd_t, request: c_int, ...) c_int;
 pub extern "c" fn uname(buf: *utsname) c_int;
 
 pub extern "c" fn gethostname(name: [*]u8, len: usize) c_int;
 pub extern "c" fn shutdown(socket: fd_t, how: c_int) c_int;
 pub extern "c" fn bind(socket: fd_t, address: ?*const sockaddr, address_len: socklen_t) c_int;
-pub extern "c" fn socketpair(domain: c_uint, sock_type: c_uint, protocol: c_uint, sv: *[2]fd_t) c_int;
 pub extern "c" fn listen(sockfd: fd_t, backlog: c_uint) c_int;
 pub extern "c" fn getsockname(sockfd: fd_t, noalias addr: *sockaddr, noalias addrlen: *socklen_t) c_int;
 pub extern "c" fn getpeername(sockfd: fd_t, noalias addr: *sockaddr, noalias addrlen: *socklen_t) c_int;
@@ -10721,6 +11187,7 @@ pub extern "c" fn sendto(
     addrlen: socklen_t,
 ) isize;
 pub extern "c" fn sendmsg(sockfd: fd_t, msg: *const msghdr_const, flags: u32) isize;
+pub extern "c" fn sendmmsg(sockfd: fd_t, msgvec: [*]mmsghdr, n: c_uint, flags: u32) c_int;
 
 pub extern "c" fn recv(
     sockfd: fd_t,
@@ -10736,9 +11203,13 @@ pub extern "c" fn recvfrom(
     noalias src_addr: ?*sockaddr,
     noalias addrlen: ?*socklen_t,
 ) if (native_os == .windows) c_int else isize;
-pub extern "c" fn recvmsg(sockfd: fd_t, msg: *msghdr, flags: u32) isize;
 
-pub extern "c" fn kill(pid: pid_t, sig: c_int) c_int;
+pub const recvmsg = switch (native_os) {
+    .windows => {},
+    else => private.recvmsg,
+};
+
+pub extern "c" fn kill(pid: pid_t, sig: SIG) c_int;
 
 pub extern "c" fn setuid(uid: uid_t) c_int;
 pub extern "c" fn setgid(gid: gid_t) c_int;
@@ -10750,7 +11221,11 @@ pub extern "c" fn setresuid(ruid: uid_t, euid: uid_t, suid: uid_t) c_int;
 pub extern "c" fn setresgid(rgid: gid_t, egid: gid_t, sgid: gid_t) c_int;
 pub extern "c" fn setpgid(pid: pid_t, pgid: pid_t) c_int;
 pub extern "c" fn getuid() uid_t;
+pub extern "c" fn getgid() gid_t;
 pub extern "c" fn geteuid() uid_t;
+pub extern "c" fn getegid() gid_t;
+pub extern "c" fn getresuid(ruid: *uid_t, euid: *uid_t, suid: *uid_t) c_int;
+pub extern "c" fn getresgid(rgid: *gid_t, egid: *gid_t, sgid: *gid_t) c_int;
 
 pub extern "c" fn malloc(usize) ?*anyopaque;
 pub extern "c" fn calloc(usize, usize) ?*anyopaque;
@@ -10760,7 +11235,7 @@ pub extern "c" fn free(?*anyopaque) void;
 pub extern "c" fn futimes(fd: fd_t, times: ?*[2]timeval) c_int;
 pub extern "c" fn utimes(path: [*:0]const u8, times: ?*[2]timeval) c_int;
 
-pub extern "c" fn utimensat(dirfd: fd_t, pathname: [*:0]const u8, times: ?*[2]timespec, flags: u32) c_int;
+pub extern "c" fn utimensat(dirfd: fd_t, pathname: [*:0]const u8, times: ?*const [2]timespec, flags: u32) c_int;
 pub extern "c" fn futimens(fd: fd_t, times: ?*const [2]timespec) c_int;
 
 pub extern "c" fn pthread_create(
@@ -10769,6 +11244,23 @@ pub extern "c" fn pthread_create(
     start_routine: *const fn (?*anyopaque) callconv(.c) ?*anyopaque,
     noalias arg: ?*anyopaque,
 ) E;
+pub const pthread_cancelstate = switch (native_os) {
+    .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => enum(c_int) {
+        ENABLE = 1,
+        DISABLE = 0,
+    },
+    .linux => if (native_abi.isMusl()) enum(c_int) {
+        ENABLE = 0,
+        DISABLE = 1,
+        MASKED = 2,
+    } else if (native_abi.isGnu()) enum(c_int) {
+        ENABLE = 0,
+        DISABLE = 1,
+    },
+    else => void,
+};
+pub extern "c" fn pthread_setcancelstate(pthread_cancelstate, ?*pthread_cancelstate) E;
+pub extern "c" fn pthread_cancel(pthread_t) E;
 pub extern "c" fn pthread_attr_init(attr: *pthread_attr_t) E;
 pub extern "c" fn pthread_attr_setstack(attr: *pthread_attr_t, stackaddr: *anyopaque, stacksize: usize) E;
 pub extern "c" fn pthread_attr_setstacksize(attr: *pthread_attr_t, stacksize: usize) E;
@@ -10791,15 +11283,30 @@ pub extern "c" fn pthread_getspecific(key: pthread_key_t) ?*anyopaque;
 pub extern "c" fn pthread_setspecific(key: pthread_key_t, value: ?*anyopaque) c_int;
 pub extern "c" fn pthread_sigmask(how: c_int, set: *const sigset_t, oldset: *sigset_t) c_int;
 pub const pthread_setname_np = switch (native_os) {
-    .macos, .ios, .tvos, .watchos, .visionos => darwin.pthread_setname_np,
-    .solaris, .illumos => solaris.pthread_setname_np,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => darwin.pthread_setname_np,
+    .illumos => illumos.pthread_setname_np,
     .netbsd => netbsd.pthread_setname_np,
     else => private.pthread_setname_np,
 };
 
 pub extern "c" fn pthread_getname_np(thread: pthread_t, name: [*:0]u8, len: usize) c_int;
+pub extern "c" fn pthread_kill(pthread_t, signal: SIG) c_int;
+pub extern "c" fn pthread_exit(ptr: ?*anyopaque) noreturn;
+
 pub const pthread_threadid_np = switch (native_os) {
-    .macos, .ios, .tvos, .watchos, .visionos => private.pthread_threadid_np,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => private.pthread_threadid_np,
+    else => {},
+};
+
+pub const caddr_t = ?[*]u8;
+
+pub const ptrace = switch (native_os) {
+    .linux, .serenity => private.ptrace,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => darwin.ptrace,
+    .dragonfly => dragonfly.ptrace,
+    .freebsd => freebsd.ptrace,
+    .netbsd => netbsd.ptrace,
+    .openbsd => openbsd.ptrace,
     else => {},
 };
 
@@ -10813,7 +11320,10 @@ pub extern "c" fn sem_trywait(sem: *sem_t) c_int;
 pub extern "c" fn sem_timedwait(sem: *sem_t, abs_timeout: *const timespec) c_int;
 pub extern "c" fn sem_getvalue(sem: *sem_t, sval: *c_int) c_int;
 
-pub extern "c" fn shm_open(name: [*:0]const u8, flag: c_int, mode: mode_t) c_int;
+pub const shm_open = switch (native_os) {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => darwin.shm_open,
+    else => private.shm_open,
+};
 pub extern "c" fn shm_unlink(name: [*:0]const u8) c_int;
 
 pub extern "c" fn kqueue() c_int;
@@ -10887,13 +11397,26 @@ pub extern "c" fn dn_expand(
     length: c_int,
 ) c_int;
 
-pub const PTHREAD_MUTEX_INITIALIZER = pthread_mutex_t{};
+pub const PTHREAD_PROCESS_PRIVATE: c_int = if (native_os.isDarwin())
+    2
+else
+    0;
+
+pub const PTHREAD_PROCESS_SHARED: c_int = 1;
+
+pub extern "c" fn pthread_spin_init(spin: *pthread_spinlock_t, pshared: c_int) c_int;
+pub extern "c" fn pthread_spin_lock(spin: *pthread_spinlock_t) c_int;
+pub extern "c" fn pthread_spin_unlock(spin: *pthread_spinlock_t) c_int;
+pub extern "c" fn pthread_spin_trylock(spin: *pthread_spinlock_t) c_int;
+pub extern "c" fn pthread_spin_destroy(spin: *pthread_spinlock_t) c_int;
+
+pub const PTHREAD_MUTEX_INITIALIZER: pthread_mutex_t = .{};
 pub extern "c" fn pthread_mutex_lock(mutex: *pthread_mutex_t) E;
 pub extern "c" fn pthread_mutex_unlock(mutex: *pthread_mutex_t) E;
 pub extern "c" fn pthread_mutex_trylock(mutex: *pthread_mutex_t) E;
 pub extern "c" fn pthread_mutex_destroy(mutex: *pthread_mutex_t) E;
 
-pub const PTHREAD_COND_INITIALIZER = pthread_cond_t{};
+pub const PTHREAD_COND_INITIALIZER: pthread_cond_t = .{};
 pub extern "c" fn pthread_cond_wait(noalias cond: *pthread_cond_t, noalias mutex: *pthread_mutex_t) E;
 pub extern "c" fn pthread_cond_timedwait(noalias cond: *pthread_cond_t, noalias mutex: *pthread_mutex_t, noalias abstime: *const timespec) E;
 pub extern "c" fn pthread_cond_signal(cond: *pthread_cond_t) E;
@@ -10918,6 +11441,9 @@ pub extern "c" fn dlopen(path: ?[*:0]const u8, mode: RTLD) ?*anyopaque;
 pub extern "c" fn dlclose(handle: *anyopaque) c_int;
 pub extern "c" fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) ?*anyopaque;
 pub extern "c" fn dlerror() ?[*:0]u8;
+
+pub const dladdr = if (native_os.isDarwin()) darwin.dladdr else {};
+pub const dl_info = if (native_os.isDarwin()) darwin.dl_info else {};
 
 pub extern "c" fn sync() void;
 pub extern "c" fn syncfs(fd: c_int) c_int;
@@ -10964,91 +11490,206 @@ pub const LC = enum(c_int) {
 
 pub extern "c" fn setlocale(category: LC, locale: ?[*:0]const u8) ?[*:0]const u8;
 
-pub const getcontext = if (builtin.target.abi.isAndroid() or builtin.target.os.tag == .openbsd or builtin.target.os.tag == .haiku)
-{} // libc does not implement getcontext
-    else if (native_os == .linux and builtin.target.abi.isMusl())
-        linux.getcontext
-    else
-        private.getcontext;
-
 pub const max_align_t = if (native_abi == .msvc or native_abi == .itanium)
     f64
 else if (native_os.isDarwin())
     c_longdouble
 else
     extern struct {
-        a: c_longlong,
+        a: c_longlong align(if (native_arch == .x86) 8 else @alignOf(c_longlong)),
         b: c_longdouble,
     };
 
+pub const div_t = extern struct {
+    quot: c_int,
+    rem: c_int,
+};
+
+pub const ldiv_t = extern struct {
+    quot: c_long,
+    rem: c_long,
+};
+
+pub const lldiv_t = extern struct {
+    quot: c_longlong,
+    rem: c_longlong,
+};
+
+pub const imaxdiv_t = extern struct {
+    quot: intmax_t,
+    rem: intmax_t,
+};
+
 pub const intmax_t = i64;
 pub const uintmax_t = u64;
+
+pub const wint_t = switch (builtin.target.os.tag) {
+    .windows => u16,
+    else => i32,
+};
+
+pub const wchar_t = switch (builtin.target.os.tag) {
+    .windows => u16,
+    else => if (builtin.target.cpu.arch.isArm() or builtin.target.cpu.arch.isAARCH64()) u32 else i32,
+};
 
 pub extern "c" fn pthread_getthreadid_np() c_int;
 pub extern "c" fn pthread_set_name_np(thread: pthread_t, name: [*:0]const u8) void;
 pub extern "c" fn pthread_get_name_np(thread: pthread_t, name: [*:0]u8, len: usize) void;
 
+pub const TIMER = switch (native_os) {
+    .linux, .emscripten => std.os.linux.TIMER,
+    .openbsd, .netbsd, .wasi, .windows, .freebsd, .serenity => packed struct(u32) {
+        ABSTIME: bool,
+        _: u31 = 0,
+    },
+    else => void,
+};
+
+pub const clock_nanosleep = switch (native_os) {
+    .linux, .emscripten, .netbsd, .wasi, .windows, .freebsd, .serenity => private.clock_nanosleep,
+    else => {},
+};
+
+pub const ioctl = switch (native_os) {
+    .windows, .wasi => {},
+    else => private.ioctl,
+};
+
+pub extern "c" fn bzero(s: *anyopaque, n: usize) void;
+
+pub const swab = switch (builtin.abi) {
+    .msvc => private._swab,
+    else => private.swab,
+};
+
+pub extern "c" fn strncmp(a: [*:0]const c_char, b: [*:0]const c_char, max: usize) c_int;
+pub extern "c" fn strcasecmp(a: [*:0]const c_char, b: [*:0]const c_char) c_int;
+pub extern "c" fn strncasecmp(a: [*:0]const c_char, b: [*:0]const c_char, max: usize) c_int;
+pub const strdup = switch (builtin.abi) {
+    .msvc => private._strdup,
+    else => private.strdup,
+};
+pub extern "c" fn strnlen(s: [*:0]const c_char, n: usize) callconv(.c) usize;
+pub extern "c" fn strndup(s: [*:0]const c_char, n: usize) ?[*:0]c_char;
+pub extern "c" fn wcsnlen(s: [*:0]const wchar_t, n: usize) callconv(.c) usize;
+pub const wcsdup = switch (builtin.abi) {
+    .msvc => private._wcsdup,
+    else => private.wcsdup,
+};
+
+pub extern "c" fn ffs(i: c_int) c_int;
+pub extern "c" fn ffsl(i: c_long) c_int;
+pub extern "c" fn ffsll(i: c_longlong) c_int;
+
+pub extern "c" fn erand48(xsubi: *[3]c_ushort) f64;
+pub extern "c" fn jrand48(xsubi: *[3]c_ushort) c_long;
+pub extern "c" fn nrand48(xsubi: *[3]c_ushort) c_long;
+
+pub extern "c" fn insque(element: *anyopaque, pred: ?*anyopaque) void;
+pub extern "c" fn remque(element: *anyopaque) void;
+
+pub extern "c" fn imaxabs(a: intmax_t) intmax_t;
+pub extern "c" fn imaxdiv(a: intmax_t, b: intmax_t) imaxdiv_t;
+
+pub extern "c" fn abs(a: c_int) c_int;
+pub extern "c" fn labs(a: c_long) c_long;
+pub extern "c" fn llabs(a: c_longlong) c_longlong;
+
+pub extern "c" fn div(a: c_int, b: c_int) div_t;
+pub extern "c" fn ldiv(a: c_long, b: c_long) ldiv_t;
+pub extern "c" fn lldiv(a: c_longlong, b: c_longlong) lldiv_t;
+
+pub extern "c" fn atoi(str: [*:0]const c_char) c_int;
+pub extern "c" fn atol(str: [*:0]const c_char) c_long;
+pub extern "c" fn atoll(str: [*:0]const c_char) c_longlong;
+
+pub extern "c" fn strtol(noalias str: [*:0]const c_char, noalias str_end: ?*[*:0]c_char, base: c_int) callconv(.c) c_long;
+pub extern "c" fn strtoll(noalias str: [*:0]const c_char, noalias str_end: ?*[*:0]c_char, base: c_int) callconv(.c) c_longlong;
+pub extern "c" fn strtoul(noalias str: [*:0]const c_char, noalias str_end: ?*[*:0]c_char, base: c_int) callconv(.c) c_ulong;
+pub extern "c" fn strtoull(noalias str: [*:0]const c_char, noalias str_end: ?*[*:0]c_char, base: c_int) callconv(.c) c_ulonglong;
+pub extern "c" fn strtoimax(noalias str: [*:0]const c_char, noalias str_end: ?*[*:0]c_char, base: c_int) callconv(.c) intmax_t;
+pub extern "c" fn strtoumax(noalias str: [*:0]const c_char, noalias str_end: ?*[*:0]c_char, base: c_int) callconv(.c) uintmax_t;
+
+pub extern "c" fn bsearch(
+    key: *const anyopaque,
+    base: *const anyopaque,
+    n: usize,
+    size: usize,
+    compare: *const fn (a: *const anyopaque, b: *const anyopaque) callconv(.c) c_int,
+) ?*anyopaque;
+
+// Math
+pub extern "c" fn atan(x: f64) f64;
+pub extern "c" fn copysign(x: f64, y: f64) f64;
+pub extern "c" fn fdim(x: f64, y: f64) f64;
+pub extern "c" fn frexp(x: f64, e: *c_int) f64;
+pub extern "c" fn hypot(x: f64, y: f64) f64;
+pub extern "c" fn modff(x: f32, iptr: *f32) f32;
+pub extern "c" fn modf(x: f64, iptr: *f64) f64;
+pub extern "c" fn modfl(x: c_longdouble, iptr: *c_longdouble) c_longdouble;
+pub extern "c" fn rintf(x: f32) f32;
+pub extern "c" fn rint(x: f64) f64;
+pub extern "c" fn rintl(x: c_longdouble) c_longdouble;
+
 // OS-specific bits. These are protected from being used on the wrong OS by
 // comptime assertions inside each OS-specific file.
 
-pub const AF_SUN = solaris.AF_SUN;
-pub const AT_SUN = solaris.AT_SUN;
-pub const FILE_EVENT = solaris.FILE_EVENT;
-pub const GETCONTEXT = solaris.GETCONTEXT;
-pub const GETUSTACK = solaris.GETUSTACK;
-pub const PORT_ALERT = solaris.PORT_ALERT;
-pub const PORT_SOURCE = solaris.PORT_SOURCE;
-pub const POSIX_FADV = solaris.POSIX_FADV;
-pub const SCM = solaris.SCM;
-pub const SETCONTEXT = solaris.SETCONTEXT;
-pub const SETUSTACK = solaris.GETUSTACK;
-pub const SFD = solaris.SFD;
-pub const cmsghdr = solaris.cmsghdr;
-pub const ctid_t = solaris.ctid_t;
-pub const file_obj = solaris.file_obj;
-pub const fpregset_t = solaris.fpregset_t;
-pub const id_t = solaris.id_t;
-pub const lif_ifinfo_req = solaris.lif_ifinfo_req;
-pub const lif_nd_req = solaris.lif_nd_req;
-pub const lifreq = solaris.lifreq;
-pub const major_t = solaris.major_t;
-pub const minor_t = solaris.minor_t;
-pub const poolid_t = solaris.poolid_t;
-pub const port_notify = solaris.port_notify;
-pub const priority = solaris.priority;
-pub const procfs = solaris.procfs;
-pub const projid_t = solaris.projid_t;
-pub const signalfd_siginfo = solaris.signalfd_siginfo;
-pub const taskid_t = solaris.taskid_t;
-pub const zoneid_t = solaris.zoneid_t;
+pub const AF_SUN = illumos.AF_SUN;
+pub const AT_SUN = illumos.AT_SUN;
+pub const FILE_EVENT = illumos.FILE_EVENT;
+pub const GETCONTEXT = illumos.GETCONTEXT;
+pub const GETUSTACK = illumos.GETUSTACK;
+pub const PORT_ALERT = illumos.PORT_ALERT;
+pub const PORT_SOURCE = illumos.PORT_SOURCE;
+pub const POSIX_FADV = illumos.POSIX_FADV;
+pub const SETCONTEXT = illumos.SETCONTEXT;
+pub const SETUSTACK = illumos.GETUSTACK;
+pub const SFD = illumos.SFD;
+pub const ctid_t = illumos.ctid_t;
+pub const file_obj = illumos.file_obj;
+pub const id_t = illumos.id_t;
+pub const lif_ifinfo_req = illumos.lif_ifinfo_req;
+pub const lif_nd_req = illumos.lif_nd_req;
+pub const lifreq = illumos.lifreq;
+pub const major_t = illumos.major_t;
+pub const minor_t = illumos.minor_t;
+pub const poolid_t = illumos.poolid_t;
+pub const port_notify = illumos.port_notify;
+pub const priority = illumos.priority;
+pub const procfs = illumos.procfs;
+pub const projid_t = illumos.projid_t;
+pub const signalfd_siginfo = illumos.signalfd_siginfo;
+pub const taskid_t = illumos.taskid_t;
+pub const zoneid_t = illumos.zoneid_t;
 
+pub const B_ABSOLUTE_TIMEOUT = haiku.B_ABSOLUTE_TIMEOUT;
+pub const B_OS_NAME_LENGTH = haiku.B_OS_NAME_LENGTH;
+pub const B_TIMEOUT_REAL_TIME_BASE = haiku.B_TIMEOUT_REAL_TIME_BASE;
 pub const DirEnt = haiku.DirEnt;
-pub const _get_next_area_info = haiku._get_next_area_info;
-pub const _get_next_image_info = haiku._get_next_image_info;
-pub const _get_team_info = haiku._get_team_info;
-pub const _kern_get_current_team = haiku._kern_get_current_team;
+pub const _kern_acquire_sem_etc = haiku._kern_acquire_sem_etc;
+pub const _kern_create_sem = haiku._kern_create_sem;
+pub const _kern_delete_sem = haiku._kern_delete_sem;
 pub const _kern_open_dir = haiku._kern_open_dir;
 pub const _kern_read_dir = haiku._kern_read_dir;
 pub const _kern_read_stat = haiku._kern_read_stat;
+pub const _kern_release_sem_etc = haiku._kern_release_sem_etc;
 pub const _kern_rewind_dir = haiku._kern_rewind_dir;
 pub const area_id = haiku.area_id;
-pub const area_info = haiku.area_info;
-pub const directory_which = haiku.directory_which;
-pub const find_directory = haiku.find_directory;
 pub const find_thread = haiku.find_thread;
 pub const get_system_info = haiku.get_system_info;
-pub const image_info = haiku.image_info;
+pub const on_exit_thread = haiku.on_exit_thread;
 pub const port_id = haiku.port_id;
+pub const readv_pos = haiku.readv_pos;
 pub const sem_id = haiku.sem_id;
 pub const status_t = haiku.status_t;
 pub const system_info = haiku.system_info;
 pub const team_id = haiku.team_id;
-pub const team_info = haiku.team_info;
 pub const thread_id = haiku.thread_id;
+pub const writev_pos = haiku.writev_pos;
 
 pub const AUTH = openbsd.AUTH;
 pub const BI = openbsd.BI;
-pub const HW = openbsd.HW;
 pub const PTHREAD_STACK_MIN = openbsd.PTHREAD_STACK_MIN;
 pub const TCFLUSH = openbsd.TCFLUSH;
 pub const TCIO = openbsd.TCIO;
@@ -11100,7 +11741,6 @@ pub const login_getcaptime = openbsd.login_getcaptime;
 pub const login_getclass = openbsd.login_getclass;
 pub const login_getstyle = openbsd.login_getstyle;
 pub const pledge = openbsd.pledge;
-pub const pthread_spinlock_t = openbsd.pthread_spinlock_t;
 pub const pw_dup = openbsd.pw_dup;
 pub const setclasscontext = openbsd.setclasscontext;
 pub const setpassent = openbsd.setpassent;
@@ -11111,7 +11751,6 @@ pub const user_from_uid = openbsd.user_from_uid;
 
 pub const CAP_RIGHTS_VERSION = freebsd.CAP_RIGHTS_VERSION;
 pub const KINFO_FILE_SIZE = freebsd.KINFO_FILE_SIZE;
-pub const MFD = freebsd.MFD;
 pub const UMTX_ABSTIME = freebsd.UMTX_ABSTIME;
 pub const UMTX_OP = freebsd.UMTX_OP;
 pub const _umtx_op = freebsd._umtx_op;
@@ -11123,12 +11762,15 @@ pub const fsfilcnt_t = freebsd.fsfilcnt_t;
 pub const kinfo_file = freebsd.kinfo_file;
 pub const kinfo_getfile = freebsd.kinfo_getfile;
 
+pub const CALENDAR_CLOCK = darwin.CALENDAR_CLOCK;
 pub const COPYFILE = darwin.COPYFILE;
 pub const CPUFAMILY = darwin.CPUFAMILY;
 pub const PT = darwin.PT;
 pub const DB_RECORDTYPE = darwin.DB_RECORDTYPE;
 pub const EXC = darwin.EXC;
 pub const EXCEPTION = darwin.EXCEPTION;
+pub const KEVENT = darwin.KEVENT;
+pub const MACH = darwin.MACH;
 pub const MACH_MSG_TYPE = darwin.MACH_MSG_TYPE;
 pub const MACH_PORT_RIGHT = darwin.MACH_PORT_RIGHT;
 pub const MACH_TASK_BASIC_INFO = darwin.MACH_TASK_BASIC_INFO;
@@ -11136,10 +11778,15 @@ pub const MACH_TASK_BASIC_INFO_COUNT = darwin.MACH_TASK_BASIC_INFO_COUNT;
 pub const MATTR = darwin.MATTR;
 pub const NSVersionOfRunTimeLibrary = darwin.NSVersionOfRunTimeLibrary;
 pub const OPEN_MAX = darwin.OPEN_MAX;
+pub const OS = darwin.OS;
 pub const POSIX_SPAWN = darwin.POSIX_SPAWN;
+pub const SYSPROTO_EVENT = darwin.SYSPROTO_EVENT;
+pub const SYSPROTO_CONTROL = darwin.SYSPROTO_CONTROL;
+pub const TASK = darwin.TASK;
 pub const TASK_NULL = darwin.TASK_NULL;
 pub const TASK_VM_INFO = darwin.TASK_VM_INFO;
 pub const TASK_VM_INFO_COUNT = darwin.TASK_VM_INFO_COUNT;
+pub const THREAD = darwin.THREAD;
 pub const THREAD_BASIC_INFO = darwin.THREAD_BASIC_INFO;
 pub const THREAD_BASIC_INFO_COUNT = darwin.THREAD_BASIC_INFO_COUNT;
 pub const THREAD_IDENTIFIER_INFO_COUNT = darwin.THREAD_IDENTIFIER_INFO_COUNT;
@@ -11156,16 +11803,19 @@ pub const _dyld_get_image_header = darwin._dyld_get_image_header;
 pub const _dyld_get_image_name = darwin._dyld_get_image_name;
 pub const _dyld_get_image_vmaddr_slide = darwin._dyld_get_image_vmaddr_slide;
 pub const _dyld_image_count = darwin._dyld_image_count;
+pub const _dyld_get_image_header_containing_address = darwin._dyld_get_image_header_containing_address;
+pub const dyld_image_path_containing_address = darwin.dyld_image_path_containing_address;
 pub const _host_page_size = darwin._host_page_size;
+pub const boolean_t = darwin.boolean_t;
 pub const clock_get_time = darwin.clock_get_time;
+pub const clock_serv_t = darwin.clock_serv_t;
+pub const clock_res_t = darwin.clock_res_t;
 pub const @"close$NOCANCEL" = darwin.@"close$NOCANCEL";
-pub const dispatch_release = darwin.dispatch_release;
-pub const dispatch_semaphore_create = darwin.dispatch_semaphore_create;
-pub const dispatch_semaphore_signal = darwin.dispatch_semaphore_signal;
-pub const dispatch_semaphore_wait = darwin.dispatch_semaphore_wait;
-pub const dispatch_time = darwin.dispatch_time;
+pub const dispatch = darwin.dispatch;
 pub const fcopyfile = darwin.fcopyfile;
+pub const renameatx_np = darwin.renameatx_np;
 pub const host_t = darwin.host_t;
+pub const integer_t = darwin.integer_t;
 pub const ipc_space_t = darwin.ipc_space_t;
 pub const ipc_space_port_t = darwin.ipc_space_port_t;
 pub const kern_return_t = darwin.kern_return_t;
@@ -11177,6 +11827,7 @@ pub const mach_continuous_time = darwin.mach_continuous_time;
 pub const mach_hdr = darwin.mach_hdr;
 pub const mach_host_self = darwin.mach_host_self;
 pub const mach_msg = darwin.mach_msg;
+pub const mach_msg_return_t = darwin.mach_msg_return_t;
 pub const mach_msg_type_number_t = darwin.mach_msg_type_number_t;
 pub const mach_port_allocate = darwin.mach_port_allocate;
 pub const mach_port_array_t = darwin.mach_port_array_t;
@@ -11188,6 +11839,7 @@ pub const mach_task_basic_info = darwin.mach_task_basic_info;
 pub const mach_task_self = darwin.mach_task_self;
 pub const mach_timebase_info = darwin.mach_timebase_info;
 pub const mach_timebase_info_data = darwin.mach_timebase_info_data;
+pub const mach_timespec_t = darwin.mach_timespec_t;
 pub const mach_vm_address_t = darwin.mach_vm_address_t;
 pub const mach_vm_protect = darwin.mach_vm_protect;
 pub const mach_vm_read = darwin.mach_vm_read;
@@ -11197,16 +11849,20 @@ pub const mach_vm_size_t = darwin.mach_vm_size_t;
 pub const mach_vm_write = darwin.mach_vm_write;
 pub const natural_t = darwin.natural_t;
 pub const os_log_create = darwin.os_log_create;
+pub const os_log_t = darwin.os_log_t;
 pub const os_log_type_enabled = darwin.os_log_type_enabled;
+pub const os_log_type_t = darwin.os_log_type_t;
 pub const os_signpost_enabled = darwin.os_signpost_enabled;
 pub const os_signpost_id_generate = darwin.os_signpost_id_generate;
 pub const os_signpost_id_make_with_pointer = darwin.os_signpost_id_make_with_pointer;
+pub const os_signpost_id_t = darwin.os_signpost_id_t;
 pub const os_signpost_interval_begin = darwin.os_signpost_interval_begin;
 pub const os_signpost_interval_end = darwin.os_signpost_interval_end;
 pub const os_unfair_lock = darwin.os_unfair_lock;
 pub const os_unfair_lock_assert_not_owner = darwin.os_unfair_lock_assert_not_owner;
 pub const os_unfair_lock_assert_owner = darwin.os_unfair_lock_assert_owner;
 pub const os_unfair_lock_lock = darwin.os_unfair_lock_lock;
+pub const os_unfair_lock_t = darwin.os_unfair_lock_t;
 pub const os_unfair_lock_trylock = darwin.os_unfair_lock_trylock;
 pub const os_unfair_lock_unlock = darwin.os_unfair_lock_unlock;
 pub const pid_for_task = darwin.pid_for_task;
@@ -11222,19 +11878,23 @@ pub const posix_spawn_file_actions_init = darwin.posix_spawn_file_actions_init;
 pub const posix_spawn_file_actions_t = darwin.posix_spawn_file_actions_t;
 pub const posix_spawnattr_destroy = darwin.posix_spawnattr_destroy;
 pub const posix_spawnattr_getflags = darwin.posix_spawnattr_getflags;
+pub const posix_spawnattr_getpgroup = darwin.posix_spawnattr_getpgroup;
 pub const posix_spawnattr_init = darwin.posix_spawnattr_init;
 pub const posix_spawnattr_setflags = darwin.posix_spawnattr_setflags;
+pub const posix_spawnattr_setpgroup = darwin.posix_spawnattr_setpgroup;
 pub const posix_spawnattr_t = darwin.posix_spawnattr_t;
 pub const posix_spawnp = darwin.posix_spawnp;
 pub const pthread_attr_get_qos_class_np = darwin.pthread_attr_get_qos_class_np;
 pub const pthread_attr_set_qos_class_np = darwin.pthread_attr_set_qos_class_np;
 pub const pthread_get_qos_class_np = darwin.pthread_get_qos_class_np;
 pub const pthread_set_qos_class_self_np = darwin.pthread_set_qos_class_self_np;
-pub const ptrace = darwin.ptrace;
+pub const qos_class_t = darwin.qos_class_t;
+pub const task_flavor_t = darwin.task_flavor_t;
 pub const task_for_pid = darwin.task_for_pid;
 pub const task_get_exception_ports = darwin.task_get_exception_ports;
 pub const task_info = darwin.task_info;
 pub const task_info_t = darwin.task_info_t;
+pub const task_name_t = darwin.task_name_t;
 pub const task_resume = darwin.task_resume;
 pub const task_set_exception_ports = darwin.task_set_exception_ports;
 pub const task_suspend = darwin.task_suspend;
@@ -11247,8 +11907,10 @@ pub const thread_info = darwin.thread_info;
 pub const thread_info_t = darwin.thread_info_t;
 pub const thread_resume = darwin.thread_resume;
 pub const thread_set_state = darwin.thread_set_state;
+pub const vm_address_t = darwin.vm_address_t;
 pub const vm_deallocate = darwin.vm_deallocate;
 pub const vm_machine_attribute = darwin.vm_machine_attribute;
+pub const vm_machine_attribute_t = darwin.vm_machine_attribute_t;
 pub const vm_machine_attribute_val_t = darwin.vm_machine_attribute_val_t;
 pub const vm_map_t = darwin.vm_map_t;
 pub const vm_offset_t = darwin.vm_offset_t;
@@ -11261,7 +11923,6 @@ pub const vm_region_submap_info_64 = darwin.vm_region_submap_info_64;
 pub const vm_region_submap_short_info_64 = darwin.vm_region_submap_short_info_64;
 pub const vm_region_top_info = darwin.vm_region_top_info;
 
-pub const caddr_t = darwin.caddr_t;
 pub const exception_behavior_array_t = darwin.exception_behavior_array_t;
 pub const exception_behavior_t = darwin.exception_behavior_t;
 pub const exception_data_t = darwin.exception_data_t;
@@ -11273,10 +11934,12 @@ pub const exception_mask_array_t = darwin.exception_mask_array_t;
 pub const exception_mask_t = darwin.exception_mask_t;
 pub const exception_port_array_t = darwin.exception_port_array_t;
 pub const exception_port_t = darwin.exception_port_t;
+pub const exception_type_t = darwin.exception_type_t;
 pub const mach_exception_data_t = darwin.mach_exception_data_t;
 pub const mach_exception_data_type_t = darwin.mach_exception_data_type_t;
 pub const mach_msg_bits_t = darwin.mach_msg_bits_t;
 pub const mach_msg_id_t = darwin.mach_msg_id_t;
+pub const mach_msg_header_t = darwin.mach_msg_header_t;
 pub const mach_msg_option_t = darwin.mach_msg_option_t;
 pub const mach_msg_size_t = darwin.mach_msg_size_t;
 pub const mach_msg_timeout_t = darwin.mach_msg_timeout_t;
@@ -11286,6 +11949,7 @@ pub const memory_object_offset_t = darwin.memory_object_offset_t;
 pub const policy_t = darwin.policy_t;
 pub const task_policy_flavor_t = darwin.task_policy_flavor_t;
 pub const task_policy_t = darwin.task_policy_t;
+pub const task_read_t = darwin.task_read_t;
 pub const task_t = darwin.task_t;
 pub const thread_act_t = darwin.thread_act_t;
 pub const thread_flavor_t = darwin.thread_flavor_t;
@@ -11303,6 +11967,9 @@ pub const vm_region_flavor_t = darwin.vm_region_flavor_t;
 
 pub const _ksiginfo = netbsd._ksiginfo;
 pub const _lwp_self = netbsd._lwp_self;
+pub const _lwp_park = netbsd.___lwp_park60;
+pub const _lwp_unpark = netbsd._lwp_unpark;
+pub const _lwp_unpark_all = netbsd._lwp_unpark_all;
 pub const lwpid_t = netbsd.lwpid_t;
 
 pub const lwp_gettid = dragonfly.lwp_gettid;
@@ -11314,20 +11981,24 @@ pub const disown = serenity.disown;
 pub const profiling_enable = serenity.profiling_enable;
 pub const profiling_disable = serenity.profiling_disable;
 pub const profiling_free_buffer = serenity.profiling_free_buffer;
-pub const futex_wait = serenity.futex_wait;
-pub const futex_wake = serenity.futex_wake;
 pub const purge = serenity.purge;
 pub const perf_event = serenity.perf_event;
 pub const perf_register_string = serenity.perf_register_string;
 pub const get_stack_bounds = serenity.get_stack_bounds;
 pub const anon_create = serenity.anon_create;
-pub const serenity_readlink = serenity.serenity_readlink;
-pub const serenity_open = serenity.serenity_open;
 pub const getkeymap = serenity.getkeymap;
 pub const setkeymap = serenity.setkeymap;
 
 /// External definitions shared by two or more operating systems.
 const private = struct {
+    pub extern "c" fn strdup(s: [*:0]const c_char) ?[*:0]c_char;
+    pub extern "c" fn _strdup(s: [*:0]const c_char) ?[*:0]c_char;
+    pub extern "c" fn wcsdup(s: [*:0]const wchar_t) ?[*:0]wchar_t;
+    pub extern "c" fn _wcsdup(s: [*:0]const wchar_t) ?[*:0]wchar_t;
+
+    pub extern "c" fn swab(noalias from: *const anyopaque, noalias to: *anyopaque, n: isize) void;
+    pub extern "c" fn _swab(noalias from: *const anyopaque, noalias to: *anyopaque, n: isize) void;
+
     extern "c" fn close(fd: fd_t) c_int;
     extern "c" fn clock_getres(clk_id: clockid_t, tp: *timespec) c_int;
     extern "c" fn clock_gettime(clk_id: clockid_t, tp: *timespec) c_int;
@@ -11339,32 +12010,36 @@ const private = struct {
     extern "c" fn getdirentries(fd: fd_t, buf_ptr: [*]u8, nbytes: usize, basep: *i64) isize;
     extern "c" fn getdents(fd: c_int, buf_ptr: [*]u8, nbytes: usize) switch (native_os) {
         .freebsd => isize,
-        .solaris, .illumos => usize,
+        .illumos => usize,
         else => c_int,
     };
     extern "c" fn getrusage(who: c_int, usage: *rusage) c_int;
     extern "c" fn gettimeofday(noalias tv: ?*timeval, noalias tz: ?*timezone) c_int;
+    extern "c" fn ioctl(fd: fd_t, request: c_int, ...) c_int;
     extern "c" fn msync(addr: *align(page_size) const anyopaque, len: usize, flags: c_int) c_int;
     extern "c" fn nanosleep(rqtp: *const timespec, rmtp: ?*timespec) c_int;
+    extern "c" fn clock_nanosleep(clockid: clockid_t, flags: TIMER, t: *const timespec, remain: ?*timespec) c_int;
     extern "c" fn pipe2(fds: *[2]fd_t, flags: O) c_int;
     extern "c" fn readdir(dir: *DIR) ?*dirent;
     extern "c" fn realpath(noalias file_name: [*:0]const u8, noalias resolved_name: [*]u8) ?[*:0]u8;
+    extern "c" fn recvmsg(sockfd: fd_t, msg: *msghdr, flags: u32) isize;
     extern "c" fn sched_yield() c_int;
     extern "c" fn sendfile(out_fd: fd_t, in_fd: fd_t, offset: ?*off_t, count: usize) isize;
-    extern "c" fn sigaction(sig: c_int, noalias act: ?*const Sigaction, noalias oact: ?*Sigaction) c_int;
-    extern "c" fn sigdelset(set: ?*sigset_t, signo: c_int) c_int;
-    extern "c" fn sigaddset(set: ?*sigset_t, signo: c_int) c_int;
+    extern "c" fn sigaction(sig: SIG, noalias act: ?*const Sigaction, noalias oact: ?*Sigaction) c_int;
+    extern "c" fn sigdelset(set: ?*sigset_t, signo: SIG) c_int;
+    extern "c" fn sigaddset(set: ?*sigset_t, signo: SIG) c_int;
     extern "c" fn sigfillset(set: ?*sigset_t) c_int;
     extern "c" fn sigemptyset(set: ?*sigset_t) c_int;
-    extern "c" fn sigismember(set: ?*const sigset_t, signo: c_int) c_int;
+    extern "c" fn sigismember(set: ?*const sigset_t, signo: SIG) c_int;
     extern "c" fn sigprocmask(how: c_int, noalias set: ?*const sigset_t, noalias oset: ?*sigset_t) c_int;
     extern "c" fn socket(domain: c_uint, sock_type: c_uint, protocol: c_uint) c_int;
-    extern "c" fn stat(noalias path: [*:0]const u8, noalias buf: *Stat) c_int;
-    extern "c" fn sigaltstack(ss: ?*stack_t, old_ss: ?*stack_t) c_int;
+    extern "c" fn socketpair(domain: c_uint, sock_type: c_uint, protocol: c_uint, sv: *[2]fd_t) c_int;
+    extern "c" fn sigaltstack(ss: ?*const stack_t, old_ss: ?*stack_t) c_int;
     extern "c" fn sysconf(sc: c_int) c_long;
+    extern "c" fn shm_open(name: [*:0]const u8, flag: c_int, mode: mode_t) c_int;
+    extern "c" fn wait4(pid: pid_t, status: ?*c_int, options: c_int, ru: ?*rusage) pid_t;
 
     extern "c" fn pthread_setname_np(thread: pthread_t, name: [*:0]const u8) c_int;
-    extern "c" fn getcontext(ucp: *ucontext_t) c_int;
 
     extern "c" fn getrandom(buf_ptr: [*]u8, buf_len: usize, flags: c_uint) isize;
     extern "c" fn getentropy(buffer: [*]u8, size: usize) c_int;
@@ -11375,6 +12050,15 @@ const private = struct {
     extern "c" fn malloc_usable_size(?*const anyopaque) usize;
     extern "c" fn posix_memalign(memptr: *?*anyopaque, alignment: usize, size: usize) c_int;
 
+    extern "c" fn mlock(addr: *align(page_size) const anyopaque, len: usize) c_int;
+    extern "c" fn mlock2(addr: *align(page_size) const anyopaque, len: usize, flags: MLOCK) c_int;
+    extern "c" fn munlock(addr: *align(page_size) const anyopaque, len: usize) c_int;
+    extern "c" fn mlockall(flags: MCL) c_int;
+    extern "c" fn munlockall() c_int;
+
+    // linux and https://github.com/SerenityOS/serenity/blob/502caef9a40bccc7459f9835f2174a601106299a/Userland/Libraries/LibC/sys/ptrace.cpp
+    extern "c" fn ptrace(request: c_int, pid: pid_t, addr: ?*anyopaque, data: ?*anyopaque) c_long;
+
     /// macos modernized symbols.
     /// x86_64 links to $INODE64 suffix for 64-bit support.
     /// Note these are not necessary on aarch64.
@@ -11382,6 +12066,7 @@ const private = struct {
     extern "c" fn @"fstatat$INODE64"(dirfd: fd_t, path: [*:0]const u8, buf: *Stat, flag: u32) c_int;
     extern "c" fn @"readdir$INODE64"(dir: *DIR) ?*dirent;
     extern "c" fn @"stat$INODE64"(noalias path: [*:0]const u8, noalias buf: *Stat) c_int;
+    extern "c" fn stat(noalias path: [*:0]const u8, noalias buf: *Stat) c_int;
 
     /// macos modernized symbols.
     extern "c" fn @"realpath$DARWIN_EXTSN"(noalias file_name: [*:0]const u8, noalias resolved_name: [*]u8) ?[*:0]u8;
@@ -11398,17 +12083,20 @@ const private = struct {
     extern "c" fn __libc_thr_yield() c_int;
     extern "c" fn __msync13(addr: *align(page_size) const anyopaque, len: usize, flags: c_int) c_int;
     extern "c" fn __nanosleep50(rqtp: *const timespec, rmtp: ?*timespec) c_int;
-    extern "c" fn __sigaction14(sig: c_int, noalias act: ?*const Sigaction, noalias oact: ?*Sigaction) c_int;
+    extern "c" fn __sigaction14(sig: SIG, noalias act: ?*const Sigaction, noalias oact: ?*Sigaction) c_int;
     extern "c" fn __sigemptyset14(set: ?*sigset_t) c_int;
     extern "c" fn __sigfillset14(set: ?*sigset_t) c_int;
     extern "c" fn __sigprocmask14(how: c_int, noalias set: ?*const sigset_t, noalias oset: ?*sigset_t) c_int;
     extern "c" fn __socket30(domain: c_uint, sock_type: c_uint, protocol: c_uint) c_int;
     extern "c" fn __stat50(path: [*:0]const u8, buf: *Stat) c_int;
     extern "c" fn __getdents30(fd: c_int, buf_ptr: [*]u8, nbytes: usize) c_int;
-    extern "c" fn __sigaltstack14(ss: ?*stack_t, old_ss: ?*stack_t) c_int;
+    extern "c" fn __sigaltstack14(ss: ?*const stack_t, old_ss: ?*stack_t) c_int;
+    extern "c" fn __wait450(pid: pid_t, status: ?*c_int, options: c_int, ru: ?*rusage) pid_t;
 
     extern "c" fn __libc_current_sigrtmin() c_int;
     extern "c" fn __libc_current_sigrtmax() c_int;
+    extern "c" fn __signal_get_sigrtmin() c_int;
+    extern "c" fn __signal_get_sigrtmax() c_int;
 
     // Don't forget to add another clown when an OS picks yet another unique
     // symbol name for errno location!
@@ -11423,6 +12111,6 @@ const private = struct {
     extern threadlocal var errno: c_int;
 
     fn errnoFromThreadLocal() *c_int {
-        return &errno;
+        return &private.errno;
     }
 };

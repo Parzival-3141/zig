@@ -1,15 +1,13 @@
 //! The engines provided here should be initialized from an external source.
-//! For a thread-local cryptographically secure pseudo random number generator,
-//! use `std.crypto.random`.
 //! Be sure to use a CSPRNG when required, otherwise using a normal PRNG will
 //! be faster and use substantially less stack space.
+const Random = @This();
 
 const std = @import("std.zig");
 const math = std.math;
 const mem = std.mem;
 const assert = std.debug.assert;
 const maxInt = std.math.maxInt;
-const Random = @This();
 
 /// Fast unbiased random numbers.
 pub const DefaultPrng = Xoshiro256;
@@ -28,12 +26,29 @@ pub const Sfc64 = @import("Random/Sfc64.zig");
 pub const RomuTrio = @import("Random/RomuTrio.zig");
 pub const SplitMix64 = @import("Random/SplitMix64.zig");
 pub const ziggurat = @import("Random/ziggurat.zig");
+pub const lcg = @import("Random/lcg.zig");
 
 /// Any comparison of this field may result in illegal behavior, since it may be set to
 /// `undefined` in cases where the random implementation does not have any associated
 /// state.
 ptr: *anyopaque,
 fillFn: *const fn (ptr: *anyopaque, buf: []u8) void,
+
+pub const IoSource = struct {
+    io: std.Io,
+
+    pub fn interface(this: *const @This()) std.Random {
+        return .{
+            .ptr = @constCast(this),
+            .fillFn = fill,
+        };
+    }
+
+    fn fill(ptr: *anyopaque, buffer: []u8) void {
+        const this: *const @This() = @ptrCast(@alignCast(ptr));
+        this.io.random(buffer);
+    }
+};
 
 pub fn init(pointer: anytype, comptime fillFn: fn (ptr: @TypeOf(pointer), buf: []u8) void) Random {
     const Ptr = @TypeOf(pointer);
@@ -56,6 +71,12 @@ pub fn init(pointer: anytype, comptime fillFn: fn (ptr: @TypeOf(pointer), buf: [
 /// Read random bytes into the specified buffer until full.
 pub fn bytes(r: Random, buf: []u8) void {
     r.fillFn(r.ptr, buf);
+}
+
+pub fn array(r: Random, comptime E: type, comptime N: usize) [N]E {
+    var result: [N]E = undefined;
+    bytes(r, &result);
+    return result;
 }
 
 pub fn boolean(r: Random) bool {
@@ -104,9 +125,9 @@ pub fn enumValueWithIndex(r: Random, comptime EnumType: type, comptime Index: ty
 /// `i` is evenly distributed.
 pub fn int(r: Random, comptime T: type) T {
     const bits = @typeInfo(T).int.bits;
-    const UnsignedT = std.meta.Int(.unsigned, bits);
-    const ceil_bytes = comptime std.math.divCeil(u16, bits, 8) catch unreachable;
-    const ByteAlignedT = std.meta.Int(.unsigned, ceil_bytes * 8);
+    const UnsignedT = @Int(.unsigned, bits);
+    const ceil_bytes = @divCeil(bits, 8);
+    const ByteAlignedT = @Int(.unsigned, ceil_bytes * 8);
 
     var rand_bytes: [ceil_bytes]u8 = undefined;
     r.bytes(&rand_bytes);
@@ -194,7 +215,7 @@ pub fn intRangeLessThanBiased(r: Random, comptime T: type, at_least: T, less_tha
     const info = @typeInfo(T).int;
     if (info.signedness == .signed) {
         // Two's complement makes this math pretty easy.
-        const UnsignedT = std.meta.Int(.unsigned, info.bits);
+        const UnsignedT = @Int(.unsigned, info.bits);
         const lo: UnsignedT = @bitCast(at_least);
         const hi: UnsignedT = @bitCast(less_than);
         const result = lo +% r.uintLessThanBiased(UnsignedT, hi -% lo);
@@ -213,7 +234,7 @@ pub fn intRangeLessThan(r: Random, comptime T: type, at_least: T, less_than: T) 
     const info = @typeInfo(T).int;
     if (info.signedness == .signed) {
         // Two's complement makes this math pretty easy.
-        const UnsignedT = std.meta.Int(.unsigned, info.bits);
+        const UnsignedT = @Int(.unsigned, info.bits);
         const lo: UnsignedT = @bitCast(at_least);
         const hi: UnsignedT = @bitCast(less_than);
         const result = lo +% r.uintLessThan(UnsignedT, hi -% lo);
@@ -231,7 +252,7 @@ pub fn intRangeAtMostBiased(r: Random, comptime T: type, at_least: T, at_most: T
     const info = @typeInfo(T).int;
     if (info.signedness == .signed) {
         // Two's complement makes this math pretty easy.
-        const UnsignedT = std.meta.Int(.unsigned, info.bits);
+        const UnsignedT = @Int(.unsigned, info.bits);
         const lo: UnsignedT = @bitCast(at_least);
         const hi: UnsignedT = @bitCast(at_most);
         const result = lo +% r.uintAtMostBiased(UnsignedT, hi -% lo);
@@ -250,7 +271,7 @@ pub fn intRangeAtMost(r: Random, comptime T: type, at_least: T, at_most: T) T {
     const info = @typeInfo(T).int;
     if (info.signedness == .signed) {
         // Two's complement makes this math pretty easy.
-        const UnsignedT = std.meta.Int(.unsigned, info.bits);
+        const UnsignedT = @Int(.unsigned, info.bits);
         const lo: UnsignedT = @bitCast(at_least);
         const hi: UnsignedT = @bitCast(at_most);
         const result = lo +% r.uintAtMost(UnsignedT, hi -% lo);

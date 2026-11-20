@@ -1,5 +1,7 @@
-const std = @import("../../std.zig");
 const builtin = @import("builtin");
+
+const std = @import("../../std.zig");
+const assert = std.debug.assert;
 const linux = std.os.linux;
 const mem = std.mem;
 const elf = std.elf;
@@ -8,26 +10,26 @@ const expectEqual = std.testing.expectEqual;
 const fs = std.fs;
 
 test "fallocate" {
-    if (builtin.cpu.arch.isMIPS64() and (builtin.abi == .gnuabin32 or builtin.abi == .muslabin32)) return error.SkipZigTest; // https://github.com/ziglang/zig/issues/23809
+    const io = std.testing.io;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = "test_fallocate";
-    const file = try tmp.dir.createFile(path, .{ .truncate = true, .mode = 0o666 });
-    defer file.close();
+    const file = try tmp.dir.createFile(io, path, .{ .truncate = true, .permissions = .fromMode(0o666) });
+    defer file.close(io);
 
-    try expect((try file.stat()).size == 0);
+    try expect((try file.stat(io)).size == 0);
 
     const len: i64 = 65536;
-    switch (linux.E.init(linux.fallocate(file.handle, 0, 0, len))) {
+    switch (linux.errno(linux.fallocate(file.handle, 0, 0, len))) {
         .SUCCESS => {},
         .NOSYS => return error.SkipZigTest,
         .OPNOTSUPP => return error.SkipZigTest,
         else => |errno| std.debug.panic("unhandled errno: {}", .{errno}),
     }
 
-    try expect((try file.stat()).size == len);
+    try expect((try file.stat(io)).size == len);
 }
 
 test "getpid" {
@@ -40,11 +42,11 @@ test "getppid" {
 
 test "timer" {
     const epoll_fd = linux.epoll_create();
-    var err: linux.E = linux.E.init(epoll_fd);
+    var err: linux.E = linux.errno(epoll_fd);
     try expect(err == .SUCCESS);
 
     const timer_fd = linux.timerfd_create(linux.TIMERFD_CLOCK.MONOTONIC, .{});
-    try expect(linux.E.init(timer_fd) == .SUCCESS);
+    try expect(linux.errno(timer_fd) == .SUCCESS);
 
     const time_interval = linux.timespec{
         .sec = 0,
@@ -56,7 +58,7 @@ test "timer" {
         .it_value = time_interval,
     };
 
-    err = linux.E.init(linux.timerfd_settime(@as(i32, @intCast(timer_fd)), .{}, &new_time, null));
+    err = linux.errno(linux.timerfd_settime(@as(i32, @intCast(timer_fd)), .{}, &new_time, null));
     try expect(err == .SUCCESS);
 
     var event = linux.epoll_event{
@@ -64,158 +66,142 @@ test "timer" {
         .data = linux.epoll_data{ .ptr = 0 },
     };
 
-    err = linux.E.init(linux.epoll_ctl(@as(i32, @intCast(epoll_fd)), linux.EPOLL.CTL_ADD, @as(i32, @intCast(timer_fd)), &event));
+    err = linux.errno(linux.epoll_ctl(@as(i32, @intCast(epoll_fd)), linux.EPOLL.CTL_ADD, @as(i32, @intCast(timer_fd)), &event));
     try expect(err == .SUCCESS);
 
     const events_one: linux.epoll_event = undefined;
-    var events = [_]linux.epoll_event{events_one} ** 8;
+    var events: [8]linux.epoll_event = @splat(events_one);
 
-    err = linux.E.init(linux.epoll_wait(@as(i32, @intCast(epoll_fd)), &events, 8, -1));
+    err = linux.errno(linux.epoll_wait(@as(i32, @intCast(epoll_fd)), &events, 8, -1));
     try expect(err == .SUCCESS);
 }
 
 test "statx" {
+    const io = std.testing.io;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const tmp_file_name = "just_a_temporary_file.txt";
-    var file = try tmp.dir.createFile(tmp_file_name, .{});
-    defer file.close();
+    var file = try tmp.dir.createFile(io, tmp_file_name, .{});
+    defer file.close(io);
 
-    var statx_buf: linux.Statx = undefined;
-    switch (linux.E.init(linux.statx(file.handle, "", linux.AT.EMPTY_PATH, linux.STATX_BASIC_STATS, &statx_buf))) {
+    var buf: linux.Statx = undefined;
+    switch (linux.errno(linux.statx(file.handle, "", linux.AT.EMPTY_PATH, .BASIC_STATS, &buf))) {
         .SUCCESS => {},
         else => unreachable,
     }
 
-    if (builtin.cpu.arch == .riscv32 or builtin.cpu.arch.isLoongArch()) return error.SkipZigTest; // No fstatat, so the rest of the test is meaningless.
-
-    var stat_buf: linux.Stat = undefined;
-    switch (linux.E.init(linux.fstatat(file.handle, "", &stat_buf, linux.AT.EMPTY_PATH))) {
-        .SUCCESS => {},
-        else => unreachable,
-    }
-
-    try expect(stat_buf.mode == statx_buf.mode);
-    try expect(@as(u32, @bitCast(stat_buf.uid)) == statx_buf.uid);
-    try expect(@as(u32, @bitCast(stat_buf.gid)) == statx_buf.gid);
-    try expect(@as(u64, @bitCast(@as(i64, stat_buf.size))) == statx_buf.size);
-    try expect(@as(u64, @bitCast(@as(i64, stat_buf.blksize))) == statx_buf.blksize);
-    try expect(@as(u64, @bitCast(@as(i64, stat_buf.blocks))) == statx_buf.blocks);
+    const uid = linux.getuid();
+    const gid = linux.getgid();
+    if (buf.mask.MODE)
+        try expectEqual(@as(linux.mode_t, linux.S.IFREG), buf.mode & linux.S.IFMT);
+    if (buf.mask.UID)
+        try expectEqual(uid, buf.uid);
+    if (buf.mask.GID)
+        try expectEqual(gid, buf.gid);
+    if (buf.mask.SIZE)
+        try expectEqual(@as(u64, 0), buf.size);
 }
 
 test "user and group ids" {
     if (builtin.link_libc) return error.SkipZigTest;
-    try expectEqual(linux.getauxval(elf.AT_UID), linux.getuid());
-    try expectEqual(linux.getauxval(elf.AT_GID), linux.getgid());
-    try expectEqual(linux.getauxval(elf.AT_EUID), linux.geteuid());
-    try expectEqual(linux.getauxval(elf.AT_EGID), linux.getegid());
+    try expectEqual(linux.getauxval(elf.AT.UID), linux.getuid());
+    try expectEqual(linux.getauxval(elf.AT.GID), linux.getgid());
+    try expectEqual(linux.getauxval(elf.AT.EUID), linux.geteuid());
+    try expectEqual(linux.getauxval(elf.AT.EGID), linux.getegid());
 }
 
 test "fadvise" {
+    const io = std.testing.io;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const tmp_file_name = "temp_posix_fadvise.txt";
-    var file = try tmp.dir.createFile(tmp_file_name, .{});
-    defer file.close();
+    var file = try tmp.dir.createFile(io, tmp_file_name, .{});
+    defer file.close(io);
 
     var buf: [2048]u8 = undefined;
-    try file.writeAll(&buf);
+    try file.writeStreamingAll(io, &buf);
 
     const ret = linux.fadvise(file.handle, 0, 0, linux.POSIX_FADV.SEQUENTIAL);
     try expectEqual(@as(usize, 0), ret);
 }
 
 test "sigset_t" {
-    std.debug.assert(@sizeOf(linux.sigset_t) == (linux.NSIG / 8));
+    const SIG = linux.SIG;
+    assert(@sizeOf(linux.sigset_t) == (linux.NSIG / 8));
 
     var sigset = linux.sigemptyset();
 
     // See that none are set, then set each one, see that they're all set, then
     // remove them all, and then see that none are set.
     for (1..linux.NSIG) |i| {
-        try expectEqual(linux.sigismember(&sigset, @truncate(i)), false);
+        const sig = std.enums.fromInt(SIG, i) orelse continue;
+        try expectEqual(false, linux.sigismember(&sigset, sig));
     }
     for (1..linux.NSIG) |i| {
-        linux.sigaddset(&sigset, @truncate(i));
+        const sig = std.enums.fromInt(SIG, i) orelse continue;
+        linux.sigaddset(&sigset, sig);
     }
     for (1..linux.NSIG) |i| {
-        try expectEqual(linux.sigismember(&sigset, @truncate(i)), true);
+        const sig = std.enums.fromInt(SIG, i) orelse continue;
+        try expectEqual(true, linux.sigismember(&sigset, sig));
     }
     for (1..linux.NSIG) |i| {
-        linux.sigdelset(&sigset, @truncate(i));
+        const sig = std.enums.fromInt(SIG, i) orelse continue;
+        linux.sigdelset(&sigset, sig);
     }
     for (1..linux.NSIG) |i| {
-        try expectEqual(linux.sigismember(&sigset, @truncate(i)), false);
+        const sig = std.enums.fromInt(SIG, i) orelse continue;
+        try expectEqual(false, linux.sigismember(&sigset, sig));
     }
+}
 
-    // Kernel sigset_t is either 2+ 32-bit values or 1+ 64-bit value(s).
-    const sigset_len = @typeInfo(linux.sigset_t).array.len;
-    const sigset_elemis64 = 64 == @bitSizeOf(@typeInfo(linux.sigset_t).array.child);
+test "sigdelset" {
+    var set = linux.sigemptyset();
 
-    linux.sigaddset(&sigset, 1);
-    try expectEqual(sigset[0], 1);
-    if (sigset_len > 1) {
-        try expectEqual(sigset[1], 0);
-    }
-
-    linux.sigaddset(&sigset, 31);
-    try expectEqual(sigset[0], 0x4000_0001);
-    if (sigset_len > 1) {
-        try expectEqual(sigset[1], 0);
-    }
-
-    linux.sigaddset(&sigset, 36);
-    if (sigset_elemis64) {
-        try expectEqual(sigset[0], 0x8_4000_0001);
-    } else {
-        try expectEqual(sigset[0], 0x4000_0001);
-        try expectEqual(sigset[1], 0x8);
-    }
-
-    linux.sigaddset(&sigset, 64);
-    if (sigset_elemis64) {
-        try expectEqual(sigset[0], 0x8000_0008_4000_0001);
-    } else {
-        try expectEqual(sigset[0], 0x4000_0001);
-        try expectEqual(sigset[1], 0x8000_0008);
-    }
+    // Deleting an absent signal must leave it absent.
+    linux.sigdelset(&set, linux.SIG.USR1);
+    try expectEqual(false, linux.sigismember(&set, linux.SIG.USR1));
 }
 
 test "sigfillset" {
     // unlike the C library, all the signals are set in the kernel-level fillset
     const sigset = linux.sigfillset();
     for (1..linux.NSIG) |i| {
-        try expectEqual(linux.sigismember(&sigset, @truncate(i)), true);
+        const sig = std.enums.fromInt(linux.SIG, i) orelse continue;
+        try expectEqual(true, linux.sigismember(&sigset, sig));
     }
 }
 
 test "sigemptyset" {
     const sigset = linux.sigemptyset();
     for (1..linux.NSIG) |i| {
-        try expectEqual(linux.sigismember(&sigset, @truncate(i)), false);
+        const sig = std.enums.fromInt(linux.SIG, i) orelse continue;
+        try expectEqual(false, linux.sigismember(&sigset, sig));
     }
 }
 
 test "sysinfo" {
     var info: linux.Sysinfo = undefined;
     const result: usize = linux.sysinfo(&info);
-    try expect(std.os.linux.E.init(result) == .SUCCESS);
+    try expect(std.os.linux.errno(result) == .SUCCESS);
 
     try expect(info.mem_unit > 0);
     try expect(info.mem_unit <= std.heap.page_size_max);
 }
 
 comptime {
-    std.debug.assert(128 == @as(u32, @bitCast(linux.FUTEX_OP{ .cmd = @enumFromInt(0), .private = true, .realtime = false })));
-    std.debug.assert(256 == @as(u32, @bitCast(linux.FUTEX_OP{ .cmd = @enumFromInt(0), .private = false, .realtime = true })));
+    assert(128 == @as(u32, @bitCast(linux.FUTEX_OP{ .cmd = @fromBackingInt(@intCast(0)), .private = true, .realtime = false })));
+    assert(256 == @as(u32, @bitCast(linux.FUTEX_OP{ .cmd = @fromBackingInt(@intCast(0)), .private = false, .realtime = true })));
 
     // Check futex_param4 union is packed correctly
     const param_union = linux.futex_param4{
         .val2 = 0xaabbcc,
     };
-    std.debug.assert(@intFromPtr(param_union.timeout) == 0xaabbcc);
+    assert(@intFromPtr(param_union.timeout) == 0xaabbcc);
 }
 
 test "futex v1" {
@@ -224,17 +210,17 @@ test "futex v1" {
 
     // No-op wait, lock value is not expected value
     rc = linux.futex(&lock.raw, .{ .cmd = .WAIT, .private = true }, 2, .{ .timeout = null }, null, 0);
-    try expectEqual(.AGAIN, linux.E.init(rc));
+    try expectEqual(.AGAIN, linux.errno(rc));
 
     rc = linux.futex_4arg(&lock.raw, .{ .cmd = .WAIT, .private = true }, 2, null);
-    try expectEqual(.AGAIN, linux.E.init(rc));
+    try expectEqual(.AGAIN, linux.errno(rc));
 
     // Short-fuse wait, timeout kicks in
     rc = linux.futex(&lock.raw, .{ .cmd = .WAIT, .private = true }, 1, .{ .timeout = &.{ .sec = 0, .nsec = 2 } }, null, 0);
-    try expectEqual(.TIMEDOUT, linux.E.init(rc));
+    try expectEqual(.TIMEDOUT, linux.errno(rc));
 
     rc = linux.futex_4arg(&lock.raw, .{ .cmd = .WAIT, .private = true }, 1, &.{ .sec = 0, .nsec = 2 });
-    try expectEqual(.TIMEDOUT, linux.E.init(rc));
+    try expectEqual(.TIMEDOUT, linux.errno(rc));
 
     // Wakeup (no waiters)
     rc = linux.futex(&lock.raw, .{ .cmd = .WAKE, .private = true }, 2, .{ .timeout = null }, null, 0);
@@ -245,7 +231,7 @@ test "futex v1" {
 
     // CMP_REQUEUE - val3 mismatch
     rc = linux.futex(&lock.raw, .{ .cmd = .CMP_REQUEUE, .private = true }, 2, .{ .val2 = 0 }, null, 99);
-    try expectEqual(.AGAIN, linux.E.init(rc));
+    try expectEqual(.AGAIN, linux.errno(rc));
 
     // CMP_REQUEUE - requeue (but no waiters, so ... not much)
     {
@@ -278,12 +264,12 @@ test "futex v1" {
     {
         // val1 return early
         rc = linux.futex(&lock.raw, .{ .cmd = .WAIT_BITSET, .private = true }, 2, .{ .timeout = null }, null, 0xfff);
-        try expectEqual(.AGAIN, linux.E.init(rc));
+        try expectEqual(.AGAIN, linux.errno(rc));
 
         // timeout wait
         const timeout: linux.timespec = .{ .sec = 0, .nsec = 2 };
         rc = linux.futex(&lock.raw, .{ .cmd = .WAIT_BITSET, .private = true }, 1, .{ .timeout = &timeout }, null, 0xfff);
-        try expectEqual(.TIMEDOUT, linux.E.init(rc));
+        try expectEqual(.TIMEDOUT, linux.errno(rc));
     }
 
     // WAKE_BITSET
@@ -293,13 +279,13 @@ test "futex v1" {
 
         // bitmask must have at least 1 bit set:
         rc = linux.futex(&lock.raw, .{ .cmd = .WAKE_BITSET, .private = true }, 2, .{ .timeout = null }, null, 0);
-        try expectEqual(.INVAL, linux.E.init(rc));
+        try expectEqual(.INVAL, linux.errno(rc));
     }
 }
 
 comptime {
-    std.debug.assert(2 == @as(u32, @bitCast(linux.FUTEX2_FLAGS{ .size = .U32, .private = false })));
-    std.debug.assert(128 == @as(u32, @bitCast(linux.FUTEX2_FLAGS{ .size = @enumFromInt(0), .private = true })));
+    assert(2 == @as(u32, @bitCast(linux.FUTEX2_FLAGS{ .size = .U32, .private = false })));
+    assert(128 == @as(u32, @bitCast(linux.FUTEX2_FLAGS{ .size = @fromBackingInt(@intCast(0)), .private = true })));
 }
 
 test "futex2_waitv" {
@@ -329,7 +315,7 @@ test "futex2_waitv" {
 
     const timeout = linux.kernel_timespec{ .sec = 0, .nsec = 2 }; // absolute timeout, so this is 1970...
     const rc = linux.futex2_waitv(&futexes, futexes.len, .{}, &timeout, .MONOTONIC);
-    switch (linux.E.init(rc)) {
+    switch (linux.errno(rc)) {
         .NOSYS => return error.SkipZigTest, // futex2_waitv added in kernel v5.16
         else => |err| try expectEqual(.TIMEDOUT, err),
     }
@@ -340,7 +326,7 @@ test "futex2_waitv" {
 fn futex2_skip_if_unsupported() !void {
     const lock: u32 = 0;
     const rc = linux.futex2_wake(&lock, 0, 1, .{ .size = .U32, .private = true });
-    if (linux.E.init(rc) == .NOSYS) {
+    if (linux.errno(rc) == .NOSYS) {
         return error.SkipZigTest;
     }
 }
@@ -356,23 +342,23 @@ test "futex2_wait" {
     // (at least) they're not implemented.
     if (false) {
         rc = linux.futex2_wait(&lock.raw, 1, mask, .{ .size = .U8, .private = true }, null, .MONOTONIC);
-        try expectEqual(.INVAL, linux.E.init(rc));
+        try expectEqual(.INVAL, linux.errno(rc));
 
         rc = linux.futex2_wait(&lock.raw, 1, mask, .{ .size = .U16, .private = true }, null, .MONOTONIC);
-        try expectEqual(.INVAL, linux.E.init(rc));
+        try expectEqual(.INVAL, linux.errno(rc));
 
         rc = linux.futex2_wait(&lock.raw, 1, mask, .{ .size = .U64, .private = true }, null, .MONOTONIC);
-        try expectEqual(.INVAL, linux.E.init(rc));
+        try expectEqual(.INVAL, linux.errno(rc));
     }
 
     const flags = linux.FUTEX2_FLAGS{ .size = .U32, .private = true };
     // no-wait, lock state mismatch
     rc = linux.futex2_wait(&lock.raw, 2, mask, flags, null, .MONOTONIC);
-    try expectEqual(.AGAIN, linux.E.init(rc));
+    try expectEqual(.AGAIN, linux.errno(rc));
 
     // hit timeout on wait
     rc = linux.futex2_wait(&lock.raw, 1, mask, flags, &.{ .sec = 0, .nsec = 2 }, .MONOTONIC);
-    try expectEqual(.TIMEDOUT, linux.E.init(rc));
+    try expectEqual(.TIMEDOUT, linux.errno(rc));
 
     // timeout is absolute
     {
@@ -386,11 +372,11 @@ test "futex2_wait" {
             .nsec = curr.nsec + 2,
         };
         rc = linux.futex2_wait(&lock.raw, 1, mask, flags, &timeout, .MONOTONIC);
-        try expectEqual(.TIMEDOUT, linux.E.init(rc));
+        try expectEqual(.TIMEDOUT, linux.errno(rc));
     }
 
     rc = linux.futex2_wait(&lock.raw, 1, mask, flags, &.{ .sec = 0, .nsec = 2 }, .REALTIME);
-    try expectEqual(.TIMEDOUT, linux.E.init(rc));
+    try expectEqual(.TIMEDOUT, linux.errno(rc));
 }
 
 test "futex2_wake" {
@@ -425,6 +411,42 @@ test "futex2_requeue" {
 
     const rc = linux.futex2_requeue(&futexes, .{}, 2, 2);
     try expectEqual(0, rc);
+}
+
+test "timerfd" {
+    const tfd: linux.fd_t = rc: {
+        const rc = linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true });
+        switch (linux.errno(rc)) {
+            .SUCCESS => break :rc @intCast(rc),
+            else => @panic("test failed"),
+        }
+    };
+    defer _ = linux.close(tfd);
+
+    // Fire event 10_000_000ns = 10ms after the posix.timerfd_settime call.
+    var sit: linux.itimerspec = .{ .it_interval = .{ .sec = 0, .nsec = 0 }, .it_value = .{ .sec = 0, .nsec = 10 * (1000 * 1000) } };
+    const flags: linux.TFD.TIMER = .{};
+    switch (linux.errno(linux.timerfd_settime(tfd, @bitCast(flags), &sit, null))) {
+        .SUCCESS => {},
+        else => @panic("test failed"),
+    }
+
+    var fds: [1]std.posix.pollfd = .{.{ .fd = tfd, .events = linux.POLL.IN }};
+    try expectEqual(@as(usize, 1), try std.posix.poll(&fds, -1)); // -1 => infinite waiting
+
+    const git = rc: {
+        var curr_value: linux.itimerspec = undefined;
+        const rc = linux.timerfd_gettime(tfd, &curr_value);
+        switch (linux.errno(rc)) {
+            .SUCCESS => break :rc curr_value,
+            else => @panic("test failed"),
+        }
+    };
+    const expect_disarmed_timer: linux.itimerspec = .{
+        .it_interval = .{ .sec = 0, .nsec = 0 },
+        .it_value = .{ .sec = 0, .nsec = 0 },
+    };
+    try expectEqual(expect_disarmed_timer, git);
 }
 
 test {

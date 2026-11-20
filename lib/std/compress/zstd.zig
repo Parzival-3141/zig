@@ -88,6 +88,17 @@ fn testDecompress(gpa: std.mem.Allocator, compressed: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
+/// Create a `Decompress` from `compressed` and immediately discard all output. Returns the number
+/// of discarded bytes.
+fn testDiscard(gpa: std.mem.Allocator, compressed: []const u8) !usize {
+    const buf: []u8 = try gpa.alloc(u8, default_window_len + block_size_max);
+    defer gpa.free(buf);
+
+    var in: std.Io.Reader = .fixed(compressed);
+    var zstd_stream: Decompress = .init(&in, buf, .{});
+    return try zstd_stream.reader.discardRemaining();
+}
+
 fn testExpectDecompress(uncompressed: []const u8, compressed: []const u8) !void {
     const gpa = std.testing.allocator;
     const result = try testDecompress(gpa, compressed);
@@ -108,15 +119,6 @@ fn testExpectDecompressError(err: anyerror, compressed: []const u8) !void {
         zstd_stream.reader.streamRemaining(&out.writer),
     );
     try std.testing.expectError(err, zstd_stream.err orelse {});
-}
-
-test Decompress {
-    const uncompressed = @embedFile("testdata/rfc8478.txt");
-    const compressed3 = @embedFile("testdata/rfc8478.txt.zst.3");
-    const compressed19 = @embedFile("testdata/rfc8478.txt.zst.19");
-
-    try testExpectDecompress(uncompressed, compressed3);
-    try testExpectDecompress(uncompressed, compressed19);
 }
 
 test "partial magic number" {

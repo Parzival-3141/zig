@@ -5,9 +5,8 @@ pub const autoHash = auto_hash.autoHash;
 pub const autoHashStrat = auto_hash.hash;
 pub const Strategy = auto_hash.HashStrategy;
 
-// pub for polynomials + generic crc32 construction
 pub const crc = @import("hash/crc.zig");
-pub const Crc32 = crc.Crc32;
+pub const Crc32 = crc.@"CRC-32/ISO-HDLC";
 
 const fnv = @import("hash/fnv.zig");
 pub const Fnv1a_32 = fnv.Fnv1a_32;
@@ -42,7 +41,7 @@ pub fn int(input: anytype) @TypeOf(input) {
     const info = @typeInfo(@TypeOf(input)).int;
     const bits = info.bits;
     // Convert input to unsigned integer (easier to deal with)
-    const Uint = @Type(.{ .int = .{ .bits = bits, .signedness = .unsigned } });
+    const Uint = @Int(.unsigned, bits);
     const u_input: Uint = @bitCast(input);
     if (bits > 256) @compileError("bit widths > 256 are unsupported, use std.hash.autoHash functionality.");
     // For bit widths that don't have a dedicated function, use a heuristic

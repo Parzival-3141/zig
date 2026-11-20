@@ -1,35 +1,51 @@
-#target=x86_64-linux-selfhosted
-#target=x86_64-linux-cbe
-#target=x86_64-windows-cbe
-#update=non-inline version
-#file=main.zig
+#exe {
+-Mroot=main.zig
+#}
+
+#write main.zig {
 pub fn main() !void {
     try foo();
 }
 fn foo() !void {
-    try std.fs.File.stdout().writeAll("Hello, World!\n");
+    try std.Io.File.stdout().writeStreamingAll(io, "Hello, World!\n");
 }
 const std = @import("std");
-#expect_stdout="Hello, World!\n"
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+non-inline version#}
+#check stdout {
+Hello, World!
+#}
 
-#update=make function inline
-#file=main.zig
+#write main.zig {
 pub fn main() !void {
     try foo();
 }
 inline fn foo() !void {
-    try std.fs.File.stdout().writeAll("Hello, World!\n");
+    try std.Io.File.stdout().writeStreamingAll(io, "Hello, World!\n");
 }
 const std = @import("std");
-#expect_stdout="Hello, World!\n"
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+make function inline#}
+#check stdout {
+Hello, World!
+#}
 
-#update=change string
-#file=main.zig
+#write main.zig {
 pub fn main() !void {
     try foo();
 }
 inline fn foo() !void {
-    try std.fs.File.stdout().writeAll("Hello, `inline` World!\n");
+    try std.Io.File.stdout().writeStreamingAll(io, "Hello, `inline` World!\n");
 }
 const std = @import("std");
-#expect_stdout="Hello, `inline` World!\n"
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+change string#}
+#check stdout {
+Hello, `inline` World!
+#}

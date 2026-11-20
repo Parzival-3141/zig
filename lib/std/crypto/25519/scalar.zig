@@ -11,7 +11,7 @@ pub const field_order: u256 = 72370055773322622139731865630429942408571163593799
 pub const CompressedScalar = [32]u8;
 
 /// Zero
-pub const zero = [_]u8{0} ** 32;
+pub const zero: [32]u8 = @splat(0);
 
 const field_order_s = s: {
     var s: [32]u8 = undefined;
@@ -81,7 +81,7 @@ pub fn add(a: CompressedScalar, b: CompressedScalar) CompressedScalar {
 
 /// Return -s (mod L)
 pub fn neg(s: CompressedScalar) CompressedScalar {
-    const fs: [64]u8 = field_order_s ++ [_]u8{0} ** 32;
+    const fs: [64]u8 = field_order_s ++ @as([32]u8, @splat(0));
     var sx: [64]u8 = undefined;
     sx[0..32].* = s;
     @memset(sx[32..], 0);
@@ -101,8 +101,8 @@ pub fn sub(a: CompressedScalar, b: CompressedScalar) CompressedScalar {
 }
 
 /// Return a random scalar < L
-pub fn random() CompressedScalar {
-    return Scalar.random().toBytes();
+pub fn random(io: std.Io) CompressedScalar {
+    return Scalar.random(io).toBytes();
 }
 
 /// A scalar in unpacked representation
@@ -560,10 +560,10 @@ pub const Scalar = struct {
     }
 
     /// Return a random scalar < L.
-    pub fn random() Scalar {
+    pub fn random(io: std.Io) Scalar {
         var s: [64]u8 = undefined;
         while (true) {
-            crypto.random.bytes(&s);
+            io.random(&s);
             const n = Scalar.fromBytes64(s);
             if (!n.isZero()) {
                 return n;
@@ -850,10 +850,10 @@ test "scalar25519" {
     var y = x.toBytes();
     try rejectNonCanonical(y);
     var buf: [128]u8 = undefined;
-    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{X}", .{&y}), "1E979B917937F3DE71D18077F961F6CEFF01030405060708010203040506070F");
+    try std.testing.expectEqualStrings(try std.mem.print(&buf, "{X}", .{&y}), "1E979B917937F3DE71D18077F961F6CEFF01030405060708010203040506070F");
 
     const reduced = reduce(field_order_s);
-    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{X}", .{&reduced}), "0000000000000000000000000000000000000000000000000000000000000000");
+    try std.testing.expectEqualStrings(try std.mem.print(&buf, "{X}", .{&reduced}), "0000000000000000000000000000000000000000000000000000000000000000");
 }
 
 test "non-canonical scalar25519" {
@@ -862,12 +862,12 @@ test "non-canonical scalar25519" {
 }
 
 test "mulAdd overflow check" {
-    const a: [32]u8 = [_]u8{0xff} ** 32;
-    const b: [32]u8 = [_]u8{0xff} ** 32;
-    const c: [32]u8 = [_]u8{0xff} ** 32;
+    const a: [32]u8 = @splat(0xff);
+    const b: [32]u8 = @splat(0xff);
+    const c: [32]u8 = @splat(0xff);
     const x = mulAdd(a, b, c);
     var buf: [128]u8 = undefined;
-    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{X}", .{&x}), "D14DF91389432C25AD60FF9791B9FD1D67BEF517D273ECCE3D9A307C1B419903");
+    try std.testing.expectEqualStrings(try std.mem.print(&buf, "{X}", .{&x}), "D14DF91389432C25AD60FF9791B9FD1D67BEF517D273ECCE3D9A307C1B419903");
 }
 
 test "scalar field inversion" {
@@ -879,13 +879,14 @@ test "scalar field inversion" {
 }
 
 test "random scalar" {
-    const s1 = random();
-    const s2 = random();
+    const io = std.testing.io;
+    const s1 = random(io);
+    const s2 = random(io);
     try std.testing.expect(!mem.eql(u8, &s1, &s2));
 }
 
 test "64-bit reduction" {
-    const bytes = field_order_s ++ [_]u8{0} ** 32;
+    const bytes = field_order_s ++ @as([32]u8, @splat(0));
     const x = Scalar.fromBytes64(bytes);
     try std.testing.expect(x.isZero());
 }

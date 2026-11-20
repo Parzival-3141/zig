@@ -20,14 +20,14 @@ const stdlib_renames = std.StaticStringMap([]const u8).initComptime(.{
     .{ "_llseek", "llseek" },
     .{ "_newselect", "newselect" },
     .{ "_sysctl", "sysctl" },
-    // Most 64-bit archs.
-    .{ "newfstat", "fstat64" },
-    .{ "newfstatat", "fstatat64" },
-    // POWER.
-    .{ "sync_file_range2", "sync_file_range" },
     // ARM EABI/Thumb.
     .{ "arm_sync_file_range", "sync_file_range" },
     .{ "arm_fadvise64_64", "fadvise64_64" },
+    // Alpha
+    // See https://github.com/torvalds/linux/blob/8bf22c33e7a172fbc72464f4cc484d23a6b412ba/arch/alpha/include/uapi/asm/unistd.h#L10
+    .{ "getxpid", "getpid" },
+    .{ "getxuid", "getuid" },
+    .{ "getxgid", "getgid" },
 });
 
 /// Filter syscalls that aren't actually syscalls.
@@ -73,6 +73,7 @@ const Abi = enum {
     nios2,
     or1k,
     riscv,
+    hexagon,
 };
 
 const __X32_SYSCALL_BIT: u32 = 0x40000000;
@@ -155,39 +156,41 @@ const architectures: []const Arch = &.{
     .{ .@"var" = "PowerPC64", .table = .{ .specific = "arch/powerpc/kernel/syscalls/syscall.tbl" }, .abi = &.{ .common, .@"64", .nospu } },
     .{ .@"var" = "S390x", .table = .{ .specific = "arch/s390/kernel/syscalls/syscall.tbl" }, .abi = &.{ .common, .@"64" } },
     .{ .@"var" = "Xtensa", .table = .{ .specific = "arch/xtensa/kernel/syscalls/syscall.tbl" } },
+    .{ .@"var" = "Alpha", .table = .{ .specific = "arch/alpha/kernel/syscalls/syscall.tbl" } },
     .{ .@"var" = "Arm64", .table = .generic, .abi = &.{ .common, .@"64", .renameat, .rlimit, .memfd_secret } },
     .{ .@"var" = "RiscV32", .table = .generic, .abi = &.{ .common, .@"32", .riscv, .memfd_secret } },
     .{ .@"var" = "RiscV64", .table = .generic, .abi = &.{ .common, .@"64", .riscv, .rlimit, .memfd_secret } },
+    .{ .@"var" = "LoongArch32", .table = .generic, .abi = &.{ .common, .@"32" } },
     .{ .@"var" = "LoongArch64", .table = .generic, .abi = &.{ .common, .@"64" } },
     .{ .@"var" = "Arc", .table = .generic, .abi = &.{ .common, .@"32", .arc, .time32, .renameat, .stat64, .rlimit } },
     .{ .@"var" = "CSky", .table = .generic, .abi = &.{ .common, .@"32", .csky, .time32, .stat64, .rlimit } },
-    .{ .@"var" = "Hexagon", .table = .generic, .abi = &.{ .common, .@"32", .time32, .stat64, .rlimit, .renameat } },
+    .{ .@"var" = "Hexagon", .table = .generic, .abi = &.{ .common, .@"32", .hexagon, .time32, .stat64, .rlimit, .renameat } },
     .{ .@"var" = "OpenRisc", .table = .generic, .abi = &.{ .common, .@"32", .or1k, .time32, .stat64, .rlimit, .renameat } },
-    // .{ .@"var" = "Nios2", .table = .generic, .abi = &.{ .common, .@"32", .nios2, .time32, .stat64, .rlimit, .renameat } },
-    // .{ .@"var" = "Parisc", .table = .{ .specific = "arch/parisc/kernel/syscalls/syscall.tbl" }, .abi = &.{ .common, .@"32" } },
-    // .{ .@"var" = "Parisc64", .table = .{ .specific = "arch/parisc/kernel/syscalls/syscall.tbl" }, .abi = &.{ .common, .@"64" } },
-    // .{ .@"var" = "Sh", .table = .{ .specific = "arch/sh/kernel/syscalls/syscall.tbl" } },
-    // .{ .@"var" = "Microblaze", .table = .{ .specific = "arch/microblaze/kernel/syscalls/syscall.tbl" } },
+    .{ .@"var" = "Hppa", .table = .{ .specific = "arch/parisc/kernel/syscalls/syscall.tbl" }, .abi = &.{ .common, .@"32" } },
+    .{ .@"var" = "Hppa64", .table = .{ .specific = "arch/parisc/kernel/syscalls/syscall.tbl" }, .abi = &.{ .common, .@"64" } },
+    .{ .@"var" = "Sh", .table = .{ .specific = "arch/sh/kernel/syscalls/syscall.tbl" } },
+    .{ .@"var" = "Microblaze", .table = .{ .specific = "arch/microblaze/kernel/syscalls/syscall.tbl" } },
 };
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const gpa = arena.allocator();
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
 
-    const args = try std.process.argsAlloc(gpa);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2 or mem.eql(u8, args[1], "--help")) {
-        usage(std.debug.lockStderrWriter(&.{}), args[0]) catch std.process.exit(2);
+        const stderr = std.debug.lockStderr(&.{});
+        const w = &stderr.file_writer.interface;
+        usage(w, args[0]) catch std.process.exit(2);
         std.process.exit(1);
     }
     const linux_path = args[1];
 
     var stdout_buffer: [2048]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdout_writer = Io.File.stdout().writerStreaming(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    var linux_dir = try std.fs.cwd().openDir(linux_path, .{});
-    defer linux_dir.close();
+    var linux_dir = try Io.Dir.cwd().openDir(io, linux_path, .{});
+    defer linux_dir.close(io);
 
     // As of 6.11, the largest table is 24195 bytes.
     // 32k should be enough for now.
@@ -196,7 +199,7 @@ pub fn main() !void {
 
     // Fetch the kernel version from the Makefile variables.
     const version = blk: {
-        const head = try linux_dir.readFile("Makefile", buf[0..128]);
+        const head = try linux_dir.readFile(io, "Makefile", buf[0..128]);
         var lines = mem.tokenizeScalar(u8, head, '\n');
         _ = lines.next(); // Skip SPDX identifier
 
@@ -211,15 +214,14 @@ pub fn main() !void {
     };
 
     try Io.Writer.print(stdout,
-        \\// This file is automatically generated, DO NOT edit it manually.
-        \\// See tools/generate_linux_syscalls.zig for more info.
+        \\// This file is automatically generated by tools/generate_linux_syscalls.zig
         \\// This list current as of kernel: {f}
         \\
         \\
     , .{version});
 
     for (architectures, 0..) |arch, i| {
-        const table = try linux_dir.readFile(switch (arch.table) {
+        const table = try linux_dir.readFile(io, switch (arch.table) {
             .generic => "scripts/syscall.tbl",
             .specific => |f| f,
         }, buf);
@@ -248,10 +250,10 @@ pub fn main() !void {
     try Io.Writer.flush(stdout);
 }
 
-fn usage(w: *std.io.Writer, arg0: []const u8) std.io.Writer.Error!void {
+fn usage(w: *std.Io.Writer, arg0: []const u8) std.Io.Writer.Error!void {
     try w.print(
-        \\Usage: {s} /path/to/zig /path/to/linux
-        \\Alternative Usage: zig run /path/to/git/zig/tools/generate_linux_syscalls.zig -- /path/to/zig /path/to/linux
+        \\Usage: {s} /path/to/linux
+        \\Alternative Usage: zig run /path/to/git/zig/tools/generate_linux_syscalls.zig -- /path/to/linux
         \\
         \\Generates the list of Linux syscalls for each supported cpu arch, using the Linux development tree.
         \\Prints to stdout Zig code which you can use to replace the file lib/std/os/linux/syscalls.zig.

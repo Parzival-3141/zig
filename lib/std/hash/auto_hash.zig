@@ -76,6 +76,7 @@ pub fn hash(hasher: anytype, key: anytype, comptime strat: HashStrategy) void {
     switch (@typeInfo(Key)) {
         .noreturn,
         .@"opaque",
+        .spirv,
         .undefined,
         .null,
         .comptime_float,
@@ -91,24 +92,21 @@ pub fn hash(hasher: anytype, key: anytype, comptime strat: HashStrategy) void {
         // Help the optimizer see that hashing an int is easy by inlining!
         // TODO Check if the situation is better after #561 is resolved.
         .int => |int| switch (int.signedness) {
-            .signed => hash(hasher, @as(@Type(.{ .int = .{
-                .bits = int.bits,
-                .signedness = .unsigned,
-            } }), @bitCast(key)), strat),
+            .signed => hash(hasher, @as(@Int(.unsigned, int.bits), @bitCast(key)), strat),
             .unsigned => {
                 if (std.meta.hasUniqueRepresentation(Key)) {
                     @call(.always_inline, Hasher.update, .{ hasher, std.mem.asBytes(&key) });
                 } else {
                     // Take only the part containing the key value, the remaining
                     // bytes are undefined and must not be hashed!
-                    const byte_size = comptime std.math.divCeil(comptime_int, @bitSizeOf(Key), 8) catch unreachable;
+                    const byte_size = @divCeil(@bitSizeOf(Key), 8);
                     @call(.always_inline, Hasher.update, .{ hasher, std.mem.asBytes(&key)[0..byte_size] });
                 }
             },
         },
 
         .bool => hash(hasher, @intFromBool(key), strat),
-        .@"enum" => hash(hasher, @intFromEnum(key), strat),
+        .@"enum" => hash(hasher, @backingInt(key), strat),
         .error_set => hash(hasher, @intFromError(key), strat),
         .@"anyframe", .@"fn" => hash(hasher, @intFromPtr(key), strat),
 
@@ -130,25 +128,23 @@ pub fn hash(hasher: anytype, key: anytype, comptime strat: HashStrategy) void {
         },
 
         .@"struct" => |info| {
-            inline for (info.fields) |field| {
+            inline for (info.field_names) |field_name| {
                 // We reuse the hash of the previous field as the seed for the
                 // next one so that they're dependant.
-                hash(hasher, @field(key, field.name), strat);
+                hash(hasher, @field(key, field_name), strat);
             }
         },
 
-        .@"union" => |info| {
+        .@"union" => |info| blk: {
             if (info.tag_type) |tag_type| {
                 const tag = std.meta.activeTag(key);
                 hash(hasher, tag, strat);
-                inline for (info.fields) |field| {
-                    if (@field(tag_type, field.name) == tag) {
-                        if (field.type != void) {
-                            hash(hasher, @field(key, field.name), strat);
+                inline for (info.field_names, info.field_types) |field_name, field_type| {
+                    if (@field(tag_type, field_name) == tag) {
+                        if (field_type != void) {
+                            hash(hasher, @field(key, field_name), strat);
                         }
-                        // TODO use a labelled break when it does not crash the compiler. cf #2908
-                        // break :blk;
-                        return;
+                        break :blk;
                     }
                 }
                 unreachable;
@@ -170,8 +166,8 @@ inline fn typeContainsSlice(comptime K: type) bool {
         .pointer => |info| info.size == .slice,
 
         inline .@"struct", .@"union" => |info| {
-            inline for (info.fields) |field| {
-                if (typeContainsSlice(field.type)) {
+            inline for (info.field_types) |field_type| {
+                if (typeContainsSlice(field_type)) {
                     return true;
                 }
             }
@@ -229,7 +225,7 @@ fn testHashDeepRecursive(key: anytype) u64 {
 
 test "typeContainsSlice" {
     comptime {
-        try testing.expect(!typeContainsSlice(std.meta.Tag(std.builtin.Type)));
+        try testing.expect(!typeContainsSlice(std.meta.Tag(std.lang.Type)));
 
         try testing.expect(typeContainsSlice([]const u8));
         try testing.expect(!typeContainsSlice(u8));

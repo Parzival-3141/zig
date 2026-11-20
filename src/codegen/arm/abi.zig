@@ -23,61 +23,65 @@ pub const Class = union(enum) {
 pub const Context = enum { ret, arg };
 
 pub fn classifyType(ty: Type, zcu: *Zcu, ctx: Context) Class {
-    assert(ty.hasRuntimeBitsIgnoreComptime(zcu));
+    assert(ty.hasRuntimeBits(zcu));
 
     var maybe_float_bits: ?u16 = null;
     const max_byval_size = 512;
     const ip = &zcu.intern_pool;
     switch (ty.zigTypeTag(zcu)) {
         .@"struct" => {
-            const bit_size = ty.bitSize(zcu);
             if (ty.containerLayout(zcu) == .@"packed") {
-                if (bit_size > 64) return .memory;
+                if (ty.bitSize(zcu) > 64) return .memory;
                 return .byval;
             }
+            const bit_size = ty.abiSize(zcu) * 8;
             if (bit_size > max_byval_size) return .memory;
             const float_count = countFloats(ty, zcu, &maybe_float_bits);
             if (float_count <= byval_float_count) return .byval;
+
+            if (ty.abiAlignment(zcu).compare(.gt, .@"4")) {
+                return Class.arrSize(bit_size, 64);
+            }
 
             const fields = ty.structFieldCount(zcu);
             var i: u32 = 0;
             while (i < fields) : (i += 1) {
                 const field_ty = ty.fieldType(i, zcu);
-                const field_alignment = ty.fieldAlignment(i, zcu);
-                const field_size = field_ty.bitSize(zcu);
-                if (field_size > 32 or field_alignment.compare(.gt, .@"32")) {
-                    return Class.arrSize(bit_size, 64);
-                }
+                if (field_ty.abiSize(zcu) > 4) return Class.arrSize(bit_size, 64);
             }
             return Class.arrSize(bit_size, 32);
         },
         .@"union" => {
-            const bit_size = ty.bitSize(zcu);
             const union_obj = zcu.typeToUnion(ty).?;
-            if (union_obj.flagsUnordered(ip).layout == .@"packed") {
-                if (bit_size > 64) return .memory;
+            if (union_obj.layout == .@"packed") {
+                if (ty.bitSize(zcu) > 64) return .memory;
                 return .byval;
             }
+            const bit_size = ty.abiSize(zcu) * 8;
             if (bit_size > max_byval_size) return .memory;
             const float_count = countFloats(ty, zcu, &maybe_float_bits);
             if (float_count <= byval_float_count) return .byval;
 
-            for (union_obj.field_types.get(ip), 0..) |field_ty, field_index| {
-                if (Type.fromInterned(field_ty).bitSize(zcu) > 32 or
-                    ty.fieldAlignment(field_index, zcu).compare(.gt, .@"32"))
-                {
+            if (union_obj.alignment.compareStrict(.gt, .@"4")) {
+                return Class.arrSize(bit_size, 64);
+            }
+
+            for (union_obj.field_types.get(ip)) |field_ty| {
+                if (Type.fromInterned(field_ty).abiSize(zcu) > 4) {
                     return Class.arrSize(bit_size, 64);
                 }
             }
             return Class.arrSize(bit_size, 32);
         },
-        .bool, .float => return .byval,
+        .bool => return .byval,
         .int => {
-            // TODO this is incorrect for _BitInt(128) but implementing
-            // this correctly makes implementing compiler-rt impossible.
-            // const bit_size = ty.bitSize(zcu);
-            // if (bit_size > 64) return .memory;
+            if (ctx == .ret and ty.intInfo(zcu).bits > 64) return .memory;
             return .byval;
+        },
+        .float => return switch (ty.floatBits(zcu.getTarget())) {
+            else => unreachable,
+            16, 32, 64 => .byval,
+            80, 128 => .{ .i64_array = 2 },
         },
         .@"enum", .error_set => {
             const bit_size = ty.bitSize(zcu);
@@ -111,6 +115,7 @@ pub fn classifyType(ty: Type, zcu: *Zcu, ctx: Context) Class {
         .null,
         .@"fn",
         .@"opaque",
+        .spirv,
         .enum_literal,
         .array,
         => unreachable,

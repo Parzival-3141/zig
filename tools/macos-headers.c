@@ -114,6 +114,9 @@
 #include <tgmath.h>
 #include <time.h>
 /* #include <trace.h> - not found on macos catalina */
+#define _XOPEN_SOURCE
+#include <ucontext.h>
+#undef _XOPEN_SOURCE
 #include <ulimit.h>
 #include <unistd.h>
 #include <utime.h>
@@ -124,6 +127,7 @@
 
 // macOS system headers
 #include <mach/clock.h>
+#include <mach/exception.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach/thread_state.h>
@@ -137,20 +141,51 @@
 #include <sys/clonefile.h>
 #include <libproc.h>
 
+// Mach-O headers
+#include <mach-o/arch.h>
+#include <mach-o/compact_unwind_encoding.h>
+#include <mach-o/dyld.h>
+#include <mach-o/dyld_images.h>
+#include <mach-o/fat.h>
+#include <mach-o/fixup-chains.h>
+#include <mach-o/getsect.h>
+#include <mach-o/ldsyms.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#include <mach-o/ranlib.h>
+#include <mach-o/reloc.h>
+#include <mach-o/stab.h>
+#include <mach-o/swap.h>
+#include <mach-o/utils.h>
+
+#include <mach-o/arm/reloc.h>
+#include <mach-o/arm64/reloc.h>
+#include <mach-o/x86_64/reloc.h>
+
+// Non-POSIX net headers
+#include <net/bpf.h>
+#include <net/dlil.h>
+#include <net/ethernet.h>
+#include <net/if_arp.h>
+#include <net/if_dl.h>
+#include <net/if_llc.h>
+#include <net/if_media.h>
+#include <net/if_mib.h>
+#include <net/if_types.h>
+#include <net/if_utun.h>
+#include <net/if_var_status.h>
+#include <net/if_var.h>
+#include <net/ipsec_offload.h>
+#include <net/kext_net.h>
+#include <net/ndrv.h>
+#include <net/net_kev.h>
+#include <net/pfkeyv2.h>
+#include <net/route.h>
+
 // Depended on by libcxx
 #include <Block.h>
 #include <xlocale.h>
 #include <copyfile.h>
-#include <mach-o/dyld.h>
-#include <mach-o/fat.h>
-#include <mach-o/nlist.h>
-#include <mach-o/reloc.h>
-#include <mach-o/arch.h>
-#include <mach-o/stab.h>
-#include <mach-o/ranlib.h>
-#include <mach-o/compact_unwind_encoding.h>
-#include <mach-o/arm64/reloc.h>
-#include <mach-o/x86_64/reloc.h>
 #include <ar.h>
 
 // Depended on by LLVM
@@ -177,7 +212,8 @@
 #include <os/lock.h>
 #include <simd/simd.h>
 #include <xpc/xpc.h>
-#include <CommonCrypto/CommonDigest.h>
+#include <CommonCrypto/CommonCrypto.h>
+#include <CommonCrypto/CommonRandom.h> // Not included by CommonCrypto.h
 
 #include <objc/message.h>
 #include <objc/NSObject.h>
@@ -188,7 +224,6 @@
 // Depended on by libuv
 #include <paths.h>
 #include <ifaddrs.h>
-#include <net/if_dl.h>
 #include <sys/paths.h>
 
 // Depended on by sqlite-amalgamation
@@ -198,9 +233,6 @@
 // Provided by macOS LibC
 #include <memory.h>
 #include <zlib.h>
-
-#define _XOPEN_SOURCE
-#include <ucontext.h>
 
 int main(int argc, char **argv) {
     return 0;

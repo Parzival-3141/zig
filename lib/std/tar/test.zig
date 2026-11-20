@@ -53,7 +53,7 @@ const trailing_slash_case: Case = .{
     .data = @embedFile("testdata/trailing-slash.tar"),
     .files = &[_]Case.File{
         .{
-            .name = "123456789/" ** 30,
+            .name = @ptrCast(&@as([30][10]u8, @splat("123456789/".*))),
             .kind = .directory,
         },
     },
@@ -64,7 +64,11 @@ const writer_big_long_case: Case = .{
     .data = @embedFile("testdata/writer-big-long.tar"),
     .files = &[_]Case.File{
         .{
-            .name = "longname/" ** 15 ++ "16gig.txt",
+            .name = name: {
+                const buf: [15][9]u8 = @splat("longname/".*);
+                const dir: []const u8 = @ptrCast(&buf);
+                break :name dir ++ "16gig.txt";
+            },
             .size = 16 * 1024 * 1024 * 1024,
             .mode = 0o644,
             .truncated = true,
@@ -336,7 +340,7 @@ fn testCase(case: Case) !void {
     var file_name_buffer: [std.fs.max_path_bytes]u8 = undefined;
     var link_name_buffer: [std.fs.max_path_bytes]u8 = undefined;
 
-    var br: std.io.Reader = .fixed(case.data);
+    var br: std.Io.Reader = .fixed(case.data);
     var it: tar.Iterator = .init(&br, .{
         .file_name_buffer = &file_name_buffer,
         .link_name_buffer = &link_name_buffer,
@@ -387,7 +391,7 @@ fn testLongNameCase(case: Case) !void {
     var min_file_name_buffer: [256]u8 = undefined;
     var min_link_name_buffer: [100]u8 = undefined;
 
-    var br: std.io.Reader = .fixed(case.data);
+    var br: std.Io.Reader = .fixed(case.data);
     var iter: tar.Iterator = .init(&br, .{
         .file_name_buffer = &min_file_name_buffer,
         .link_name_buffer = &min_link_name_buffer,
@@ -407,7 +411,7 @@ test "insufficient buffer in Header name filed" {
     var min_file_name_buffer: [9]u8 = undefined;
     var min_link_name_buffer: [100]u8 = undefined;
 
-    var br: std.io.Reader = .fixed(gnu_case.data);
+    var br: std.Io.Reader = .fixed(gnu_case.data);
     var iter: tar.Iterator = .init(&br, .{
         .file_name_buffer = &min_file_name_buffer,
         .link_name_buffer = &min_link_name_buffer,
@@ -424,6 +428,7 @@ test "insufficient buffer in Header name filed" {
 }
 
 test "should not overwrite existing file" {
+    const io = testing.io;
     // Starting from this folder structure:
     // $ tree root
     //    root
@@ -462,24 +467,25 @@ test "should not overwrite existing file" {
     // This ensures that file is not overwritten.
     //
     const data = @embedFile("testdata/overwrite_file.tar");
-    var r: std.io.Reader = .fixed(data);
+    var r: std.Io.Reader = .fixed(data);
 
     // Unpack with strip_components = 1 should fail
     var root = std.testing.tmpDir(.{});
     defer root.cleanup();
     try testing.expectError(
         error.PathAlreadyExists,
-        tar.pipeToFileSystem(root.dir, &r, .{ .mode_mode = .ignore, .strip_components = 1 }),
+        tar.extract(io, root.dir, &r, .{ .mode_mode = .ignore, .strip_components = 1 }),
     );
 
     // Unpack with strip_components = 0 should pass
     r = .fixed(data);
     var root2 = std.testing.tmpDir(.{});
     defer root2.cleanup();
-    try tar.pipeToFileSystem(root2.dir, &r, .{ .mode_mode = .ignore, .strip_components = 0 });
+    try tar.extract(io, root2.dir, &r, .{ .mode_mode = .ignore, .strip_components = 0 });
 }
 
 test "case sensitivity" {
+    const io = testing.io;
     // Mimicking issue #18089, this tar contains, same file name in two case
     // sensitive name version. Should fail on case insensitive file systems.
     //
@@ -490,18 +496,18 @@ test "case sensitivity" {
     //     18089/alacritty/Darkermatrix.yml
     //
     const data = @embedFile("testdata/18089.tar");
-    var r: std.io.Reader = .fixed(data);
+    var r: std.Io.Reader = .fixed(data);
 
     var root = std.testing.tmpDir(.{});
     defer root.cleanup();
 
-    tar.pipeToFileSystem(root.dir, &r, .{ .mode_mode = .ignore, .strip_components = 1 }) catch |err| {
+    tar.extract(io, root.dir, &r, .{ .mode_mode = .ignore, .strip_components = 1 }) catch |err| {
         // on case insensitive fs we fail on overwrite existing file
         try testing.expectEqual(error.PathAlreadyExists, err);
         return;
     };
 
     // on case sensitive os both files are created
-    try testing.expect((try root.dir.statFile("alacritty/darkermatrix.yml")).kind == .file);
-    try testing.expect((try root.dir.statFile("alacritty/Darkermatrix.yml")).kind == .file);
+    try testing.expect((try root.dir.statFile(io, "alacritty/darkermatrix.yml", .{})).kind == .file);
+    try testing.expect((try root.dir.statFile(io, "alacritty/Darkermatrix.yml", .{})).kind == .file);
 }

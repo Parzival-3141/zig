@@ -4,14 +4,14 @@ const assert = std.debug.assert;
 const Compilation = @import("../Compilation.zig");
 const build_options = @import("build_options");
 const trace = @import("../tracy.zig").trace;
-const Module = @import("../Package/Module.zig");
+const Module = @import("../Module.zig");
 
 pub const BuildError = error{
     OutOfMemory,
     AlreadyReported,
     ZigCompilerNotBuiltWithLLVMExtensions,
     TSANUnsupportedCPUArchitecture,
-};
+} || std.Io.Cancelable;
 
 pub fn buildTsan(comp: *Compilation, prog_node: std.Progress.Node) BuildError!void {
     if (!build_options.have_llvm) {
@@ -25,29 +25,33 @@ pub fn buildTsan(comp: *Compilation, prog_node: std.Progress.Node) BuildError!vo
     defer arena_allocator.deinit();
     const arena = arena_allocator.allocator();
 
+    const io = comp.io;
     const target = comp.getTarget();
     const root_name = switch (target.os.tag) {
         // On Apple platforms, we use the same name as LLVM because the
         // TSAN library implementation hard-codes a check for these names.
-        .driverkit, .macos => "clang_rt.tsan_osx_dynamic",
+        .driverkit, .maccatalyst, .macos => "clang_rt.tsan_osx_dynamic",
         .ios => if (target.abi == .simulator) "clang_rt.tsan_iossim_dynamic" else "clang_rt.tsan_ios_dynamic",
         .tvos => if (target.abi == .simulator) "clang_rt.tsan_tvossim_dynamic" else "clang_rt.tsan_tvos_dynamic",
         .visionos => if (target.abi == .simulator) "clang_rt.tsan_xrossim_dynamic" else "clang_rt.tsan_xros_dynamic",
         .watchos => if (target.abi == .simulator) "clang_rt.tsan_watchossim_dynamic" else "clang_rt.tsan_watchos_dynamic",
         else => "tsan",
     };
-    const link_mode: std.builtin.LinkMode = if (target.os.tag.isDarwin()) .dynamic else .static;
+    const link_mode: std.lang.LinkMode = if (target.os.tag.isDarwin()) .dynamic else .static;
     const output_mode = .Lib;
     const basename = try std.zig.binNameAlloc(arena, .{
         .root_name = root_name,
-        .target = target,
+        .cpu_arch = target.cpu.arch,
+        .os_tag = target.os.tag,
+        .ofmt = target.ofmt,
+        .abi = target.abi,
         .output_mode = output_mode,
         .link_mode = link_mode,
     });
 
     const optimize_mode = comp.compilerRtOptMode();
     const strip = comp.compilerRtStrip();
-    const unwind_tables: std.builtin.UnwindTables =
+    const unwind_tables: std.lang.UnwindTables =
         if (target.cpu.arch == .x86 and target.os.tag == .windows) .none else .async;
     const link_libcpp = target.os.tag.isDarwin();
 
@@ -92,11 +96,10 @@ pub fn buildTsan(comp: *Compilation, prog_node: std.Progress.Node) BuildError!vo
             .sanitize_c = .off,
             .sanitize_thread = false,
             .red_zone = comp.root_mod.red_zone,
-            .omit_frame_pointer = optimize_mode != .Debug and !target.os.tag.isDarwin(),
+            .omit_frame_pointer = comp.root_mod.omit_frame_pointer,
             .valgrind = false,
             .unwind_tables = unwind_tables,
             .optimize_mode = optimize_mode,
-            .structured_cfg = comp.root_mod.structured_cfg,
             .pic = true,
             .no_builtin = true,
             .code_model = comp.root_mod.code_model,
@@ -133,7 +136,7 @@ pub fn buildTsan(comp: *Compilation, prog_node: std.Progress.Node) BuildError!vo
     }
 
     const platform_tsan_sources = switch (target.os.tag) {
-        .ios, .macos, .watchos, .tvos, .visionos => &darwin_tsan_sources,
+        .driverkit, .ios, .maccatalyst, .macos, .watchos, .tvos, .visionos => &darwin_tsan_sources,
         .windows => &windows_tsan_sources,
         else => &unix_tsan_sources,
     };
@@ -277,9 +280,9 @@ pub fn buildTsan(comp: *Compilation, prog_node: std.Progress.Node) BuildError!vo
     const misc_task: Compilation.MiscTask = .libtsan;
 
     var sub_create_diag: Compilation.CreateDiagnostic = undefined;
-    const sub_compilation = Compilation.create(comp.gpa, arena, &sub_create_diag, .{
+    const sub_compilation = Compilation.create(comp.gpa, arena, io, &sub_create_diag, .{
+        .thread_limit = comp.thread_limit,
         .dirs = comp.dirs.withoutLocalCache(),
-        .thread_pool = comp.thread_pool,
         .self_exe_path = comp.self_exe_path,
         .cache_mode = .whole,
         .config = config,
@@ -287,19 +290,21 @@ pub fn buildTsan(comp: *Compilation, prog_node: std.Progress.Node) BuildError!vo
         .root_name = root_name,
         .libc_installation = comp.libc_installation,
         .emit_bin = .yes_cache,
+        .function_sections = true,
+        .data_sections = true,
         .c_source_files = c_source_files.items,
         .verbose_cc = comp.verbose_cc,
         .verbose_link = comp.verbose_link,
         .verbose_air = comp.verbose_air,
         .verbose_llvm_ir = comp.verbose_llvm_ir,
         .verbose_llvm_bc = comp.verbose_llvm_bc,
-        .verbose_cimport = comp.verbose_cimport,
         .verbose_llvm_cpu_features = comp.verbose_llvm_cpu_features,
         .clang_passthrough_mode = comp.clang_passthrough_mode,
         .skip_linker_dependencies = skip_linker_dependencies,
         .linker_allow_shlib_undefined = linker_allow_shlib_undefined,
         .install_name = install_name,
         .headerpad_size = headerpad_size,
+        .environ_map = comp.environ_map,
     }) catch |err| {
         switch (err) {
             else => comp.lockAndSetMiscFailure(misc_task, "unable to build {t}: create compilation failed: {t}", .{ misc_task, err }),
@@ -310,15 +315,16 @@ pub fn buildTsan(comp: *Compilation, prog_node: std.Progress.Node) BuildError!vo
     defer sub_compilation.destroy();
 
     comp.updateSubCompilation(sub_compilation, misc_task, prog_node) catch |err| switch (err) {
-        error.AlreadyReported => return error.AlreadyReported,
+        error.AlreadyReported => |e| return e,
         else => |e| {
             comp.lockAndSetMiscFailure(misc_task, "unable to build {t}: compilation failed: {s}", .{ misc_task, @errorName(e) });
             return error.AlreadyReported;
         },
     };
 
+    // libtsan contains `.preinit_array` entries that must run for correctness, hence `must_link = true`.
     const crt_file = try sub_compilation.toCrtFile();
-    comp.queuePrelinkTaskMode(crt_file.full_object_path, &config);
+    try comp.queuePrelinkTaskMode(crt_file.full_object_path, true, &config);
     assert(comp.tsan_lib == null);
     comp.tsan_lib = crt_file;
 }
@@ -403,6 +409,7 @@ const sanitizer_common_sources = [_][]const u8{
     "sanitizer_flag_parser.cpp",
     "sanitizer_flags.cpp",
     "sanitizer_fuchsia.cpp",
+    "sanitizer_haiku.cpp",
     "sanitizer_libc.cpp",
     "sanitizer_libignore.cpp",
     "sanitizer_linux.cpp",
@@ -420,6 +427,7 @@ const sanitizer_common_sources = [_][]const u8{
     "sanitizer_procmaps_bsd.cpp",
     "sanitizer_procmaps_common.cpp",
     "sanitizer_procmaps_fuchsia.cpp",
+    "sanitizer_procmaps_haiku.cpp",
     "sanitizer_procmaps_linux.cpp",
     "sanitizer_procmaps_mac.cpp",
     "sanitizer_procmaps_solaris.cpp",

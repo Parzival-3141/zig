@@ -1,4 +1,4 @@
-/* Copyright (C) 2000-2025 Free Software Foundation, Inc.
+/* Copyright (C) 2000-2026 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -45,11 +45,7 @@ typedef unsigned long greg_t;
    the register set is an array, we make gregset_t a simple array
    that has the same size as s390_regs.  This is needed for the
    elf_prstatus structure.  */
-#if __WORDSIZE == 64
-# define __NGREG 27
-#else
-# define __NGREG 36
-#endif
+#define __NGREG 27
 #ifdef __USE_MISC
 # define NGREG __NGREG
 #endif

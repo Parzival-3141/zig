@@ -184,7 +184,13 @@ pub const Poly1305 = struct {
         mem.writeInt(u64, out[0..8], st.h[0], .little);
         mem.writeInt(u64, out[8..16], st.h[1], .little);
 
-        std.crypto.secureZero(u8, @as([*]u8, @ptrCast(st))[0..@sizeOf(Poly1305)]);
+        std.crypto.secureZero(Poly1305, st[0..1]);
+    }
+
+    pub fn finalResult(d: *Poly1305) [mac_length]u8 {
+        var result: [mac_length]u8 = undefined;
+        d.final(&result);
+        return result;
     }
 
     pub fn create(out: *[mac_length]u8, msg: []const u8, key: *const [key_length]u8) void {

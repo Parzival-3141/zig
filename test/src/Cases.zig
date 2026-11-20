@@ -1,6 +1,8 @@
 const Cases = @This();
 const builtin = @import("builtin");
+
 const std = @import("std");
+const Io = std.Io;
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const getExternalExecutor = std.zig.system.getExternalExecutor;
@@ -8,8 +10,8 @@ const ArrayList = std.ArrayList;
 
 gpa: Allocator,
 arena: Allocator,
+io: Io,
 cases: std.array_list.Managed(Case),
-translate: std.array_list.Managed(Translate),
 
 pub const IncrementalCase = struct {
     base_path: []const u8,
@@ -26,8 +28,9 @@ pub const DepModule = struct {
 };
 
 pub const Backend = enum {
-    stage1,
-    stage2,
+    /// Test does not care which backend is used; compiler gets to pick the default.
+    auto,
+    selfhosted,
     llvm,
 };
 
@@ -46,7 +49,7 @@ pub const Case = struct {
     /// In order to be able to run e.g. Execution updates, this must be set
     /// to Executable.
     output_mode: std.builtin.OutputMode,
-    optimize_mode: std.builtin.OptimizeMode = .Debug,
+    optimize_mode: std.builtin.Optimize = .debug,
 
     files: std.array_list.Managed(File),
     case: ?union(enum) {
@@ -75,7 +78,7 @@ pub const Case = struct {
     emit_h: bool = false,
     is_test: bool = false,
     expect_exact: bool = false,
-    backend: Backend = .stage2,
+    backend: Backend = .auto,
     link_libc: bool = false,
     pic: ?bool = null,
     pie: ?bool = null,
@@ -124,25 +127,6 @@ pub const Case = struct {
         self.case = .Compile;
         self.addSourceFile("tmp.zig", src);
     }
-};
-
-pub const Translate = struct {
-    /// The name of the test case. This is shown if a test fails, and
-    /// otherwise ignored.
-    name: []const u8,
-
-    input: [:0]const u8,
-    target: std.Build.ResolvedTarget,
-    link_libc: bool,
-    c_frontend: CFrontend,
-    kind: union(enum) {
-        /// Translate the input, run it and check that it
-        /// outputs the expected text.
-        run: []const u8,
-        /// Translate the input and check that it contains
-        /// the expected lines of code.
-        translate: []const []const u8,
-    },
 };
 
 pub fn addExe(
@@ -271,26 +255,6 @@ pub fn addC(ctx: *Cases, name: []const u8, target: std.Build.ResolvedTarget) *Ca
     return &ctx.cases.items[ctx.cases.items.len - 1];
 }
 
-pub fn addCompareOutput(
-    ctx: *Cases,
-    name: []const u8,
-    src: [:0]const u8,
-    expected_stdout: []const u8,
-) void {
-    ctx.addExe(name, .{}).addCompareOutput(src, expected_stdout);
-}
-
-/// Adds a test case that compiles the Zig source given in `src`, executes
-/// it, runs it, and tests the output against `expected_stdout`
-pub fn compareOutput(
-    ctx: *Cases,
-    name: []const u8,
-    src: [:0]const u8,
-    expected_stdout: []const u8,
-) void {
-    return ctx.addCompareOutput(name, src, expected_stdout);
-}
-
 pub fn addTransform(
     ctx: *Cases,
     name: []const u8,
@@ -352,48 +316,63 @@ pub fn addCompile(
 /// Each file should include a test manifest as a contiguous block of comments at
 /// the end of the file. The first line should be the test type, followed by a set of
 /// key-value config values, followed by a blank line, then the expected output.
-pub fn addFromDir(ctx: *Cases, dir: std.fs.Dir, b: *std.Build) void {
+pub fn addFromDir(ctx: *Cases, dir: Io.Dir, path_from_root: []const u8, b: *std.Build) void {
     var current_file: []const u8 = "none";
-    ctx.addFromDirInner(dir, &current_file, b) catch |err| {
-        std.debug.panicExtra(
-            @returnAddress(),
-            "test harness failed to process file '{s}': {s}\n",
-            .{ current_file, @errorName(err) },
-        );
+    ctx.addFromDirInner(dir, path_from_root, &current_file, b) catch |err| {
+        std.debug.panicExtra(@returnAddress(), "test harness failed to process file {q}: {t}", .{
+            current_file, err,
+        });
     };
 }
 
 fn addFromDirInner(
     ctx: *Cases,
-    iterable_dir: std.fs.Dir,
+    iterable_dir: Io.Dir,
+    path_from_root: []const u8,
     /// This is kept up to date with the currently being processed file so
     /// that if any errors occur the caller knows it happened during this file.
     current_file: *[]const u8,
     b: *std.Build,
 ) !void {
+    const io = ctx.io;
     var it = try iterable_dir.walk(ctx.arena);
     var filenames: ArrayList([]const u8) = .empty;
 
-    while (try it.next()) |entry| {
-        if (entry.kind != .file) continue;
-
+    while (try it.next(io)) |entry| {
         // Ignore stuff such as .swp files
         if (!knownFileExtension(entry.basename)) continue;
-        try filenames.append(ctx.arena, try ctx.arena.dupe(u8, entry.path));
+
+        switch (entry.kind) {
+            .file => {
+                b.dependOnFileContents(b.path(b.pathJoin(&.{ path_from_root, entry.path })));
+                try filenames.append(ctx.arena, try ctx.arena.dupe(u8, entry.path));
+            },
+            .directory => {
+                b.dependOnDirectoryContents(b.path(b.pathJoin(&.{ path_from_root, entry.path })));
+            },
+            else => continue,
+        }
     }
 
     for (filenames.items) |filename| {
         current_file.* = filename;
 
         const max_file_size = 10 * 1024 * 1024;
-        const src = try iterable_dir.readFileAllocOptions(ctx.arena, filename, max_file_size, null, .@"1", 0);
+        const src = try iterable_dir.readFileAllocOptions(io, filename, ctx.arena, .limited(max_file_size), .@"1", 0);
 
         // Parse the manifest
         var manifest = try TestManifest.parse(ctx.arena, src);
 
         const backends = try manifest.getConfigForKeyAlloc(ctx.arena, "backend", Backend);
-        const targets = try manifest.getConfigForKeyAlloc(ctx.arena, "target", std.Target.Query);
-        const c_frontends = try manifest.getConfigForKeyAlloc(ctx.arena, "c_frontend", CFrontend);
+        const target_strs = try manifest.getConfigForKeyAlloc(ctx.arena, "target", []const u8);
+        const cpu_features_str = manifest.config_map.get("cpu_features") orelse "";
+        const targets = try ctx.arena.alloc(std.Target.Query, target_strs.len);
+        for (targets, target_strs) |*query, target_str| {
+            query.* = try std.Target.Query.parse(.{
+                .arch_os_abi = target_str,
+                .cpu_features = if (cpu_features_str.len == 0) null else cpu_features_str,
+            });
+        }
         const is_test = try manifest.getConfigForKeyAssertSingle("is_test", bool);
         const link_libc = try manifest.getConfigForKeyAssertSingle("link_libc", bool);
         const output_mode = try manifest.getConfigForKeyAssertSingle("output_mode", std.builtin.OutputMode);
@@ -403,39 +382,6 @@ fn addFromDirInner(
         const emit_bin = try manifest.getConfigForKeyAssertSingle("emit_bin", bool);
         const imports = try manifest.getConfigForKeyAlloc(ctx.arena, "imports", []const u8);
 
-        if (manifest.type == .translate_c) {
-            for (c_frontends) |c_frontend| {
-                for (targets) |target_query| {
-                    const output = try manifest.trailingLinesSplit(ctx.arena);
-                    try ctx.translate.append(.{
-                        .name = try caseNameFromPath(ctx.arena, filename),
-                        .c_frontend = c_frontend,
-                        .target = b.resolveTargetQuery(target_query),
-                        .link_libc = link_libc,
-                        .input = src,
-                        .kind = .{ .translate = output },
-                    });
-                }
-            }
-            continue;
-        }
-        if (manifest.type == .run_translated_c) {
-            for (c_frontends) |c_frontend| {
-                for (targets) |target_query| {
-                    const output = try manifest.trailingSplit(ctx.arena);
-                    try ctx.translate.append(.{
-                        .name = try caseNameFromPath(ctx.arena, filename),
-                        .c_frontend = c_frontend,
-                        .target = b.resolveTargetQuery(target_query),
-                        .link_libc = link_libc,
-                        .input = src,
-                        .kind = .{ .run = output },
-                    });
-                }
-            }
-            continue;
-        }
-
         var cases = std.array_list.Managed(usize).init(ctx.arena);
 
         // Cross-product to get all possible test combinations
@@ -443,13 +389,20 @@ fn addFromDirInner(
             const resolved_target = b.resolveTargetQuery(target_query);
             const target = &resolved_target.result;
             for (backends) |backend| {
-                if (backend == .stage2 and
-                    target.cpu.arch != .aarch64 and target.cpu.arch != .wasm32 and target.cpu.arch != .x86_64 and target.cpu.arch != .spirv64)
-                {
-                    // Other backends don't support new liveness format
+                if (backend == .selfhosted) {
+                    switch (target.cpu.arch) {
+                        .aarch64, .wasm32, .x86_64, .spirv64, .spirv32 => {},
+                        // Other backends don't support new liveness format
+                        else => continue,
+                    }
+                }
+
+                if (backend == .selfhosted and target.cpu.arch == .aarch64) {
+                    // https://codeberg.org/ziglang/zig/pulls/30232#issuecomment-9182045
                     continue;
                 }
-                if (backend == .stage2 and target.os.tag == .macos and
+
+                if (backend == .selfhosted and target.os.tag == .macos and
                     target.cpu.arch == .x86_64 and builtin.cpu.arch == .aarch64)
                 {
                     // Rosetta has issues with ZLD
@@ -492,109 +445,18 @@ fn addFromDirInner(
                     const output = try manifest.trailingSplit(ctx.arena);
                     case.addCompareOutput(src, output);
                 },
-                .translate_c => @panic("c_frontend specified for compile case"),
-                .run_translated_c => @panic("c_frontend specified for compile case"),
                 .cli => @panic("TODO cli tests"),
             }
         }
     }
 }
 
-pub fn init(gpa: Allocator, arena: Allocator) Cases {
+pub fn init(gpa: Allocator, arena: Allocator, io: Io) Cases {
     return .{
         .gpa = gpa,
-        .cases = std.array_list.Managed(Case).init(gpa),
-        .translate = std.array_list.Managed(Translate).init(gpa),
+        .io = io,
+        .cases = .init(gpa),
         .arena = arena,
-    };
-}
-
-pub const TranslateCOptions = struct {
-    skip_translate_c: bool = false,
-    skip_run_translated_c: bool = false,
-};
-pub fn lowerToTranslateCSteps(
-    self: *Cases,
-    b: *std.Build,
-    parent_step: *std.Build.Step,
-    test_filters: []const []const u8,
-    test_target_filters: []const []const u8,
-    target: std.Build.ResolvedTarget,
-    translate_c_options: TranslateCOptions,
-) void {
-    const tests = @import("../tests.zig");
-    const test_translate_c_step = b.step("test-translate-c", "Run the C translation tests");
-    if (!translate_c_options.skip_translate_c) {
-        tests.addTranslateCTests(b, test_translate_c_step, test_filters, test_target_filters);
-        parent_step.dependOn(test_translate_c_step);
-    }
-
-    const test_run_translated_c_step = b.step("test-run-translated-c", "Run the Run-Translated-C tests");
-    if (!translate_c_options.skip_run_translated_c) {
-        tests.addRunTranslatedCTests(b, test_run_translated_c_step, test_filters, target);
-        parent_step.dependOn(test_run_translated_c_step);
-    }
-
-    for (self.translate.items) |case| switch (case.kind) {
-        .run => |output| {
-            if (translate_c_options.skip_run_translated_c) continue;
-            const annotated_case_name = b.fmt("run-translated-c {s}", .{case.name});
-            for (test_filters) |test_filter| {
-                if (std.mem.indexOf(u8, annotated_case_name, test_filter)) |_| break;
-            } else if (test_filters.len > 0) continue;
-            if (!std.process.can_spawn) {
-                std.debug.print("Unable to spawn child processes on {s}, skipping test.\n", .{@tagName(builtin.os.tag)});
-                continue; // Pass test.
-            }
-
-            const write_src = b.addWriteFiles();
-            const file_source = write_src.add("tmp.c", case.input);
-
-            const translate_c = b.addTranslateC(.{
-                .root_source_file = file_source,
-                .optimize = .Debug,
-                .target = case.target,
-                .link_libc = case.link_libc,
-                .use_clang = case.c_frontend == .clang,
-            });
-            translate_c.step.name = b.fmt("{s} translate-c", .{annotated_case_name});
-
-            const run_exe = b.addExecutable(.{
-                .name = "translated_c",
-                .root_module = translate_c.createModule(),
-            });
-            run_exe.step.name = b.fmt("{s} build-exe", .{annotated_case_name});
-            run_exe.root_module.link_libc = true;
-            const run = b.addRunArtifact(run_exe);
-            run.step.name = b.fmt("{s} run", .{annotated_case_name});
-            run.expectStdOutEqual(output);
-            run.skip_foreign_checks = true;
-
-            test_run_translated_c_step.dependOn(&run.step);
-        },
-        .translate => |output| {
-            if (translate_c_options.skip_translate_c) continue;
-            const annotated_case_name = b.fmt("zig translate-c {s}", .{case.name});
-            for (test_filters) |test_filter| {
-                if (std.mem.indexOf(u8, annotated_case_name, test_filter)) |_| break;
-            } else if (test_filters.len > 0) continue;
-
-            const write_src = b.addWriteFiles();
-            const file_source = write_src.add("tmp.c", case.input);
-
-            const translate_c = b.addTranslateC(.{
-                .root_source_file = file_source,
-                .optimize = .Debug,
-                .target = case.target,
-                .link_libc = case.link_libc,
-                .use_clang = case.c_frontend == .clang,
-            });
-            translate_c.step.name = b.fmt("{s} translate-c", .{annotated_case_name});
-
-            const check_file = translate_c.addCheckFile(output);
-            check_file.step.name = b.fmt("{s} CheckFile", .{annotated_case_name});
-            test_translate_c_step.dependOn(&check_file.step);
-        },
     };
 }
 
@@ -603,10 +465,13 @@ pub const CaseTestOptions = struct {
     test_target_filters: []const []const u8,
     skip_compile_errors: bool,
     skip_non_native: bool,
+    skip_spirv: bool,
+    skip_wasm: bool,
     skip_freebsd: bool,
     skip_netbsd: bool,
+    skip_openbsd: bool,
     skip_windows: bool,
-    skip_macos: bool,
+    skip_darwin: bool,
     skip_linux: bool,
     skip_llvm: bool,
     skip_libc: bool,
@@ -618,34 +483,47 @@ pub fn lowerToBuildSteps(
     parent_step: *std.Build.Step,
     options: CaseTestOptions,
 ) void {
-    const host = std.zig.system.resolveTargetQuery(.{}) catch |err|
-        std.debug.panic("unable to detect native host: {s}\n", .{@errorName(err)});
-    const cases_dir_path = b.build_root.join(b.allocator, &.{ "test", "cases" }) catch @panic("OOM");
+    const io = self.io;
+    const graph = b.graph;
+    const arena = graph.arena;
+    const host = b.resolveTargetQuery(.{});
 
     for (self.cases.items) |case| {
         for (options.test_filters) |test_filter| {
-            if (std.mem.indexOf(u8, case.name, test_filter)) |_| break;
+            if (std.mem.find(u8, case.name, test_filter)) |_| break;
         } else if (options.test_filters.len > 0) continue;
 
         if (case.case.? == .Error and options.skip_compile_errors) continue;
 
-        if (options.skip_non_native and !case.target.query.isNative())
+        if (options.skip_non_native and !@import("../tests.zig").isNative(&case.target, &b.graph.host.result))
             continue;
+
+        if (options.skip_spirv and case.target.query.cpu_arch != null and case.target.query.cpu_arch.?.isSpirV()) continue;
+        if (options.skip_wasm and case.target.query.cpu_arch != null and case.target.query.cpu_arch.?.isWasm()) continue;
 
         if (options.skip_freebsd and case.target.query.os_tag == .freebsd) continue;
         if (options.skip_netbsd and case.target.query.os_tag == .netbsd) continue;
+        if (options.skip_openbsd and case.target.query.os_tag == .openbsd) continue;
         if (options.skip_windows and case.target.query.os_tag == .windows) continue;
-        if (options.skip_macos and case.target.query.os_tag == .macos) continue;
+        if (options.skip_darwin and case.target.query.os_tag != null and case.target.query.os_tag.?.isDarwin()) continue;
         if (options.skip_linux and case.target.query.os_tag == .linux) continue;
 
-        const would_use_llvm = @import("../tests.zig").wouldUseLlvm(case.backend == .llvm, case.target.query, case.optimize_mode);
+        const would_use_llvm = @import("../tests.zig").wouldUseLlvm(
+            switch (case.backend) {
+                .auto => null,
+                .selfhosted => false,
+                .llvm => true,
+            },
+            case.target.query,
+            case.optimize_mode,
+        );
         if (options.skip_llvm and would_use_llvm) continue;
 
-        const triple_txt = case.target.query.zigTriple(b.allocator) catch @panic("OOM");
+        const triple_txt = case.target.query.zigTriple(arena) catch @panic("OOM");
 
         if (options.test_target_filters.len > 0) {
             for (options.test_target_filters) |filter| {
-                if (std.mem.indexOf(u8, triple_txt, filter) != null) break;
+                if (std.mem.find(u8, triple_txt, filter) != null) break;
             } else continue;
         }
 
@@ -653,7 +531,7 @@ pub fn lowerToBuildSteps(
             continue;
 
         const writefiles = b.addWriteFiles();
-        var file_sources = std.StringHashMap(std.Build.LazyPath).init(b.allocator);
+        var file_sources = std.StringHashMap(std.Build.LazyPath).init(arena);
         defer file_sources.deinit();
         const first_file = case.files.items[0];
         const root_source_file = writefiles.add(first_file.path, first_file.src);
@@ -663,12 +541,15 @@ pub fn lowerToBuildSteps(
         }
 
         for (case.imports) |import_rel| {
-            const import_abs = std.fs.path.join(b.allocator, &.{
-                cases_dir_path,
-                case.import_path orelse @panic("import_path not set"),
-                import_rel,
-            }) catch @panic("OOM");
-            _ = writefiles.addCopyFile(.{ .cwd_relative = import_abs }, import_rel);
+            _ = writefiles.addCopyFile(.{ .src_path = .{
+                .owner = b,
+                .sub_path = b.pathJoin(&.{
+                    "test",
+                    "cases",
+                    case.import_path orelse @panic("import_path not set"),
+                    import_rel,
+                }),
+            } }, import_rel);
         }
 
         const mod = b.createModule(.{
@@ -707,8 +588,8 @@ pub fn lowerToBuildSteps(
         if (case.pie) |pie| artifact.pie = pie;
 
         switch (case.backend) {
-            .stage1 => continue,
-            .stage2 => {
+            .auto => {},
+            .selfhosted => {
                 artifact.use_llvm = false;
                 artifact.use_lld = false;
             },
@@ -742,7 +623,12 @@ pub fn lowerToBuildSteps(
             },
             .Execution => |expected_stdout| no_exec: {
                 const run = if (case.target.result.ofmt == .c) run_step: {
-                    if (getExternalExecutor(&host, &case.target.result, .{ .link_libc = true }) != .native) {
+                    if (getExternalExecutor(io, &case.target.result, .{
+                        .host_cpu_arch = host.result.cpu.arch,
+                        .host_os_tag = host.result.os.tag,
+                        .link_mode = .dynamic, // TODO: this emulates old behavior until this file is deleted
+                        .link_libc = true,
+                    }) != .native) {
                         // We wouldn't be able to run the compiled C code.
                         break :no_exec;
                     }
@@ -787,37 +673,17 @@ const TestManifestConfigDefaults = struct {
     /// Asserts if the key doesn't exist - yep, it's an oversight alright.
     fn get(@"type": TestManifest.Type, key: []const u8) []const u8 {
         if (std.mem.eql(u8, key, "backend")) {
-            return "stage2";
+            return "auto";
         } else if (std.mem.eql(u8, key, "target")) {
-            if (@"type" == .@"error" or @"type" == .translate_c or @"type" == .run_translated_c) {
+            if (@"type" == .@"error") {
                 return "native";
             }
-            return comptime blk: {
-                var defaults: []const u8 = "";
-                // TODO should we only return "mainstream" targets by default here?
-                // TODO we should also specify ABIs explicitly as the backends are
-                // getting more and more complete
-                // Linux
-                for (&[_][]const u8{ "x86_64", "arm", "aarch64" }) |arch| {
-                    defaults = defaults ++ arch ++ "-linux" ++ ",";
-                }
-                // macOS
-                for (&[_][]const u8{ "x86_64", "aarch64" }) |arch| {
-                    defaults = defaults ++ arch ++ "-macos" ++ ",";
-                }
-                // Windows
-                defaults = defaults ++ "x86_64-windows" ++ ",";
-                // Wasm
-                defaults = defaults ++ "wasm32-wasi";
-                break :blk defaults;
-            };
+            return "native,wasm32-wasi";
         } else if (std.mem.eql(u8, key, "output_mode")) {
             return switch (@"type") {
                 .@"error" => "Obj",
                 .run => "Exe",
                 .compile => "Obj",
-                .translate_c => "Obj",
-                .run_translated_c => "Obj",
                 .cli => @panic("TODO test harness for CLI tests"),
             };
         } else if (std.mem.eql(u8, key, "emit_asm")) {
@@ -836,6 +702,8 @@ const TestManifestConfigDefaults = struct {
             return "null";
         } else if (std.mem.eql(u8, key, "imports")) {
             return "";
+        } else if (std.mem.eql(u8, key, "cpu_features")) {
+            return "";
         } else unreachable;
     }
 };
@@ -844,7 +712,7 @@ const TestManifestConfigDefaults = struct {
 /// (see https://github.com/ziglang/zig/issues/11288)
 ///
 /// error
-/// backend=stage1,stage2
+/// backend=selfhosted,llvm
 /// output_mode=exe
 ///
 /// :3:19: error: foo
@@ -868,6 +736,7 @@ const TestManifest = struct {
         .{ "is_test", {} },
         .{ "output_mode", {} },
         .{ "target", {} },
+        .{ "cpu_features", {} },
         .{ "c_frontend", {} },
         .{ "link_libc", {} },
         .{ "backend", {} },
@@ -881,8 +750,6 @@ const TestManifest = struct {
         run,
         cli,
         compile,
-        translate_c,
-        run_translated_c,
     };
 
     const TrailingIterator = struct {
@@ -951,10 +818,6 @@ const TestManifest = struct {
                 break :blk .cli;
             } else if (std.mem.eql(u8, raw, "compile")) {
                 break :blk .compile;
-            } else if (std.mem.eql(u8, raw, "translate-c")) {
-                break :blk .translate_c;
-            } else if (std.mem.eql(u8, raw, "run-translated-c")) {
-                break :blk .run_translated_c;
             } else {
                 std.log.warn("unknown test case type requested: {s}", .{raw});
                 return error.UnknownTestCaseType;
@@ -1126,14 +989,6 @@ const TestManifest = struct {
         }
     }
 };
-
-fn resolveTargetQuery(query: std.Target.Query) std.Build.ResolvedTarget {
-    return .{
-        .query = query,
-        .target = std.zig.system.resolveTargetQuery(query) catch
-            @panic("unable to resolve target query"),
-    };
-}
 
 fn knownFileExtension(filename: []const u8) bool {
     // List taken from `Compilation.classifyFileExt` in the compiler.

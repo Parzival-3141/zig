@@ -1,54 +1,67 @@
 const builtin = @import("builtin");
 const std = @import("../../std.zig");
-const iovec = std.posix.iovec;
-const iovec_const = std.posix.iovec_const;
-const linux = std.os.linux;
-const SYS = linux.SYS;
-const uid_t = std.os.linux.uid_t;
-const gid_t = std.os.linux.uid_t;
-const pid_t = std.os.linux.pid_t;
-const sockaddr = linux.sockaddr;
-const socklen_t = linux.socklen_t;
-const timespec = std.os.linux.timespec;
+const SYS = std.os.linux.SYS;
 
-pub fn syscall0(number: SYS) usize {
+pub const syscall_arg_t = u32;
+
+pub fn syscall0(
+    number: SYS,
+) u32 {
     return asm volatile ("trap #0"
-        : [ret] "={d0}" (-> usize),
-        : [number] "{d0}" (@intFromEnum(number)),
+        : [ret] "={d0}" (-> u32),
+        : [number] "{d0}" (@backingInt(number)),
         : .{ .memory = true });
 }
 
-pub fn syscall1(number: SYS, arg1: usize) usize {
+pub fn syscall1(
+    number: SYS,
+    arg1: syscall_arg_t,
+) u32 {
     return asm volatile ("trap #0"
-        : [ret] "={d0}" (-> usize),
-        : [number] "{d0}" (@intFromEnum(number)),
+        : [ret] "={d0}" (-> u32),
+        : [number] "{d0}" (@backingInt(number)),
           [arg1] "{d1}" (arg1),
         : .{ .memory = true });
 }
 
-pub fn syscall2(number: SYS, arg1: usize, arg2: usize) usize {
+pub fn syscall2(
+    number: SYS,
+    arg1: syscall_arg_t,
+    arg2: syscall_arg_t,
+) u32 {
     return asm volatile ("trap #0"
-        : [ret] "={d0}" (-> usize),
-        : [number] "{d0}" (@intFromEnum(number)),
+        : [ret] "={d0}" (-> u32),
+        : [number] "{d0}" (@backingInt(number)),
           [arg1] "{d1}" (arg1),
           [arg2] "{d2}" (arg2),
         : .{ .memory = true });
 }
 
-pub fn syscall3(number: SYS, arg1: usize, arg2: usize, arg3: usize) usize {
+pub fn syscall3(
+    number: SYS,
+    arg1: syscall_arg_t,
+    arg2: syscall_arg_t,
+    arg3: syscall_arg_t,
+) u32 {
     return asm volatile ("trap #0"
-        : [ret] "={d0}" (-> usize),
-        : [number] "{d0}" (@intFromEnum(number)),
+        : [ret] "={d0}" (-> u32),
+        : [number] "{d0}" (@backingInt(number)),
           [arg1] "{d1}" (arg1),
           [arg2] "{d2}" (arg2),
           [arg3] "{d3}" (arg3),
         : .{ .memory = true });
 }
 
-pub fn syscall4(number: SYS, arg1: usize, arg2: usize, arg3: usize, arg4: usize) usize {
+pub fn syscall4(
+    number: SYS,
+    arg1: syscall_arg_t,
+    arg2: syscall_arg_t,
+    arg3: syscall_arg_t,
+    arg4: syscall_arg_t,
+) u32 {
     return asm volatile ("trap #0"
-        : [ret] "={d0}" (-> usize),
-        : [number] "{d0}" (@intFromEnum(number)),
+        : [ret] "={d0}" (-> u32),
+        : [number] "{d0}" (@backingInt(number)),
           [arg1] "{d1}" (arg1),
           [arg2] "{d2}" (arg2),
           [arg3] "{d3}" (arg3),
@@ -56,10 +69,17 @@ pub fn syscall4(number: SYS, arg1: usize, arg2: usize, arg3: usize, arg4: usize)
         : .{ .memory = true });
 }
 
-pub fn syscall5(number: SYS, arg1: usize, arg2: usize, arg3: usize, arg4: usize, arg5: usize) usize {
+pub fn syscall5(
+    number: SYS,
+    arg1: syscall_arg_t,
+    arg2: syscall_arg_t,
+    arg3: syscall_arg_t,
+    arg4: syscall_arg_t,
+    arg5: syscall_arg_t,
+) u32 {
     return asm volatile ("trap #0"
-        : [ret] "={d0}" (-> usize),
-        : [number] "{d0}" (@intFromEnum(number)),
+        : [ret] "={d0}" (-> u32),
+        : [number] "{d0}" (@backingInt(number)),
           [arg1] "{d1}" (arg1),
           [arg2] "{d2}" (arg2),
           [arg3] "{d3}" (arg3),
@@ -70,16 +90,16 @@ pub fn syscall5(number: SYS, arg1: usize, arg2: usize, arg3: usize, arg4: usize,
 
 pub fn syscall6(
     number: SYS,
-    arg1: usize,
-    arg2: usize,
-    arg3: usize,
-    arg4: usize,
-    arg5: usize,
-    arg6: usize,
-) usize {
+    arg1: syscall_arg_t,
+    arg2: syscall_arg_t,
+    arg3: syscall_arg_t,
+    arg4: syscall_arg_t,
+    arg5: syscall_arg_t,
+    arg6: syscall_arg_t,
+) u32 {
     return asm volatile ("trap #0"
-        : [ret] "={d0}" (-> usize),
-        : [number] "{d0}" (@intFromEnum(number)),
+        : [ret] "={d0}" (-> u32),
+        : [number] "{d0}" (@backingInt(number)),
           [arg1] "{d1}" (arg1),
           [arg2] "{d2}" (arg2),
           [arg3] "{d3}" (arg3),
@@ -89,7 +109,7 @@ pub fn syscall6(
         : .{ .memory = true });
 }
 
-pub fn clone() callconv(.naked) usize {
+pub fn clone() callconv(.naked) u32 {
     // __clone(func, stack, flags, arg, ptid, tls, ctid)
     //         +4,   +8,    +12,   +16, +20,  +24, +28
     //
@@ -147,117 +167,10 @@ pub const restore = restore_rt;
 pub fn restore_rt() callconv(.naked) noreturn {
     asm volatile ("trap #0"
         :
-        : [number] "{d0}" (@intFromEnum(SYS.rt_sigreturn)),
-        : .{ .memory = true });
+        : [number] "{d0}" (@backingInt(SYS.rt_sigreturn)),
+    );
 }
 
-pub const F = struct {
-    pub const DUPFD = 0;
-    pub const GETFD = 1;
-    pub const SETFD = 2;
-    pub const GETFL = 3;
-    pub const SETFL = 4;
-
-    pub const SETOWN = 8;
-    pub const GETOWN = 9;
-    pub const SETSIG = 10;
-    pub const GETSIG = 11;
-
-    pub const GETLK = 12;
-    pub const SETLK = 13;
-    pub const SETLKW = 14;
-
-    pub const SETOWN_EX = 15;
-    pub const GETOWN_EX = 16;
-
-    pub const GETOWNER_UIDS = 17;
-
-    pub const RDLCK = 0;
-    pub const WRLCK = 1;
-    pub const UNLCK = 2;
-};
-
-pub const blksize_t = i32;
-pub const nlink_t = u32;
 pub const time_t = i32;
-pub const mode_t = u32;
-pub const off_t = i64;
-pub const ino_t = u64;
-pub const dev_t = u64;
-pub const blkcnt_t = i64;
 
-pub const timeval = extern struct {
-    sec: time_t,
-    usec: i32,
-};
-
-pub const Flock = extern struct {
-    type: i16,
-    whence: i16,
-    start: off_t,
-    len: off_t,
-    pid: pid_t,
-};
-
-// TODO: not 100% sure of padding for msghdr
-pub const msghdr = extern struct {
-    name: ?*sockaddr,
-    namelen: socklen_t,
-    iov: [*]iovec,
-    iovlen: i32,
-    control: ?*anyopaque,
-    controllen: socklen_t,
-    flags: i32,
-};
-
-pub const msghdr_const = extern struct {
-    name: ?*const sockaddr,
-    namelen: socklen_t,
-    iov: [*]const iovec_const,
-    iovlen: i32,
-    control: ?*const anyopaque,
-    controllen: socklen_t,
-    flags: i32,
-};
-
-pub const Stat = extern struct {
-    dev: dev_t,
-    __pad: i16,
-    __ino_truncated: i32,
-    mode: mode_t,
-    nlink: nlink_t,
-    uid: uid_t,
-    gid: gid_t,
-    rdev: dev_t,
-    __pad2: i16,
-    size: off_t,
-    blksize: blksize_t,
-    blocks: blkcnt_t,
-    atim: timespec,
-    mtim: timespec,
-    ctim: timespec,
-    ino: ino_t,
-
-    pub fn atime(self: @This()) timespec {
-        return self.atim;
-    }
-
-    pub fn mtime(self: @This()) timespec {
-        return self.mtim;
-    }
-
-    pub fn ctime(self: @This()) timespec {
-        return self.ctim;
-    }
-};
-
-pub const Elf_Symndx = u32;
-
-// No VDSO used as of glibc 112a0ae18b831bf31f44d81b82666980312511d6.
 pub const VDSO = void;
-
-/// TODO
-pub const ucontext_t = void;
-
-/// TODO
-pub const getcontext = {};

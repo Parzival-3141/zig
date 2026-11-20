@@ -1,5 +1,11 @@
+const builtin = @import("builtin");
+const native_endian = builtin.cpu.arch.endian();
+
 const std = @import("std");
+const Io = std.Io;
 const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+
 const Token = @import("lex.zig").Token;
 const SourceMappings = @import("source_mapping.zig").SourceMappings;
 const utils = @import("utils.zig");
@@ -11,17 +17,15 @@ const parse = @import("parse.zig");
 const lang = @import("lang.zig");
 const code_pages = @import("code_pages.zig");
 const SupportedCodePage = code_pages.SupportedCodePage;
-const builtin = @import("builtin");
-const native_endian = builtin.cpu.arch.endian();
 
 pub const Diagnostics = struct {
-    errors: std.ArrayListUnmanaged(ErrorDetails) = .empty,
+    errors: std.ArrayList(ErrorDetails) = .empty,
     /// Append-only, cannot handle removing strings.
     /// Expects to own all strings within the list.
-    strings: std.ArrayListUnmanaged([]const u8) = .empty,
-    allocator: std.mem.Allocator,
+    strings: std.ArrayList([]const u8) = .empty,
+    allocator: Allocator,
 
-    pub fn init(allocator: std.mem.Allocator) Diagnostics {
+    pub fn init(allocator: Allocator) Diagnostics {
         return .{
             .allocator = allocator,
         };
@@ -39,7 +43,7 @@ pub const Diagnostics = struct {
         try self.errors.append(self.allocator, error_details);
     }
 
-    const SmallestStringIndexType = std.meta.Int(.unsigned, @min(
+    const SmallestStringIndexType = @Int(.unsigned, @min(
         @bitSizeOf(ErrorDetails.FileOpenError.FilenameStringIndex),
         @min(
             @bitSizeOf(ErrorDetails.IconReadError.FilenameStringIndex),
@@ -61,17 +65,12 @@ pub const Diagnostics = struct {
         return @intCast(index);
     }
 
-    pub fn renderToStdErr(self: *Diagnostics, cwd: std.fs.Dir, source: []const u8, tty_config: std.io.tty.Config, source_mappings: ?SourceMappings) void {
-        const stderr = std.debug.lockStderrWriter(&.{});
-        defer std.debug.unlockStderrWriter();
+    pub fn renderToStderr(self: *Diagnostics, io: Io, cwd: Io.Dir, source: []const u8, source_mappings: ?SourceMappings) Io.Cancelable!void {
+        const stderr = try io.lockStderr(&.{}, null);
+        defer io.unlockStderr();
         for (self.errors.items) |err_details| {
-            renderErrorMessage(stderr, tty_config, cwd, err_details, source, self.strings.items, source_mappings) catch return;
+            renderErrorMessage(io, stderr.terminal(), cwd, err_details, source, self.strings.items, source_mappings) catch return;
         }
-    }
-
-    pub fn renderToStdErrDetectTTY(self: *Diagnostics, cwd: std.fs.Dir, source: []const u8, source_mappings: ?SourceMappings) void {
-        const tty_config = std.io.tty.detectConfig(std.fs.File.stderr());
-        return self.renderToStdErr(cwd, source, tty_config, source_mappings);
     }
 
     pub fn contains(self: *const Diagnostics, err: ErrorDetails.Error) bool {
@@ -146,8 +145,8 @@ pub const ErrorDetails = struct {
 
     comptime {
         // all fields in the extra union should be 32 bits or less
-        for (std.meta.fields(Extra)) |field| {
-            std.debug.assert(@bitSizeOf(field.type) <= 32);
+        for (std.meta.fieldTypes(Extra)) |field_type| {
+            std.debug.assert(@bitSizeOf(field_type) <= 32);
         }
     }
 
@@ -166,10 +165,10 @@ pub const ErrorDetails = struct {
         err: FileOpenErrorEnum,
         filename_string_index: FilenameStringIndex,
 
-        pub const FilenameStringIndex = std.meta.Int(.unsigned, 32 - @bitSizeOf(FileOpenErrorEnum));
-        pub const FileOpenErrorEnum = std.meta.FieldEnum(std.fs.File.OpenError);
+        pub const FilenameStringIndex = @Int(.unsigned, 32 - @bitSizeOf(FileOpenErrorEnum));
+        pub const FileOpenErrorEnum = std.meta.FieldEnum(Io.File.OpenError || Io.File.StatError);
 
-        pub fn enumFromError(err: std.fs.File.OpenError) FileOpenErrorEnum {
+        pub fn enumFromError(err: (Io.File.OpenError || Io.File.StatError)) FileOpenErrorEnum {
             return switch (err) {
                 inline else => |e| @field(ErrorDetails.FileOpenError.FileOpenErrorEnum, @errorName(e)),
             };
@@ -181,7 +180,7 @@ pub const ErrorDetails = struct {
         icon_type: enum(u1) { cursor, icon },
         filename_string_index: FilenameStringIndex,
 
-        pub const FilenameStringIndex = std.meta.Int(.unsigned, 32 - @bitSizeOf(IconReadErrorEnum) - 1);
+        pub const FilenameStringIndex = @Int(.unsigned, 32 - @bitSizeOf(IconReadErrorEnum) - 1);
         pub const IconReadErrorEnum = std.meta.FieldEnum(ico.ReadError);
 
         pub fn enumFromError(err: ico.ReadError) IconReadErrorEnum {
@@ -198,14 +197,14 @@ pub const ErrorDetails = struct {
         bitmap_version: ico.BitmapHeader.Version = .unknown,
         _: Padding = 0,
 
-        pub const Padding = std.meta.Int(.unsigned, 15 - @bitSizeOf(ico.BitmapHeader.Version) - @bitSizeOf(ico.ImageFormat));
+        pub const Padding = @Int(.unsigned, 15 - @bitSizeOf(ico.BitmapHeader.Version) - @bitSizeOf(ico.ImageFormat));
     };
 
     pub const BitmapReadError = packed struct(u32) {
         err: BitmapReadErrorEnum,
         filename_string_index: FilenameStringIndex,
 
-        pub const FilenameStringIndex = std.meta.Int(.unsigned, 32 - @bitSizeOf(BitmapReadErrorEnum));
+        pub const FilenameStringIndex = @Int(.unsigned, 32 - @bitSizeOf(BitmapReadErrorEnum));
         pub const BitmapReadErrorEnum = std.meta.FieldEnum(bmp.ReadError);
 
         pub fn enumFromError(err: bmp.ReadError) BitmapReadErrorEnum {
@@ -219,14 +218,14 @@ pub const ErrorDetails = struct {
         dib_version: ico.BitmapHeader.Version,
         filename_string_index: FilenameStringIndex,
 
-        pub const FilenameStringIndex = std.meta.Int(.unsigned, 32 - @bitSizeOf(ico.BitmapHeader.Version));
+        pub const FilenameStringIndex = @Int(.unsigned, 32 - @bitSizeOf(ico.BitmapHeader.Version));
     };
 
     pub const AcceleratorError = packed struct(u32) {
         err: AcceleratorErrorEnum,
         _: Padding = 0,
 
-        pub const Padding = std.meta.Int(.unsigned, 32 - @bitSizeOf(AcceleratorErrorEnum));
+        pub const Padding = @Int(.unsigned, 32 - @bitSizeOf(AcceleratorErrorEnum));
         pub const AcceleratorErrorEnum = std.meta.FieldEnum(res.ParseAcceleratorKeyStringError);
 
         pub fn enumFromError(err: res.ParseAcceleratorKeyStringError) AcceleratorErrorEnum {
@@ -256,20 +255,20 @@ pub const ErrorDetails = struct {
             .{ "literal", "unquoted literal" },
         });
 
-        pub fn writeCommaSeparated(self: ExpectedTypes, writer: anytype) !void {
+        pub fn writeCommaSeparated(self: ExpectedTypes, writer: *std.Io.Writer) !void {
             const struct_info = @typeInfo(ExpectedTypes).@"struct";
-            const num_real_fields = struct_info.fields.len - 1;
+            const num_real_fields = struct_info.field_names.len - 1;
             const num_padding_bits = @bitSizeOf(ExpectedTypes) - num_real_fields;
             const mask = std.math.maxInt(struct_info.backing_integer.?) >> num_padding_bits;
             const relevant_bits_only = @as(struct_info.backing_integer.?, @bitCast(self)) & mask;
             const num_set_bits = @popCount(relevant_bits_only);
 
             var i: usize = 0;
-            inline for (struct_info.fields) |field_info| {
-                if (field_info.type != bool) continue;
+            inline for (struct_info.field_names, struct_info.field_types) |field_name, field_type| {
+                if (field_type != bool) continue;
                 if (i == num_set_bits) return;
-                if (@field(self, field_info.name)) {
-                    try writer.writeAll(strings.get(field_info.name).?);
+                if (@field(self, field_name)) {
+                    try writer.writeAll(strings.get(field_name).?);
                     i += 1;
                     if (num_set_bits > 2 and i != num_set_bits) {
                         try writer.writeAll(", ");
@@ -409,7 +408,7 @@ pub const ErrorDetails = struct {
         failed_to_open_cwd,
     };
 
-    fn formatToken(ctx: TokenFormatContext, writer: *std.io.Writer) std.io.Writer.Error!void {
+    fn formatToken(ctx: TokenFormatContext, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (ctx.token.id) {
             .eof => return writer.writeAll(ctx.token.id.nameForErrorDisplay()),
             else => {},
@@ -433,7 +432,7 @@ pub const ErrorDetails = struct {
         code_page: SupportedCodePage,
     };
 
-    fn fmtToken(self: ErrorDetails, source: []const u8) std.fmt.Formatter(TokenFormatContext, formatToken) {
+    fn fmtToken(self: ErrorDetails, source: []const u8) std.fmt.Alt(TokenFormatContext, formatToken) {
         return .{ .data = .{
             .token = self.token,
             .code_page = self.code_page,
@@ -441,7 +440,7 @@ pub const ErrorDetails = struct {
         } };
     }
 
-    pub fn render(self: ErrorDetails, writer: anytype, source: []const u8, strings: []const []const u8) !void {
+    pub fn render(self: ErrorDetails, writer: *std.Io.Writer, source: []const u8, strings: []const []const u8) !void {
         switch (self.err) {
             .unfinished_string_literal => {
                 return writer.print("unfinished string literal at '{f}', expected closing '\"'", .{self.fmtToken(source)});
@@ -507,7 +506,7 @@ pub const ErrorDetails = struct {
                 // We know that the token slice is a well-formed #pragma code_page(N), so
                 // we can skip to the first ( and then get the number that follows
                 const token_slice = self.token.slice(source);
-                var number_start = std.mem.indexOfScalar(u8, token_slice, '(').? + 1;
+                var number_start = std.mem.findScalar(u8, token_slice, '(').? + 1;
                 while (std.ascii.isWhitespace(token_slice[number_start])) {
                     number_start += 1;
                 }
@@ -858,22 +857,21 @@ pub const ErrorDetails = struct {
 
 /// Convenience struct only useful when the code page can be inferred from the token
 pub const ErrorDetailsWithoutCodePage = blk: {
-    const details_info = @typeInfo(ErrorDetails);
-    const fields = details_info.@"struct".fields;
-    var fields_without_codepage: [fields.len - 1]std.builtin.Type.StructField = undefined;
+    const details_info = @typeInfo(ErrorDetails).@"struct";
+    const field_count = details_info.field_names.len;
+    var field_names: [field_count - 1][]const u8 = undefined;
+    var field_types: [field_count - 1]type = undefined;
+    var field_attrs: [field_count - 1]std.builtin.Type.Struct.FieldAttributes = undefined;
     var i: usize = 0;
-    for (fields) |field| {
-        if (std.mem.eql(u8, field.name, "code_page")) continue;
-        fields_without_codepage[i] = field;
+    for (details_info.field_names, details_info.field_types, details_info.field_attrs) |field_name, field_type, field_attr| {
+        if (std.mem.eql(u8, field_name, "code_page")) continue;
+        field_names[i] = field_name;
+        field_types[i] = field_type;
+        field_attrs[i] = field_attr;
         i += 1;
     }
-    std.debug.assert(i == fields_without_codepage.len);
-    break :blk @Type(.{ .@"struct" = .{
-        .layout = .auto,
-        .fields = &fields_without_codepage,
-        .decls = &.{},
-        .is_tuple = false,
-    } });
+    std.debug.assert(i == field_count - 1);
+    break :blk @Struct(.auto, null, &field_names, &field_types, &field_attrs);
 };
 
 fn cellCount(code_page: SupportedCodePage, source: []const u8, start_index: usize, end_index: usize) usize {
@@ -894,7 +892,15 @@ fn cellCount(code_page: SupportedCodePage, source: []const u8, start_index: usiz
 
 const truncated_str = "<...truncated...>";
 
-pub fn renderErrorMessage(writer: *std.io.Writer, tty_config: std.io.tty.Config, cwd: std.fs.Dir, err_details: ErrorDetails, source: []const u8, strings: []const []const u8, source_mappings: ?SourceMappings) !void {
+pub fn renderErrorMessage(
+    io: Io,
+    t: Io.Terminal,
+    cwd: Io.Dir,
+    err_details: ErrorDetails,
+    source: []const u8,
+    strings: []const []const u8,
+    source_mappings: ?SourceMappings,
+) !void {
     if (err_details.type == .hint) return;
 
     const source_line_start = err_details.token.getLineStartForErrorDisplay(source);
@@ -913,36 +919,37 @@ pub fn renderErrorMessage(writer: *std.io.Writer, tty_config: std.io.tty.Config,
 
     const err_line = if (corresponding_span) |span| span.start_line else err_details.token.line_number;
 
-    try tty_config.setColor(writer, .bold);
+    const writer = t.writer;
+    try t.setColor(.bold);
     if (corresponding_file) |file| {
         try writer.writeAll(file);
     } else {
-        try tty_config.setColor(writer, .dim);
+        try t.setColor(.dim);
         try writer.writeAll("<after preprocessor>");
-        try tty_config.setColor(writer, .reset);
-        try tty_config.setColor(writer, .bold);
+        try t.setColor(.reset);
+        try t.setColor(.bold);
     }
     try writer.print(":{d}:{d}: ", .{ err_line, column });
     switch (err_details.type) {
         .err => {
-            try tty_config.setColor(writer, .red);
+            try t.setColor(.red);
             try writer.writeAll("error: ");
         },
         .warning => {
-            try tty_config.setColor(writer, .yellow);
+            try t.setColor(.yellow);
             try writer.writeAll("warning: ");
         },
         .note => {
-            try tty_config.setColor(writer, .cyan);
+            try t.setColor(.cyan);
             try writer.writeAll("note: ");
         },
         .hint => unreachable,
     }
-    try tty_config.setColor(writer, .reset);
-    try tty_config.setColor(writer, .bold);
+    try t.setColor(.reset);
+    try t.setColor(.bold);
     try err_details.render(writer, source, strings);
     try writer.writeByte('\n');
-    try tty_config.setColor(writer, .reset);
+    try t.setColor(.reset);
 
     if (!err_details.print_source_line) {
         try writer.writeByte('\n');
@@ -969,30 +976,33 @@ pub fn renderErrorMessage(writer: *std.io.Writer, tty_config: std.io.tty.Config,
 
     try writer.writeAll(source_line_for_display.line);
     if (source_line_for_display.truncated) {
-        try tty_config.setColor(writer, .dim);
+        try t.setColor(.dim);
         try writer.writeAll(truncated_str);
-        try tty_config.setColor(writer, .reset);
+        try t.setColor(.reset);
     }
     try writer.writeByte('\n');
 
-    try tty_config.setColor(writer, .green);
+    try t.setColor(.green);
     const num_spaces = truncated_visual_info.point_offset - truncated_visual_info.before_len;
     try writer.splatByteAll(' ', num_spaces);
     try writer.splatByteAll('~', truncated_visual_info.before_len);
     try writer.writeByte('^');
     try writer.splatByteAll('~', truncated_visual_info.after_len);
     try writer.writeByte('\n');
-    try tty_config.setColor(writer, .reset);
+    try t.setColor(.reset);
 
     if (corresponding_span != null and corresponding_file != null) {
         var worth_printing_lines: bool = true;
         var initial_lines_err: ?anyerror = null;
+        var file_reader_buf: [max_source_line_bytes * 2]u8 = undefined;
         var corresponding_lines: ?CorrespondingLines = CorrespondingLines.init(
+            io,
             cwd,
             err_details,
             source_line_for_display.line,
             corresponding_span.?,
             corresponding_file.?,
+            &file_reader_buf,
         ) catch |err| switch (err) {
             error.NotWorthPrintingLines => blk: {
                 worth_printing_lines = false;
@@ -1004,22 +1014,22 @@ pub fn renderErrorMessage(writer: *std.io.Writer, tty_config: std.io.tty.Config,
                 break :blk null;
             },
         };
-        defer if (corresponding_lines) |*cl| cl.deinit();
+        defer if (corresponding_lines) |*cl| cl.deinit(io);
 
-        try tty_config.setColor(writer, .bold);
+        try t.setColor(.bold);
         if (corresponding_file) |file| {
             try writer.writeAll(file);
         } else {
-            try tty_config.setColor(writer, .dim);
+            try t.setColor(.dim);
             try writer.writeAll("<after preprocessor>");
-            try tty_config.setColor(writer, .reset);
-            try tty_config.setColor(writer, .bold);
+            try t.setColor(.reset);
+            try t.setColor(.bold);
         }
         try writer.print(":{d}:{d}: ", .{ err_line, column });
-        try tty_config.setColor(writer, .cyan);
+        try t.setColor(.cyan);
         try writer.writeAll("note: ");
-        try tty_config.setColor(writer, .reset);
-        try tty_config.setColor(writer, .bold);
+        try t.setColor(.reset);
+        try t.setColor(.bold);
         try writer.writeAll("this line originated from line");
         if (corresponding_span.?.start_line != corresponding_span.?.end_line) {
             try writer.print("s {}-{}", .{ corresponding_span.?.start_line, corresponding_span.?.end_line });
@@ -1027,7 +1037,7 @@ pub fn renderErrorMessage(writer: *std.io.Writer, tty_config: std.io.tty.Config,
             try writer.print(" {}", .{corresponding_span.?.start_line});
         }
         try writer.print(" of file '{s}'\n", .{corresponding_file.?});
-        try tty_config.setColor(writer, .reset);
+        try t.setColor(.reset);
 
         if (!worth_printing_lines) return;
 
@@ -1038,21 +1048,21 @@ pub fn renderErrorMessage(writer: *std.io.Writer, tty_config: std.io.tty.Config,
             }) |display_line| {
                 try writer.writeAll(display_line.line);
                 if (display_line.truncated) {
-                    try tty_config.setColor(writer, .dim);
+                    try t.setColor(.dim);
                     try writer.writeAll(truncated_str);
-                    try tty_config.setColor(writer, .reset);
+                    try t.setColor(.reset);
                 }
                 try writer.writeByte('\n');
             }
             break :write_lines null;
         };
         if (write_lines_err) |err| {
-            try tty_config.setColor(writer, .red);
+            try t.setColor(.red);
             try writer.writeAll(" | ");
-            try tty_config.setColor(writer, .reset);
-            try tty_config.setColor(writer, .dim);
+            try t.setColor(.reset);
+            try t.setColor(.dim);
             try writer.print("unable to print line(s) from file: {s}\n", .{@errorName(err)});
-            try tty_config.setColor(writer, .reset);
+            try t.setColor(.reset);
         }
         try writer.writeByte('\n');
     }
@@ -1077,11 +1087,19 @@ const CorrespondingLines = struct {
     last_byte: u8 = 0,
     at_eof: bool = false,
     span: SourceMappings.CorrespondingSpan,
-    file: std.fs.File,
-    buffered_reader: std.fs.File.Reader,
+    file: Io.File,
+    file_reader: Io.File.Reader,
     code_page: SupportedCodePage,
 
-    pub fn init(cwd: std.fs.Dir, err_details: ErrorDetails, line_for_comparison: []const u8, corresponding_span: SourceMappings.CorrespondingSpan, corresponding_file: []const u8) !CorrespondingLines {
+    pub fn init(
+        io: Io,
+        cwd: Io.Dir,
+        err_details: ErrorDetails,
+        line_for_comparison: []const u8,
+        corresponding_span: SourceMappings.CorrespondingSpan,
+        corresponding_file: []const u8,
+        file_reader_buf: []u8,
+    ) !CorrespondingLines {
         // We don't do line comparison for this error, so don't print the note if the line
         // number is different
         if (err_details.err == .string_literal_too_long and err_details.token.line_number != corresponding_span.start_line) {
@@ -1095,19 +1113,15 @@ const CorrespondingLines = struct {
 
         var corresponding_lines = CorrespondingLines{
             .span = corresponding_span,
-            .file = try utils.openFileNotDir(cwd, corresponding_file, .{}),
-            .buffered_reader = undefined,
+            .file = try cwd.openFile(io, corresponding_file, .{ .allow_directory = false }),
             .code_page = err_details.code_page,
+            .file_reader = undefined,
         };
-        corresponding_lines.buffered_reader = corresponding_lines.file.reader(&.{});
-        errdefer corresponding_lines.deinit();
-
-        var fbs = std.io.fixedBufferStream(&corresponding_lines.line_buf);
-        const writer = fbs.writer();
+        corresponding_lines.file_reader = corresponding_lines.file.reader(io, file_reader_buf);
+        errdefer corresponding_lines.deinit(io);
 
         try corresponding_lines.writeLineFromStreamVerbatim(
-            writer,
-            corresponding_lines.buffered_reader.interface.adaptToOldInterface(),
+            &corresponding_lines.file_reader.interface,
             corresponding_span.start_line,
         );
 
@@ -1145,12 +1159,8 @@ const CorrespondingLines = struct {
         self.line_len = 0;
         self.visual_line_len = 0;
 
-        var fbs = std.io.fixedBufferStream(&self.line_buf);
-        const writer = fbs.writer();
-
         try self.writeLineFromStreamVerbatim(
-            writer,
-            self.buffered_reader.interface.adaptToOldInterface(),
+            &self.file_reader.interface,
             self.line_num,
         );
 
@@ -1164,7 +1174,7 @@ const CorrespondingLines = struct {
         return visual_line;
     }
 
-    fn writeLineFromStreamVerbatim(self: *CorrespondingLines, writer: anytype, input: anytype, line_num: usize) !void {
+    fn writeLineFromStreamVerbatim(self: *CorrespondingLines, input: *std.Io.Reader, line_num: usize) !void {
         while (try readByteOrEof(input)) |byte| {
             switch (byte) {
                 '\n', '\r' => {
@@ -1184,13 +1194,9 @@ const CorrespondingLines = struct {
                     }
                 },
                 else => {
-                    if (self.line_num == line_num) {
-                        if (writer.writeByte(byte)) {
-                            self.line_len += 1;
-                        } else |err| switch (err) {
-                            error.NoSpaceLeft => {},
-                            else => |e| return e,
-                        }
+                    if (self.line_num == line_num and self.line_len < self.line_buf.len) {
+                        self.line_buf[self.line_len] = byte;
+                        self.line_len += 1;
                     }
                 },
             }
@@ -1201,15 +1207,15 @@ const CorrespondingLines = struct {
         self.line_num += 1;
     }
 
-    fn readByteOrEof(reader: anytype) !?u8 {
-        return reader.readByte() catch |err| switch (err) {
+    fn readByteOrEof(reader: *std.Io.Reader) !?u8 {
+        return reader.takeByte() catch |err| switch (err) {
             error.EndOfStream => return null,
             else => |e| return e,
         };
     }
 
-    pub fn deinit(self: *CorrespondingLines) void {
-        self.file.close();
+    pub fn deinit(self: *CorrespondingLines, io: Io) void {
+        self.file.close(io);
     }
 };
 

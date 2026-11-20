@@ -13,7 +13,7 @@ pub fn deinit(ls: *LdScript, gpa: Allocator) void {
 }
 
 pub const Error = error{
-    LinkFailure,
+    AlreadyReported,
     UnknownCpuArch,
     OutOfMemory,
 };
@@ -26,9 +26,9 @@ pub fn parse(
     data: []const u8,
 ) Error!LdScript {
     var tokenizer = Tokenizer{ .source = data };
-    var tokens: std.ArrayListUnmanaged(Token) = .empty;
+    var tokens: std.ArrayList(Token) = .empty;
     defer tokens.deinit(gpa);
-    var line_col: std.ArrayListUnmanaged(LineColumn) = .empty;
+    var line_col: std.ArrayList(LineColumn) = .empty;
     defer line_col.deinit(gpa);
 
     var line: usize = 0;
@@ -97,15 +97,15 @@ const Command = enum {
     as_needed,
 
     fn fromString(s: []const u8) ?Command {
-        inline for (@typeInfo(Command).@"enum".fields) |field| {
+        inline for (@typeInfo(Command).@"enum".field_names) |field_name| {
             const upper_name = n: {
-                comptime var buf: [field.name.len]u8 = undefined;
-                inline for (field.name, 0..) |c, i| {
+                comptime var buf: [field_name.len]u8 = undefined;
+                inline for (field_name, 0..) |c, i| {
                     buf[i] = comptime std.ascii.toUpper(c);
                 }
                 break :n buf;
             };
-            if (std.mem.eql(u8, &upper_name, s)) return @field(Command, field.name);
+            if (std.mem.eql(u8, &upper_name, s)) return @field(Command, field_name);
         }
         return null;
     }
@@ -117,7 +117,7 @@ const Parser = struct {
     it: *TokenIterator,
 
     cpu_arch: ?std.Target.Cpu.Arch,
-    args: std.ArrayListUnmanaged(Arg),
+    args: std.ArrayList(Arg),
 
     fn start(parser: *Parser) !void {
         while (true) {

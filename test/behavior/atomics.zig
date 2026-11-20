@@ -133,6 +133,13 @@ fn test_u128_cmpxchg() !void {
 
     try expect(@cmpxchgStrong(u128, &x, 5678, 42, .seq_cst, .seq_cst) == null);
     try expect(x == 42);
+
+    var a: u128 align(16) = 40;
+    var b: u128 align(16) = 2;
+    _ = &a;
+    _ = &b;
+    try expect(@cmpxchgStrong(u128, &x, a | b, a & b, .seq_cst, .seq_cst) == null);
+    try expect(x == 0);
 }
 
 var a_global_variable = @as(u32, 1234);
@@ -143,7 +150,7 @@ test "cmpxchg on a global variable" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
-    _ = @cmpxchgWeak(u32, &a_global_variable, 1234, 42, .acquire, .monotonic);
+    _ = @cmpxchgStrong(u32, &a_global_variable, 1234, 42, .acquire, .monotonic);
     try expect(a_global_variable == 42);
 }
 
@@ -216,11 +223,6 @@ test "atomicrmw with ints" {
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
-    if (builtin.zig_backend == .stage2_llvm and builtin.cpu.arch.isMIPS()) {
-        // https://github.com/ziglang/zig/issues/16846
-        return error.SkipZigTest;
-    }
-
     try testAtomicRmwInts();
     try comptime testAtomicRmwInts();
 }
@@ -237,7 +239,7 @@ fn testAtomicRmwInts() !void {
 }
 
 fn testAtomicRmwInt(comptime signedness: std.builtin.Signedness, comptime N: usize) !void {
-    const int = std.meta.Int(signedness, N);
+    const int = @Int(signedness, N);
 
     var x: int = 1;
     var res = @atomicRmw(int, &x, .Xchg, 3, .seq_cst);
@@ -298,8 +300,8 @@ test "atomicrmw with 128-bit ints" {
 }
 
 fn testAtomicRmwInt128(comptime signedness: std.builtin.Signedness) !void {
-    const uint = std.meta.Int(.unsigned, 128);
-    const int = std.meta.Int(signedness, 128);
+    const uint = @Int(.unsigned, 128);
+    const int = @Int(signedness, 128);
 
     const initial: int = @as(int, @bitCast(@as(uint, 0xaaaaaaaa_bbbbbbbb_cccccccc_dddddddd)));
     const replacement: int = 0x00000000_00000005_00000000_00000003;
@@ -363,7 +365,6 @@ test "atomics with different types" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
-    if (builtin.target.cpu.arch.endian() == .big) return error.SkipZigTest; // #24282
 
     try testAtomicsWithType(bool, true, false);
 
@@ -374,7 +375,6 @@ test "atomics with different types" {
     try testAtomicsWithType(u24, 2, 1);
 
     try testAtomicsWithType(u0, 0, 0);
-    try testAtomicsWithType(i0, 0, 0);
 
     try testAtomicsWithType(enum(u32) { x = 1234, y = 5678 }, .x, .y);
     try testAtomicsWithType(enum(u19) { x = 1234, y = 5678 }, .x, .y);

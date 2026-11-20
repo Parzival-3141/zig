@@ -1,7 +1,9 @@
+const Writer = @This();
+
 const std = @import("std");
+const Io = std.Io;
 const assert = std.debug.assert;
 const testing = std.testing;
-const Writer = @This();
 
 const block_size = @sizeOf(Header);
 
@@ -14,9 +16,9 @@ pub const Options = struct {
     mtime: u64 = 0,
 };
 
-underlying_writer: *std.Io.Writer,
+underlying_writer: *Io.Writer,
+/// Assumed to use `/` for any path separators.
 prefix: []const u8 = "",
-mtime_now: u64 = 0,
 
 const Error = error{
     WriteFailed,
@@ -25,6 +27,7 @@ const Error = error{
 };
 
 /// Sets prefix for all other write* method paths.
+/// `root` is assumed to use `/` for any path separators.
 pub fn setRoot(w: *Writer, root: []const u8) Error!void {
     if (root.len > 0)
         try w.writeDir(root, .{});
@@ -36,16 +39,29 @@ pub fn writeDir(w: *Writer, sub_path: []const u8, options: Options) Error!void {
     try w.writeHeader(.directory, sub_path, "", 0, options);
 }
 
-pub const WriteFileError = std.Io.Writer.FileError || Error || std.fs.File.Reader.SizeError;
+pub const WriteFileError = Io.Writer.FileError || Error || Io.File.Reader.SizeError;
+
+pub fn writeFileTimestamp(
+    w: *Writer,
+    /// Assumed to use `/` for any path separators.
+    sub_path: []const u8,
+    file_reader: *Io.File.Reader,
+    mtime: Io.Timestamp,
+) WriteFileError!void {
+    return writeFile(w, sub_path, file_reader, @intCast(mtime.toSeconds()));
+}
 
 pub fn writeFile(
     w: *Writer,
+    /// Assumed to use `/` for any path separators.
     sub_path: []const u8,
-    file_reader: *std.fs.File.Reader,
-    stat_mtime: i128,
+    file_reader: *Io.File.Reader,
+    /// If you want to match the file format's expectations, it wants number of
+    /// seconds since POSIX epoch. Zero is also a great option here to make
+    /// generated tarballs more reproducible.
+    mtime: u64,
 ) WriteFileError!void {
     const size = try file_reader.getSize();
-    const mtime: u64 = @intCast(@divFloor(stat_mtime, std.time.ns_per_s));
 
     var header: Header = .{};
     try w.setPath(&header, sub_path);
@@ -58,15 +74,16 @@ pub fn writeFile(
     try w.writePadding64(size);
 }
 
-pub const WriteFileStreamError = Error || std.Io.Reader.StreamError;
+pub const WriteFileStreamError = Error || Io.Reader.StreamError;
 
 /// Writes file reading file content from `reader`. Reads exactly `size` bytes
 /// from `reader`, or returns `error.EndOfStream`.
 pub fn writeFileStream(
     w: *Writer,
+    /// Assumed to use `/` for any path separators.
     sub_path: []const u8,
     size: u64,
-    reader: *std.Io.Reader,
+    reader: *Io.Reader,
     options: Options,
 ) WriteFileStreamError!void {
     try w.writeHeader(.regular, sub_path, "", size, options);
@@ -75,7 +92,13 @@ pub fn writeFileStream(
 }
 
 /// Writes file using bytes buffer `content` for size and file content.
-pub fn writeFileBytes(w: *Writer, sub_path: []const u8, content: []const u8, options: Options) Error!void {
+pub fn writeFileBytes(
+    w: *Writer,
+    /// Assumed to use `/` for all path separators.
+    sub_path: []const u8,
+    content: []const u8,
+    options: Options,
+) Error!void {
     try w.writeHeader(.regular, sub_path, "", content.len, options);
     try w.underlying_writer.writeAll(content);
     try w.writePadding(content.len);
@@ -102,7 +125,7 @@ fn writeHeader(
     if (typeflag == .symbolic_link)
         header.setLinkname(link_name) catch |err| switch (err) {
             error.NameTooLong => try w.writeExtendedHeader(.gnu_long_link, &.{link_name}),
-            else => return err,
+            else => |e| return e,
         };
     try header.write(w.underlying_writer);
 }
@@ -119,7 +142,7 @@ fn setPath(w: *Writer, header: *Header, sub_path: []const u8) Error!void {
                 &.{ w.prefix, "/", sub_path };
             try w.writeExtendedHeader(.gnu_long_name, buffers);
         },
-        else => return err,
+        else => |e| return e,
     };
 }
 
@@ -136,15 +159,15 @@ fn writeExtendedHeader(w: *Writer, typeflag: Header.FileType, buffers: []const [
     try w.writePadding(len);
 }
 
-fn writePadding(w: *Writer, bytes: usize) std.Io.Writer.Error!void {
+fn writePadding(w: *Writer, bytes: usize) Io.Writer.Error!void {
     return writePaddingPos(w, bytes % block_size);
 }
 
-fn writePadding64(w: *Writer, bytes: u64) std.Io.Writer.Error!void {
+fn writePadding64(w: *Writer, bytes: u64) Io.Writer.Error!void {
     return writePaddingPos(w, @intCast(bytes % block_size));
 }
 
-fn writePaddingPos(w: *Writer, pos: usize) std.Io.Writer.Error!void {
+fn writePaddingPos(w: *Writer, pos: usize) Io.Writer.Error!void {
     if (pos == 0) return;
     try w.underlying_writer.splatByteAll(0, block_size - pos);
 }
@@ -153,7 +176,7 @@ fn writePaddingPos(w: *Writer, pos: usize) std.Io.Writer.Error!void {
 /// "reasonable system must not assume that such a block exists when reading an
 /// archive". Therefore, the Zig standard library recommends to not call this
 /// function.
-pub fn finishPedantically(w: *Writer) std.Io.Writer.Error!void {
+pub fn finishPedantically(w: *Writer) Io.Writer.Error!void {
     try w.underlying_writer.splatByteAll(0, block_size * 2);
 }
 
@@ -170,23 +193,23 @@ pub const Header = extern struct {
     // numeric field of width w contains w minus 1 digits, and a null.
     // Reference: https://www.gnu.org/software/tar/manual/html_node/Standard.html
     // POSIX header:                                  byte offset
-    name: [100]u8 = [_]u8{0} ** 100, //                         0
+    name: [100]u8 = @splat(0), //                               0
     mode: [7:0]u8 = default_mode.file, //                     100
-    uid: [7:0]u8 = [_:0]u8{0} ** 7, // unused                 108
-    gid: [7:0]u8 = [_:0]u8{0} ** 7, // unused                 116
-    size: [11:0]u8 = [_:0]u8{'0'} ** 11, //                   124
-    mtime: [11:0]u8 = [_:0]u8{'0'} ** 11, //                  136
-    checksum: [7:0]u8 = [_:0]u8{' '} ** 7, //                 148
+    uid: [7:0]u8 = @splat(0), // unused                       108
+    gid: [7:0]u8 = @splat(0), // unused                       116
+    size: [11:0]u8 = @splat('0'), //                          124
+    mtime: [11:0]u8 = @splat('0'), //                         136
+    checksum: [7:0]u8 = @splat(' '), //                       148
     typeflag: FileType = .regular, //                         156
-    linkname: [100]u8 = [_]u8{0} ** 100, //                   157
-    magic: [6]u8 = [_]u8{ 'u', 's', 't', 'a', 'r', 0 }, //    257
-    version: [2]u8 = [_]u8{ '0', '0' }, //                    263
-    uname: [32]u8 = [_]u8{0} ** 32, // unused                 265
-    gname: [32]u8 = [_]u8{0} ** 32, // unused                 297
-    devmajor: [7:0]u8 = [_:0]u8{0} ** 7, // unused            329
-    devminor: [7:0]u8 = [_:0]u8{0} ** 7, // unused            337
-    prefix: [155]u8 = [_]u8{0} ** 155, //                     345
-    pad: [12]u8 = [_]u8{0} ** 12, // unused                   500
+    linkname: [100]u8 = @splat(0), //                         157
+    magic: [6]u8 = .{ 'u', 's', 't', 'a', 'r', 0 }, //        257
+    version: [2]u8 = .{ '0', '0' }, //                        263
+    uname: [32]u8 = @splat(0), // unused                      265
+    gname: [32]u8 = @splat(0), // unused                      297
+    devmajor: [7:0]u8 = @splat(0), // unused                  329
+    devminor: [7:0]u8 = @splat(0), // unused                  337
+    prefix: [155]u8 = @splat(0), //                           345
+    pad: [12]u8 = @splat(0), // unused                        500
 
     pub const FileType = enum(u8) {
         regular = '0',
@@ -236,7 +259,6 @@ pub const Header = extern struct {
     }
 
     // Integer number of seconds since January 1, 1970, 00:00 Coordinated Universal Time.
-    // mtime == 0 will use current time
     pub fn setMtime(w: *Header, mtime: u64) error{OctalOverflow}!void {
         try octal(&w.mtime, mtime);
     }
@@ -248,7 +270,7 @@ pub const Header = extern struct {
         try octal(&w.checksum, checksum);
     }
 
-    pub fn write(h: *Header, bw: *std.Io.Writer) error{ OctalOverflow, WriteFailed }!void {
+    pub fn write(h: *Header, bw: *Io.Writer) error{ OctalOverflow, WriteFailed }!void {
         try h.updateChecksum();
         try bw.writeAll(std.mem.asBytes(h));
     }
@@ -290,7 +312,7 @@ pub const Header = extern struct {
 
         // add as much to prefix as you can, must split at /
         const prefix_remaining = max_prefix - prefix_pos;
-        if (std.mem.lastIndexOf(u8, sub_path[0..@min(prefix_remaining, sub_path.len)], &.{'/'})) |sep_pos| {
+        if (std.mem.findLast(u8, sub_path[0..@min(prefix_remaining, sub_path.len)], &.{'/'})) |sep_pos| {
             @memcpy(w.prefix[prefix_pos..][0..sep_pos], sub_path[0..sep_pos]);
             if ((sub_path.len - sep_pos - 1) > max_name) return error.NameTooLong;
             @memcpy(w.name[0..][0 .. sub_path.len - sep_pos - 1], sub_path[sep_pos + 1 ..]);
@@ -320,26 +342,26 @@ pub const Header = extern struct {
             },
             // no more both fits into name
             .{
-                .in = &.{ "prefix", "0123456789/" ** 8 ++ "basename" },
-                .out = &.{ "prefix", "0123456789/" ** 8 ++ "basename" },
+                .in = &.{ "prefix", repeatString(8, "0123456789/") ++ "basename" },
+                .out = &.{ "prefix", repeatString(8, "0123456789/") ++ "basename" },
             },
             // put as much as you can into prefix the rest goes into name
             .{
-                .in = &.{ "prefix", "0123456789/" ** 10 ++ "basename" },
-                .out = &.{ "prefix/" ++ "0123456789/" ** 9 ++ "0123456789", "basename" },
+                .in = &.{ "prefix", repeatString(10, "0123456789/") ++ "basename" },
+                .out = &.{ "prefix/" ++ repeatString(9, "0123456789/") ++ "0123456789", "basename" },
             },
 
             .{
-                .in = &.{ "prefix", "0123456789/" ** 15 ++ "basename" },
-                .out = &.{ "prefix/" ++ "0123456789/" ** 12 ++ "0123456789", "0123456789/0123456789/basename" },
+                .in = &.{ "prefix", repeatString(15, "0123456789/") ++ "basename" },
+                .out = &.{ "prefix/" ++ repeatString(12, "0123456789/") ++ "0123456789", "0123456789/0123456789/basename" },
             },
             .{
-                .in = &.{ "prefix", "0123456789/" ** 21 ++ "basename" },
-                .out = &.{ "prefix/" ++ "0123456789/" ** 12 ++ "0123456789", "0123456789/" ** 8 ++ "basename" },
+                .in = &.{ "prefix", repeatString(21, "0123456789/") ++ "basename" },
+                .out = &.{ "prefix/" ++ repeatString(12, "0123456789/") ++ "0123456789", repeatString(8, "0123456789/") ++ "basename" },
             },
             .{
-                .in = &.{ "", "012345678/" ** 10 ++ "foo" },
-                .out = &.{ "012345678/" ** 9 ++ "012345678", "foo" },
+                .in = &.{ "", repeatString(10, "012345678/") ++ "foo" },
+                .out = &.{ repeatString(9, "012345678/") ++ "012345678", "foo" },
             },
         };
 
@@ -356,10 +378,10 @@ pub const Header = extern struct {
             // basename can't fit into name (106 characters)
             .{ .in = &.{ "zig", "test/cases/compile_errors/regression_test_2980_base_type_u32_is_not_type_checked_properly_when_assigning_a_value_within_a_struct.zig" } },
             // cant fit into 255 + sep
-            .{ .in = &.{ "prefix", "0123456789/" ** 22 ++ "basename" } },
+            .{ .in = &.{ "prefix", repeatString(22, "0123456789/") ++ "basename" } },
             // can fit but sub_path can't be split (there is no separator)
-            .{ .in = &.{ "prefix", "0123456789" ** 10 ++ "a" } },
-            .{ .in = &.{ "prefix", "0123456789" ** 14 ++ "basename" } },
+            .{ .in = &.{ "prefix", repeatString(10, "0123456789") ++ "a" } },
+            .{ .in = &.{ "prefix", repeatString(14, "0123456789") ++ "basename" } },
         };
 
         for (error_cases) |case| {
@@ -382,11 +404,11 @@ test "write files" {
         content: []const u8,
     }{
         .{ .path = "foo", .content = "bar" },
-        .{ .path = "a12345678/" ** 10 ++ "foo", .content = "a" ** 511 },
-        .{ .path = "b12345678/" ** 24 ++ "foo", .content = "b" ** 512 },
-        .{ .path = "c12345678/" ** 25 ++ "foo", .content = "c" ** 513 },
-        .{ .path = "d12345678/" ** 51 ++ "foo", .content = "d" ** 1025 },
-        .{ .path = "e123456789" ** 11, .content = "e" },
+        .{ .path = repeatString(10, "a12345678/") ++ "foo", .content = repeatString(511, "a") },
+        .{ .path = repeatString(24, "b12345678/") ++ "foo", .content = repeatString(512, "b") },
+        .{ .path = repeatString(25, "c12345678/") ++ "foo", .content = repeatString(513, "c") },
+        .{ .path = repeatString(51, "d12345678/") ++ "foo", .content = repeatString(1025, "d") },
+        .{ .path = repeatString(11, "e123456789"), .content = "e" },
     };
 
     var file_name_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -396,14 +418,14 @@ test "write files" {
     {
         const root = "root";
 
-        var output: std.Io.Writer.Allocating = .init(testing.allocator);
+        var output: Io.Writer.Allocating = .init(testing.allocator);
         var w: Writer = .{ .underlying_writer = &output.writer };
         defer output.deinit();
         try w.setRoot(root);
         for (files) |file|
             try w.writeFileBytes(file.path, file.content, .{});
 
-        var input: std.Io.Reader = .fixed(output.written());
+        var input: Io.Reader = .fixed(output.written());
         var it: std.tar.Iterator = .init(&input, .{
             .file_name_buffer = &file_name_buffer,
             .link_name_buffer = &link_name_buffer,
@@ -424,7 +446,7 @@ test "write files" {
             try testing.expectEqual('/', actual.name[root.len..][0]);
             try testing.expectEqualStrings(expected.path, actual.name[root.len + 1 ..]);
 
-            var content: std.Io.Writer.Allocating = .init(testing.allocator);
+            var content: Io.Writer.Allocating = .init(testing.allocator);
             defer content.deinit();
             try it.streamRemaining(actual, &content.writer);
             try testing.expectEqualSlices(u8, expected.content, content.written());
@@ -432,15 +454,15 @@ test "write files" {
     }
     // without root
     {
-        var output: std.Io.Writer.Allocating = .init(testing.allocator);
+        var output: Io.Writer.Allocating = .init(testing.allocator);
         var w: Writer = .{ .underlying_writer = &output.writer };
         defer output.deinit();
         for (files) |file| {
-            var content: std.Io.Reader = .fixed(file.content);
+            var content: Io.Reader = .fixed(file.content);
             try w.writeFileStream(file.path, file.content.len, &content, .{});
         }
 
-        var input: std.Io.Reader = .fixed(output.written());
+        var input: Io.Reader = .fixed(output.written());
         var it: std.tar.Iterator = .init(&input, .{
             .file_name_buffer = &file_name_buffer,
             .link_name_buffer = &link_name_buffer,
@@ -452,11 +474,17 @@ test "write files" {
             const expected = files[i];
             try testing.expectEqualStrings(expected.path, actual.name);
 
-            var content: std.Io.Writer.Allocating = .init(testing.allocator);
+            var content: Io.Writer.Allocating = .init(testing.allocator);
             defer content.deinit();
             try it.streamRemaining(actual, &content.writer);
             try testing.expectEqualSlices(u8, expected.content, content.written());
         }
         try w.finishPedantically();
     }
+}
+
+/// Marked `inline` to avoid unnecessary binary float, since arguments are always comptime-known.
+inline fn repeatString(comptime n: usize, comptime str: []const u8) []const u8 {
+    const buf: [n][str.len]u8 = @splat(str[0..str.len].*);
+    return @ptrCast(&buf);
 }

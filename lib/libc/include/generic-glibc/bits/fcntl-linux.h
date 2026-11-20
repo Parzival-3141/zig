@@ -1,5 +1,5 @@
 /* O_*, F_*, FD_* bit values for Linux.
-   Copyright (C) 2001-2025 Free Software Foundation, Inc.
+   Copyright (C) 2001-2026 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -81,9 +81,7 @@
 #ifndef __O_NOFOLLOW
 # define __O_NOFOLLOW	0400000
 #endif
-#ifndef __O_CLOEXEC
-# define __O_CLOEXEC   02000000
-#endif
+#include <bits/cloexec.h>
 #ifndef __O_DIRECT
 # define __O_DIRECT	 040000
 #endif
@@ -176,8 +174,8 @@
 #endif
 
 #if defined __USE_UNIX98 || defined __USE_XOPEN2K8
-# define F_SETOWN	__F_SETOWN /* Get owner (process receiving SIGIO).  */
-# define F_GETOWN	__F_GETOWN /* Set owner (process receiving SIGIO).  */
+# define F_SETOWN	__F_SETOWN /* Set owner (process receiving SIGIO).  */
+# define F_GETOWN	__F_GETOWN /* Get owner (process receiving SIGIO).  */
 #endif
 
 #ifndef __F_SETSIG
@@ -185,15 +183,15 @@
 # define __F_GETSIG	11	/* Get number of signal to be sent.  */
 #endif
 #ifndef __F_SETOWN_EX
-# define __F_SETOWN_EX	15	/* Get owner (thread receiving SIGIO).  */
-# define __F_GETOWN_EX	16	/* Set owner (thread receiving SIGIO).  */
+# define __F_SETOWN_EX	15	/* Set owner (thread receiving SIGIO).  */
+# define __F_GETOWN_EX	16	/* Get owner (thread receiving SIGIO).  */
 #endif
 
 #ifdef __USE_GNU
 # define F_SETSIG	__F_SETSIG	/* Set number of signal to be sent.  */
 # define F_GETSIG	__F_GETSIG	/* Get number of signal to be sent.  */
-# define F_SETOWN_EX	__F_SETOWN_EX	/* Get owner (thread receiving SIGIO).  */
-# define F_GETOWN_EX	__F_GETOWN_EX	/* Set owner (thread receiving SIGIO).  */
+# define F_SETOWN_EX	__F_SETOWN_EX	/* Set owner (thread receiving SIGIO).  */
+# define F_GETOWN_EX	__F_GETOWN_EX	/* Get owner (thread receiving SIGIO).  */
 #endif
 
 #ifdef __USE_GNU
@@ -203,7 +201,7 @@
 # define F_DUPFD_QUERY  1027    /* Compare two file descriptors for sameness.  */
 # define F_CREATED_QUERY 1028   /* Was the file just created?  */
 # define F_SETPIPE_SZ	1031	/* Set pipe page size array.  */
-# define F_GETPIPE_SZ	1032	/* Set pipe page size array.  */
+# define F_GETPIPE_SZ	1032	/* Get pipe page size array.  */
 # define F_ADD_SEALS	1033	/* Add seals to file.  */
 # define F_GET_SEALS	1034	/* Get seals for file.  */
 /* Set / get write life time hints.  */
@@ -211,6 +209,8 @@
 # define F_SET_RW_HINT	1036
 # define F_GET_FILE_RW_HINT	1037
 # define F_SET_FILE_RW_HINT	1038
+# define F_GETDELEG	1039	/* Get delegation.  */
+# define F_SETDELEG	1040	/* Set delegation.  */
 #endif
 #ifdef __USE_XOPEN2K8
 # define F_DUPFD_CLOEXEC 1030	/* Duplicate file descriptor with
@@ -219,6 +219,10 @@
 
 /* For F_[GET|SET]FD.  */
 #define FD_CLOEXEC	1	/* Actually anything with low bit set goes */
+#ifdef __USE_GNU
+# define FD_PIDFS_ROOT	-10002	/* Root of the pidfs filesystem */
+# define FD_NSFS_ROOT	-10003	/* Root of the nsfs filesystem */
+#endif
 
 #ifndef F_RDLCK
 /* For posix fcntl() and `l_type' field of a `struct flock' for lockf().  */
@@ -381,6 +385,11 @@ struct file_handle
 						open_by_handle_at.  */
 # define AT_HANDLE_MNT_ID_UNIQUE 1 /* Return the 64-bit unique mount
 				      ID.  */
+# define AT_HANDLE_CONNECTABLE 2 /* Request a connectable file handle */
+
+/* Flags for execveat2(2). */
+# define AT_EXECVE_CHECK 0x10000 /* Only perform a check if execution
+				    would be allowed */
 #endif
 
 __BEGIN_DECLS
@@ -455,6 +464,33 @@ extern int name_to_handle_at (int __dfd, const char *__name,
 extern int open_by_handle_at (int __mountdirfd, struct file_handle *__handle,
 			      int __flags);
 
+#ifdef __has_include
+# if __has_include ("linux/openat2.h")
+#  include "linux/openat2.h"
+#  define __glibc_has_open_how 1
+# endif
+#endif
+
+#include <bits/openat2.h>
+
+/* Similar to `openat' but the arguments are packed on HOW with the size
+   USIZE.  If flags and mode from HOW are non-zero, then openat2 operates
+   like openat.
+
+   Unlike openat, unknown or invalid flags result in an error (EINVAL),
+   rather than being ignored.  The mode must be zero unless one of O_CREAT
+   or O_TMPFILE are set.
+
+   The kernel does not support legacy non-LFS interface.  */
+extern int openat2 (int __dfd, const char * __filename,
+		    const struct open_how * __how,
+		    __SIZE_TYPE__ __usize)
+     __nonnull ((2, 3));
+
 #endif	/* use GNU */
+
+#if __USE_FORTIFY_LEVEL > 0 && defined __fortify_function
+# include <bits/fcntl-linux-fortify.h>
+#endif
 
 __END_DECLS

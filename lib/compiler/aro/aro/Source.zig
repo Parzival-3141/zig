@@ -1,9 +1,15 @@
 const std = @import("std");
 
-pub const Id = enum(u32) {
-    unused = 0,
-    generated = 1,
-    _,
+pub const Id = packed struct(u32) {
+    index: enum(u31) {
+        unused = std.math.maxInt(u31) - 0,
+        generated = std.math.maxInt(u31) - 1,
+        _,
+    },
+    alias: bool = false,
+
+    pub const unused: Id = .{ .index = .unused };
+    pub const generated: Id = .{ .index = .generated };
 };
 
 /// Classifies the file for line marker output in -E mode
@@ -24,12 +30,27 @@ pub const Location = struct {
     pub fn eql(a: Location, b: Location) bool {
         return a.id == b.id and a.byte_offset == b.byte_offset and a.line == b.line;
     }
+
+    pub fn expand(loc: Location, comp: *const @import("Compilation.zig")) ExpandedLocation {
+        const source = comp.getSource(loc.id);
+        return source.lineCol(loc);
+    }
+};
+
+pub const ExpandedLocation = struct {
+    path: []const u8,
+    line: []const u8,
+    line_no: u32,
+    col: u32,
+    width: u32,
+    end_with_splice: bool,
+    kind: Kind,
 };
 
 const Source = @This();
 
 path: []const u8,
-buf: []const u8,
+buf: [:0]const u8,
 id: Id,
 /// each entry represents a byte position within `buf` where a backslash+newline was deleted
 /// from the original raw buffer. The same position can appear multiple times if multiple
@@ -37,26 +58,13 @@ id: Id,
 splice_locs: []const u32,
 kind: Kind,
 
-/// Todo: binary search instead of scanning entire `splice_locs`.
-pub fn numSplicesBefore(source: Source, byte_offset: u32) u32 {
-    for (source.splice_locs, 0..) |splice_offset, i| {
-        if (splice_offset > byte_offset) return @intCast(i);
-    }
-    return @intCast(source.splice_locs.len);
-}
+// Path of the umbrella framework. Slice of `path`.
+umbrella_framework_path: ?[]const u8 = null,
 
-/// Returns the actual line number (before newline splicing) of a Location
-/// This corresponds to what the user would actually see in their text editor
-pub fn physicalLine(source: Source, loc: Location) u32 {
-    return loc.line + source.numSplicesBefore(loc.byte_offset);
-}
-
-const LineCol = struct { line: []const u8, line_no: u32, col: u32, width: u32, end_with_splice: bool };
-
-pub fn lineCol(source: Source, loc: Location) LineCol {
+pub fn lineCol(source: Source, loc: Location) ExpandedLocation {
     var start: usize = 0;
     // find the start of the line which is either a newline or a splice
-    if (std.mem.lastIndexOfScalar(u8, source.buf[0..loc.byte_offset], '\n')) |some| start = some + 1;
+    if (std.mem.findScalarLast(u8, source.buf[0..loc.byte_offset], '\n')) |some| start = some + 1;
     const splice_index: u32 = for (source.splice_locs, 0..) |splice_offset, i| {
         if (splice_offset > start) {
             if (splice_offset < loc.byte_offset) {
@@ -96,17 +104,19 @@ pub fn lineCol(source: Source, loc: Location) LineCol {
     // find the end of the line which is either a newline, EOF or a splice
     var nl = source.buf.len;
     var end_with_splice = false;
-    if (std.mem.indexOfScalar(u8, source.buf[start..], '\n')) |some| nl = some + start;
+    if (std.mem.findScalar(u8, source.buf[start..], '\n')) |some| nl = some + start;
     if (source.splice_locs.len > splice_index and nl > source.splice_locs[splice_index] and source.splice_locs[splice_index] > start) {
         end_with_splice = true;
         nl = source.splice_locs[splice_index];
     }
     return .{
+        .path = source.path,
         .line = source.buf[start..nl],
-        .line_no = loc.line + splice_index,
+        .line_no = loc.line,
         .col = col,
         .width = width,
         .end_with_splice = end_with_splice,
+        .kind = source.kind,
     };
 }
 

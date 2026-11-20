@@ -21,7 +21,6 @@ test "super basic invocations" {
 
 test "basic invocations" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
@@ -277,7 +276,7 @@ test "forced tail call" {
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
-    if (builtin.zig_backend == .stage2_llvm) {
+    if (builtin.zig_backend == .stage2_llvm or builtin.zig_backend == .stage2_c) {
         if (builtin.cpu.arch.isMIPS() or builtin.cpu.arch.isPowerPC() or builtin.cpu.arch.isWasm()) {
             return error.SkipZigTest;
         }
@@ -312,7 +311,7 @@ test "inline call preserves tail call" {
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
-    if (builtin.zig_backend == .stage2_llvm) {
+    if (builtin.zig_backend == .stage2_llvm or builtin.zig_backend == .stage2_c) {
         if (builtin.cpu.arch.isMIPS() or builtin.cpu.arch.isPowerPC() or builtin.cpu.arch.isWasm()) {
             return error.SkipZigTest;
         }
@@ -320,7 +319,7 @@ test "inline call preserves tail call" {
 
     if (builtin.zig_backend == .stage2_c and builtin.os.tag == .windows) return error.SkipZigTest; // MSVC doesn't support always tail calls
 
-    const max = std.math.maxInt(u16);
+    const max_depth = 1000;
     const S = struct {
         var a: u16 = 0;
         fn foo() void {
@@ -328,16 +327,16 @@ test "inline call preserves tail call" {
         }
 
         inline fn bar() void {
-            if (a == max) return;
+            if (a == max_depth) return;
             // Stack overflow if not tail called
-            var buf: [max]u16 = undefined;
+            var buf: [100_000]u16 = undefined;
             buf[a] = a;
             a += 1;
             return @call(.always_tail, foo, .{});
         }
     };
     S.foo();
-    try expect(S.a == std.math.maxInt(u16));
+    try expect(S.a == max_depth);
 }
 
 test "inline call doesn't re-evaluate non generic struct" {
@@ -355,7 +354,7 @@ test "inline call doesn't re-evaluate non generic struct" {
     try comptime @call(.always_inline, S.foo, ArgTuple{.{ .a = 123, .b = 45 }});
 }
 
-test "Enum constructed by @Type passed as generic argument" {
+test "Enum constructed by @Enum passed as generic argument" {
     const S = struct {
         const E = std.meta.FieldEnum(struct {
             prev_pos: bool,
@@ -372,11 +371,11 @@ test "Enum constructed by @Type passed as generic argument" {
             alive: bool,
         });
         fn foo(comptime a: E, b: u32) !void {
-            try expect(@intFromEnum(a) == b);
+            try expect(@backingInt(a) == b);
         }
     };
-    inline for (@typeInfo(S.E).@"enum".fields, 0..) |_, i| {
-        try S.foo(@as(S.E, @enumFromInt(i)), i);
+    inline for (@typeInfo(S.E).@"enum".field_names, 0..) |_, i| {
+        try S.foo(@as(S.E, @fromBackingInt(@intCast(i))), i);
     }
 }
 
@@ -408,6 +407,7 @@ test "recursive inline call with comptime known argument" {
 
 test "inline while with @call" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const S = struct {
         fn inc(a: *u32) void {
@@ -538,6 +538,8 @@ test "call function pointer in comptime field" {
 }
 
 test "generic function pointer can be called" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const S = struct {
         var ok = false;
         fn foo(x: anytype) void {
@@ -551,19 +553,18 @@ test "generic function pointer can be called" {
 
 test "value returned from comptime function is comptime known" {
     const S = struct {
-        fn fields(comptime T: type) switch (@typeInfo(T)) {
-            .@"struct" => []const std.builtin.Type.StructField,
+        fn fieldCount(comptime T: type) switch (@typeInfo(T)) {
+            .@"struct" => comptime_int,
             else => unreachable,
         } {
             return switch (@typeInfo(T)) {
-                .@"struct" => |info| info.fields,
+                .@"struct" => |info| info.field_names.len,
                 else => unreachable,
             };
         }
     };
-    const fields_list = S.fields(@TypeOf(.{}));
-    if (fields_list.len != 0)
-        @compileError("Argument count mismatch");
+    const fields_len = S.fieldCount(@TypeOf(.{}));
+    comptime assert(fields_len == 0);
 }
 
 test "registers get overwritten when ignoring return" {
@@ -709,7 +710,7 @@ test "tail call function pointer" {
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
-    if (builtin.zig_backend == .stage2_llvm) {
+    if (builtin.zig_backend == .stage2_llvm or builtin.zig_backend == .stage2_c) {
         if (builtin.cpu.arch.isMIPS() or builtin.cpu.arch.isPowerPC() or builtin.cpu.arch.isWasm()) {
             return error.SkipZigTest;
         }
@@ -731,4 +732,35 @@ test "tail call function pointer" {
     };
 
     S.foo(100);
+}
+
+test "tail call with potentially extended types" {
+    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    if (builtin.zig_backend == .stage2_llvm or builtin.zig_backend == .stage2_c) {
+        if (builtin.cpu.arch.isMIPS() or builtin.cpu.arch.isPowerPC() or builtin.cpu.arch.isWasm()) {
+            return error.SkipZigTest;
+        }
+    }
+
+    if (builtin.zig_backend == .stage2_c and builtin.os.tag == .windows) return error.SkipZigTest; // MSVC doesn't support always tail calls
+
+    const S = struct {
+        fn Test(comptime Return: type) type {
+            return struct {
+                fn callee(@"u8": u8, @"i8": i8, @"u16": u16, @"i16": i16) callconv(.c) Return {
+                    return @intCast(@as(i32, @"u8") + @as(i32, @"i8") + @as(i32, @"u16") + @as(i32, @"i16"));
+                }
+                fn caller(@"u8": u8, @"i8": i8, @"u16": u16, @"i16": i16) callconv(.c) Return {
+                    return @call(.always_tail, callee, .{ @"u8", @"i8", @"u16", @"i16" });
+                }
+            };
+        }
+    };
+    try std.testing.expect(S.Test(u8).caller(1, -2, 3, 4) == 6);
+    try std.testing.expect(S.Test(i8).caller(5, -6, 7, -8) == -2);
+    try std.testing.expect(S.Test(u16).caller(9, 10, 11, 12) == 42);
+    try std.testing.expect(S.Test(i16).caller(13, 14, 15, -16) == 26);
 }
