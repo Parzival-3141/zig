@@ -816,10 +816,9 @@ pub fn build(b: *std.Build) !void {
     }
 
     const test_quakec_step = b.step("test-quakec", "Run the QuakeC backend behavior tests");
-    @import("test/quakec.zig").add(b, test_quakec_step, .{
+    @import("test/quakec.zig").addQuakeCTests(b, test_quakec_step, .{
         .compiler_exe = exe,
         .dev_env = dev_env,
-        .runner_path = b.option([]const u8, "qcvm-runner", "Path to the qcvm-based test runner binary"),
         .test_filters = test_filters,
     });
     if (dev_env == .quakec) test_step.dependOn(test_quakec_step);
