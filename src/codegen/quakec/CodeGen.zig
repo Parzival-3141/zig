@@ -240,7 +240,7 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
 
                 if (live.operandDies(inst_idx, 0)) try function.killValue(ty_op.operand);
             },
-            .add, .sub, .mul => |op| {
+            .add, .sub, .mul, .div_float => |op| {
                 // Both operands are the same type as the result (float for now).
                 // They are either the result of an air instruction or a constant,
                 // never pointers.
@@ -263,6 +263,7 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                         .add => .add_f,
                         .sub => .sub_f,
                         .mul => .mul_f,
+                        .div_float => .div_f,
                         else => unreachable,
                     },
                     .args = .{ a, b, .{ .local = slot } },
