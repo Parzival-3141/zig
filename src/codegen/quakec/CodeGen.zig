@@ -269,6 +269,25 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                     .args = .{ a, b, .{ .local = slot } },
                 });
             },
+            .neg => {
+                const un_op = air_data[@backingInt(inst_idx)].un_op;
+
+                // There is no negate qc instruction, so emit -1 * x instead.
+                const value_idx = try ip.get(zcu.gpa, zcu.comp.io, pt.tid, .{
+                    .float = .{ .ty = .f32_type, .storage = .{ .f32 = -1.0 } },
+                });
+                const gop = try function.immediates.getOrPutValue(zcu.gpa, value_idx, -1.0);
+
+                const a: Mir.Statement.Arg = .{ .immediate = @intCast(gop.index) };
+                const b = try function.resolveOperand(un_op);
+                if (live.operandDies(inst_idx, 0)) try function.killValue(un_op);
+
+                const slot = try function.frameAllocLiveValue(inst_idx, .float, .temp);
+                try function.statements.append(zcu.gpa, .{
+                    .op = .mul_f,
+                    .args = .{ a, b, .{ .local = slot } },
+                });
+            },
             .cmp_gt, .cmp_gte, .cmp_lt, .cmp_lte => |op| {
                 const bin_op = air_data[@backingInt(inst_idx)].bin_op;
 

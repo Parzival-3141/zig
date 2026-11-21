@@ -50,7 +50,6 @@ pub const case_sets = [_]CaseSet{
         },
     },
     .{
-        .disabled = true, // AIR `.neg` (float negation) not implemented
         .name = "arith-negation",
         .source =
         \\var in_a: f32 = 0;
