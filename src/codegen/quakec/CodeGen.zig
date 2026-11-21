@@ -288,7 +288,7 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                     .args = .{ a, b, .{ .local = slot } },
                 });
             },
-            .cmp_gt, .cmp_gte, .cmp_lt, .cmp_lte => |op| {
+            .cmp_eq, .cmp_neq, .cmp_gt, .cmp_gte, .cmp_lt, .cmp_lte => |op| {
                 const bin_op = air_data[@backingInt(inst_idx)].bin_op;
 
                 const a = try function.resolveOperand(bin_op.lhs);
@@ -300,6 +300,8 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 const slot = try function.frameAllocLiveValue(inst_idx, .float, .temp);
                 try function.statements.append(zcu.gpa, .{
                     .op = switch (op) {
+                        .cmp_eq => .eq_f,
+                        .cmp_neq => .ne_f,
                         .cmp_gt => .gt,
                         .cmp_gte => .ge,
                         .cmp_lt => .lt,

@@ -557,10 +557,8 @@ pub const case_sets = [_]CaseSet{
             .{ .inputs = &.{v("in_a", "-4")}, .expects = &.{ v("out_pos", "2"), v("out_lt", "1") } },
         },
     },
-    // Disabled: cmp_eq/cmp_neq lowering not implemented (only gt/gte/lt/lte exist).
     // Covers equality boundaries, NaN self-inequality, and -0.0 == 0.0.
     .{
-        .disabled = true,
         .name = "cmp-eq-ne",
         .source =
         \\var in_a: f32 = 0;
@@ -577,7 +575,7 @@ pub const case_sets = [_]CaseSet{
         \\}
         ,
         .cases = &.{
-            .{ .inputs = &.{v("in_a", "2")}, .expects = &.{ v("out_eq", "1"), v("out_ne", "2"), v("out_selfeq", "1"), v("out_zero", "1") } },
+            .{ .inputs = &.{v("in_a", "2")}, .expects = &.{ v("out_eq", "1"), v("out_ne", "2"), v("out_selfeq", "1"), v("out_zero", "2") } },
             .{ .inputs = &.{v("in_a", "nan")}, .expects = &.{ v("out_selfeq", "2"), v("out_zero", "2") } },
             .{ .inputs = &.{v("in_a", "-0")}, .expects = &.{v("out_zero", "1")} },
         },
