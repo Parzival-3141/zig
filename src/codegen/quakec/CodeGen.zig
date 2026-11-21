@@ -41,7 +41,7 @@ pub fn legalizeFeatures(_: *const std.Target) ?*const Air.Legalize.Features {
 pt: Zcu.PerThread,
 func_index: InternPool.Index,
 air: *const Air,
-live: Air.Liveness,
+liveness: Air.Liveness,
 
 num_params: u8 = 0,
 
@@ -113,7 +113,7 @@ pub fn generate(
         .func_index = func_index,
         .pt = pt,
         .air = air,
-        .live = liveness.*.?,
+        .liveness = liveness.*.?,
     };
     defer function.deinit();
 
@@ -153,29 +153,29 @@ fn deinit(cg: *CodeGen) void {
     cg.* = undefined;
 }
 
-fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
-    const live = function.live;
-    const pt = function.pt;
+fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) !void {
+    const liveness = cg.liveness;
+    const pt = cg.pt;
     const zcu = pt.zcu;
     const ip = &zcu.intern_pool;
-    const air = function.air;
+    const air = cg.air;
 
     const air_tags: []const Air.Inst.Tag = air.instructions.items(.tag);
     const air_data: []const Air.Inst.Data = air.instructions.items(.data);
     for (body) |inst_idx| {
-        if (live.isUnused(inst_idx) and !air.mustLower(inst_idx, &pt.zcu.intern_pool))
+        if (liveness.isUnused(inst_idx) and !air.mustLower(inst_idx, &pt.zcu.intern_pool))
             continue;
 
         // errdefer {
-        log.debug("{f}", .{AirDump{ .cg = function, .inst = inst_idx }});
+        log.debug("{f}", .{AirDump{ .cg = cg, .inst = inst_idx }});
         // }
 
         switch (air_tags[@backingInt(inst_idx)]) {
-            else => |air_tag| return function.fail("unimplemented air: {f} {t}", .{ inst_idx, air_tag }),
+            else => |air_tag| return cg.fail("unimplemented air: {f} {t}", .{ inst_idx, air_tag }),
             .alloc => {
                 const ty = air_data[@backingInt(inst_idx)].ty;
-                const qc_ty = try function.getQCType(ty.childType(pt.zcu));
-                _ = try function.frameAllocLiveValue(inst_idx, qc_ty, .local);
+                const qc_ty = try cg.getQCType(ty.childType(pt.zcu));
+                _ = try cg.frameAllocLiveValue(inst_idx, qc_ty, .local);
             },
             .dbg_stmt, .dbg_empty_stmt => {}, // ignored, quakec doesn't support debug info
             .dbg_var_ptr, .dbg_var_val, .dbg_arg_inline => {}, // ignored, quakec doesn't support debug info
@@ -189,20 +189,20 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 const ptr_ty = air.typeOf(bin_op.lhs, ip);
                 const ptr_info = ptr_ty.ptrInfo(zcu);
 
-                if (ptr_info.packed_offset.host_size != 0) return function.fail("QuakeC backend does not support non-ABI-aligned pointers", .{});
+                if (ptr_info.packed_offset.host_size != 0) return cg.fail("QuakeC backend does not support non-ABI-aligned pointers", .{});
                 if (bin_op.rhs.toInterned()) |intern| if (ip.isUndef(intern)) continue; // skip store of undefined. If this store is part of a declaration then the linker will ensure the variable is zeroed.
 
-                const rhs = try function.resolveOperand(bin_op.rhs);
-                const lhs = try function.resolvePtrOperand(bin_op.lhs);
+                const rhs = try cg.resolveOperand(bin_op.rhs);
+                const lhs = try cg.resolvePtrOperand(bin_op.lhs);
                 log.debug("lhs = {t}, rhs = {t}", .{ lhs, rhs });
 
-                try function.statements.append(zcu.gpa, .{
+                try cg.statements.append(zcu.gpa, .{
                     .op = .store_f,
                     .args = .{ rhs, lhs, .void },
                 });
 
-                if (live.operandDies(inst_idx, 0)) try function.killValue(bin_op.lhs);
-                if (live.operandDies(inst_idx, 1)) try function.killValue(bin_op.rhs);
+                if (liveness.operandDies(inst_idx, 0)) try cg.killValue(bin_op.lhs);
+                if (liveness.operandDies(inst_idx, 1)) try cg.killValue(bin_op.rhs);
             },
             .load => {
                 // operand is a pointer to a local or global register
@@ -212,13 +212,13 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 // @Cleanup probably unecessary but for my own sanity
                 assert(Type.fromInterned(ptr_info.child).eql(ty_op.ty));
 
-                if (ptr_info.packed_offset.host_size != 0) return function.fail("QuakeC backend does not support non-ABI-aligned pointers", .{});
+                if (ptr_info.packed_offset.host_size != 0) return cg.fail("QuakeC backend does not support non-ABI-aligned pointers", .{});
 
-                const qc_ty = try function.getQCType(ty_op.ty);
+                const qc_ty = try cg.getQCType(ty_op.ty);
 
-                const src = try function.resolvePtrOperand(ty_op.operand);
+                const src = try cg.resolvePtrOperand(ty_op.operand);
 
-                if (live.isUnused(inst_idx)) {
+                if (liveness.isUnused(inst_idx)) {
                     // Unused mustLower load (e.g. volatile): @Todo perform the
                     // read once discard targets are representable (needs a
                     // Mir.Statement.Arg variant resolving to OFS_NULL; note a 3-word
@@ -231,34 +231,34 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                     // a global).
                     // @UpgradePath alias + materialize-on-hazard removes the move.
 
-                    const slot = try function.frameAllocLiveValue(inst_idx, qc_ty, .temp);
-                    try function.statements.append(zcu.gpa, .{
+                    const slot = try cg.frameAllocLiveValue(inst_idx, qc_ty, .temp);
+                    try cg.statements.append(zcu.gpa, .{
                         .op = .store_f,
                         .args = .{ src, .{ .local = slot }, .void },
                     });
                 }
 
-                if (live.operandDies(inst_idx, 0)) try function.killValue(ty_op.operand);
+                if (liveness.operandDies(inst_idx, 0)) try cg.killValue(ty_op.operand);
             },
             .add, .sub, .mul, .div_float => |op| {
                 // Both operands are the same type as the result (float for now).
                 // They are either the result of an air instruction or a constant,
                 // never pointers.
                 const bin_op = air_data[@backingInt(inst_idx)].bin_op;
-                const qc_ty = try function.getQCType(air.typeOf(bin_op.lhs, ip));
+                const qc_ty = try cg.getQCType(air.typeOf(bin_op.lhs, ip));
 
-                const a = try function.resolveOperand(bin_op.lhs);
-                const b = try function.resolveOperand(bin_op.rhs);
+                const a = try cg.resolveOperand(bin_op.lhs);
+                const b = try cg.resolveOperand(bin_op.rhs);
 
                 // Free dying operands before allocating the result so chained
                 // ops (a*b*c) reuse the dying slot. Safe since the VM reads a/b
                 // before writing c, so c == a or c == b is fine.
                 // @Todo check that assumption holds on popular quake source ports
-                if (live.operandDies(inst_idx, 0)) try function.killValue(bin_op.lhs);
-                if (live.operandDies(inst_idx, 1)) try function.killValue(bin_op.rhs);
+                if (liveness.operandDies(inst_idx, 0)) try cg.killValue(bin_op.lhs);
+                if (liveness.operandDies(inst_idx, 1)) try cg.killValue(bin_op.rhs);
 
-                const slot = try function.frameAllocLiveValue(inst_idx, qc_ty, .temp);
-                try function.statements.append(zcu.gpa, .{
+                const slot = try cg.frameAllocLiveValue(inst_idx, qc_ty, .temp);
+                try cg.statements.append(zcu.gpa, .{
                     .op = switch (op) {
                         .add => .add_f,
                         .sub => .sub_f,
@@ -276,14 +276,14 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 const value_idx = try ip.get(zcu.gpa, zcu.comp.io, pt.tid, .{
                     .float = .{ .ty = .f32_type, .storage = .{ .f32 = -1.0 } },
                 });
-                const gop = try function.immediates.getOrPutValue(zcu.gpa, value_idx, -1.0);
+                const gop = try cg.immediates.getOrPutValue(zcu.gpa, value_idx, -1.0);
 
                 const a: Mir.Statement.Arg = .{ .immediate = @intCast(gop.index) };
-                const b = try function.resolveOperand(un_op);
-                if (live.operandDies(inst_idx, 0)) try function.killValue(un_op);
+                const b = try cg.resolveOperand(un_op);
+                if (liveness.operandDies(inst_idx, 0)) try cg.killValue(un_op);
 
-                const slot = try function.frameAllocLiveValue(inst_idx, .float, .temp);
-                try function.statements.append(zcu.gpa, .{
+                const slot = try cg.frameAllocLiveValue(inst_idx, .float, .temp);
+                try cg.statements.append(zcu.gpa, .{
                     .op = .mul_f,
                     .args = .{ a, b, .{ .local = slot } },
                 });
@@ -291,14 +291,14 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
             .cmp_eq, .cmp_neq, .cmp_gt, .cmp_gte, .cmp_lt, .cmp_lte => |op| {
                 const bin_op = air_data[@backingInt(inst_idx)].bin_op;
 
-                const a = try function.resolveOperand(bin_op.lhs);
-                const b = try function.resolveOperand(bin_op.rhs);
+                const a = try cg.resolveOperand(bin_op.lhs);
+                const b = try cg.resolveOperand(bin_op.rhs);
 
-                if (live.operandDies(inst_idx, 0)) try function.killValue(bin_op.lhs);
-                if (live.operandDies(inst_idx, 1)) try function.killValue(bin_op.rhs);
+                if (liveness.operandDies(inst_idx, 0)) try cg.killValue(bin_op.lhs);
+                if (liveness.operandDies(inst_idx, 1)) try cg.killValue(bin_op.rhs);
 
-                const slot = try function.frameAllocLiveValue(inst_idx, .float, .temp);
-                try function.statements.append(zcu.gpa, .{
+                const slot = try cg.frameAllocLiveValue(inst_idx, .float, .temp);
+                try cg.statements.append(zcu.gpa, .{
                     .op = switch (op) {
                         .cmp_eq => .eq_f,
                         .cmp_neq => .ne_f,
@@ -315,22 +315,22 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 const ty_op = air_data[@backingInt(inst_idx)].ty_op;
                 const wanted_ty = ty_op.ty;
                 const wanted_bitsize = wanted_ty.bitSize(zcu);
-                if (wanted_bitsize > 32) return function.fail(
+                if (wanted_bitsize > 32) return cg.fail(
                     "@bitCast()-ing values greater than 32 bits is unsupported (size: {d})",
                     .{wanted_bitsize},
                 );
 
-                const qc_ty = try function.getQCType(wanted_ty);
+                const qc_ty = try cg.getQCType(wanted_ty);
 
                 // @Todo bitcasts should be a no-op since all lowered types are the same size,
                 // but we need to adhere to the live_value semantics which requires a move.
                 // Same move policy as .load, save to temp so in-flight value isn't clobbered
                 // @UpgradePath alias + materialize-on-hazard removes the move.
-                const src = try function.resolveOperand(ty_op.operand);
-                if (live.operandDies(inst_idx, 0)) try function.killValue(ty_op.operand);
+                const src = try cg.resolveOperand(ty_op.operand);
+                if (liveness.operandDies(inst_idx, 0)) try cg.killValue(ty_op.operand);
 
-                const slot = try function.frameAllocLiveValue(inst_idx, qc_ty, .temp);
-                try function.statements.append(zcu.gpa, .{
+                const slot = try cg.frameAllocLiveValue(inst_idx, qc_ty, .temp);
+                try cg.statements.append(zcu.gpa, .{
                     .op = .store_f,
                     .args = .{ src, .{ .local = slot }, .void },
                 });
@@ -338,7 +338,7 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
             .float_from_int => {
                 const ty_op = air_data[@backingInt(inst_idx)].ty_op;
                 const ty = ty_op.ty.toIntern();
-                if (ty != .f32_type) return function.fail(
+                if (ty != .f32_type) return cg.fail(
                     "only f32s are supported, got {f}",
                     .{Type.fromInterned(ty).fmt(zcu)},
                 );
@@ -347,7 +347,7 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 // or require them to be logically representable as f32s (u24 and i25 max). In-bounds int
                 // math should work fine, and f32/i25/u24 casts are implicit in >=0.16.0!
                 // I like the second option, but until then this is illegal behavior.
-                return function.fail("integers are not implemented yet: {f} {t}", .{ inst_idx, Air.Inst.Tag.float_from_int });
+                return cg.fail("integers are not implemented yet: {f} {t}", .{ inst_idx, Air.Inst.Tag.float_from_int });
             },
             .block => {
                 const ty_pl = air_data[@backingInt(inst_idx)].ty_pl;
@@ -356,23 +356,23 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 const block_body: []const Air.Inst.Index = @ptrCast(air.extra.items[extra.end..][0..extra.data.body_len]);
 
                 // The block may have a return value, which is filled by .br instructions in the body
-                const block_result_slot: ?u32 = if (!live.isUnused(inst_idx) and block_ty.hasRuntimeBits(zcu))
-                    try function.frameAllocLiveValue(inst_idx, try function.getQCType(block_ty), .temp)
+                const block_result_slot: ?u32 = if (!liveness.isUnused(inst_idx) and block_ty.hasRuntimeBits(zcu))
+                    try cg.frameAllocLiveValue(inst_idx, try cg.getQCType(block_ty), .temp)
                 else
                     null;
 
-                try function.blocks.putNoClobber(zcu.gpa, inst_idx, .{
+                try cg.blocks.putNoClobber(zcu.gpa, inst_idx, .{
                     .fixups = .empty,
                     .result_slot = block_result_slot,
                 });
-                try function.genBody(block_body);
-                const block_end = function.statements.items.len;
+                try cg.genBody(block_body);
+                const block_end = cg.statements.items.len;
 
                 // apply fixups to body
-                var block_data = function.blocks.fetchRemove(inst_idx).?.value;
+                var block_data = cg.blocks.fetchRemove(inst_idx).?.value;
                 defer block_data.fixups.deinit(zcu.gpa);
                 for (block_data.fixups.items) |fixup_idx| {
-                    const stmt = &function.statements.items[fixup_idx];
+                    const stmt = &cg.statements.items[fixup_idx];
                     switch (stmt.op) {
                         .goto => stmt.args[0].jump_to_stmt = @intCast(block_end),
                         else => unreachable,
@@ -381,11 +381,11 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
             },
             .br => {
                 const br = air_data[@backingInt(inst_idx)].br;
-                const block = function.blocks.getPtr(br.block_inst).?;
+                const block = cg.blocks.getPtr(br.block_inst).?;
 
                 if (block.result_slot) |frame_slot| {
-                    const src = try function.resolveOperand(br.operand);
-                    try function.statements.append(zcu.gpa, .{
+                    const src = try cg.resolveOperand(br.operand);
+                    try cg.statements.append(zcu.gpa, .{
                         .op = .store_f,
                         .args = .{ src, .{ .local = frame_slot }, .void },
                     });
@@ -394,14 +394,14 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 // emit jump to block end
                 // @Todo omit jump if next statement is the block end,
                 // e.g. we're the second branch in an if-else
-                try function.statements.append(zcu.gpa, .{
+                try cg.statements.append(zcu.gpa, .{
                     .op = .goto,
                     .args = .{ .{ .jump_to_stmt = 0 }, .void, .void },
                 });
                 // record jump offset needs fixup
-                try block.fixups.append(zcu.gpa, @intCast(function.statements.items.len - 1));
+                try block.fixups.append(zcu.gpa, @intCast(cg.statements.items.len - 1));
 
-                if (live.operandDies(inst_idx, 0)) try function.killValue(br.operand);
+                if (liveness.operandDies(inst_idx, 0)) try cg.killValue(br.operand);
             },
             .cond_br => {
                 const pl_op = air_data[@backingInt(inst_idx)].pl_op;
@@ -411,51 +411,51 @@ fn genBody(function: *CodeGen, body: []const Air.Inst.Index) !void {
                 // goto +else_body_len
                 // else body
 
-                const condition = try function.resolveOperand(pl_op.operand);
-                if (live.operandDies(inst_idx, 0)) try function.killValue(pl_op.operand);
+                const condition = try cg.resolveOperand(pl_op.operand);
+                if (liveness.operandDies(inst_idx, 0)) try cg.killValue(pl_op.operand);
 
                 const extra = air.extraData(Air.CondBr, pl_op.payload);
                 const then_body: []const Air.Inst.Index = @ptrCast(air.extra.items[extra.end..][0..extra.data.then_body_len]);
                 const else_body: []const Air.Inst.Index = @ptrCast(air.extra.items[extra.end + extra.data.then_body_len ..][0..extra.data.else_body_len]);
-                const liveness_cond_br = live.getCondBr(inst_idx);
+                const liveness_cond_br = liveness.getCondBr(inst_idx);
 
-                const ifnot_idx = function.statements.items.len;
-                try function.statements.append(zcu.gpa, .{
+                const ifnot_idx = cg.statements.items.len;
+                try cg.statements.append(zcu.gpa, .{
                     .op = .ifnot,
                     .args = .{ condition, .{ .jump_to_stmt = 0 }, .void },
                 });
 
-                const undo_start = function.branch_undo_stack.items.len;
-                function.branch_depth += 1;
+                const undo_start = cg.branch_undo_stack.items.len;
+                cg.branch_depth += 1;
 
                 log.debug("then_deaths:", .{});
-                for (liveness_cond_br.then_deaths) |dead_inst| try function.killValue(dead_inst.toRef());
+                for (liveness_cond_br.then_deaths) |dead_inst| try cg.killValue(dead_inst.toRef());
                 log.debug("end_then_deaths", .{});
-                try function.genBody(then_body); // .br instruction in the body will handle jumping past the other branch
+                try cg.genBody(then_body); // .br instruction in the body will handle jumping past the other branch
                 // fixup the jump offset
-                function.statements.items[ifnot_idx].args[1].jump_to_stmt = @intCast(function.statements.items.len);
+                cg.statements.items[ifnot_idx].args[1].jump_to_stmt = @intCast(cg.statements.items.len);
 
-                try function.restoreLiveValues(undo_start);
-                function.branch_undo_stack.shrinkRetainingCapacity(undo_start);
-                function.branch_depth -= 1;
+                try cg.restoreLiveValues(undo_start);
+                cg.branch_undo_stack.shrinkRetainingCapacity(undo_start);
+                cg.branch_depth -= 1;
 
                 log.debug("else_deaths:", .{});
-                for (liveness_cond_br.else_deaths) |dead_inst| try function.killValue(dead_inst.toRef());
+                for (liveness_cond_br.else_deaths) |dead_inst| try cg.killValue(dead_inst.toRef());
                 log.debug("end_else_deaths", .{});
-                try function.genBody(else_body);
+                try cg.genBody(else_body);
 
                 // We may still be inside an outer branch, meaning the else body also appended to the undo stack,
                 // so we need to discard those undos too.
-                function.branch_undo_stack.shrinkRetainingCapacity(undo_start);
+                cg.branch_undo_stack.shrinkRetainingCapacity(undo_start);
             },
             .ret, .ret_safe => {
                 const un_op = air_data[@backingInt(inst_idx)].un_op;
-                if (un_op != .void_value) return function.fail("@Todo handle return values", .{});
+                if (un_op != .void_value) return cg.fail("@Todo handle return values", .{});
                 // Void functions end with `done`, matching qcc: a bare
                 // `return` copies 3 words from args[0] to OFS_RETURN, which is
                 // meaningless for void functions (and overlaps OFS_RETURN when
                 // args[0] is OFS_NULL).
-                try function.statements.append(zcu.gpa, .{ .op = .done });
+                try cg.statements.append(zcu.gpa, .{ .op = .done });
                 // No need to kill the operand value because the function is over
             },
         }
@@ -653,8 +653,8 @@ const AirDump = struct {
     inst: ?Air.Inst.Index = null,
     pub fn format(d: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
         if (d.inst) |inst|
-            d.cg.air.writeInst(w, inst, d.cg.pt.zcu, d.cg.live)
+            d.cg.air.writeInst(w, inst, d.cg.pt.zcu, d.cg.liveness)
         else
-            d.cg.air.write(w, d.cg.pt.zcu, d.cg.live) catch {};
+            d.cg.air.write(w, d.cg.pt.zcu, d.cg.liveness) catch {};
     }
 };
