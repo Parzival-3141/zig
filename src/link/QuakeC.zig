@@ -202,8 +202,6 @@ pub fn updateFunc(
         .statements = &.{},
         .globals = &.{},
     };
-
-    // @panic("@Todo updateFunc");
 }
 
 pub fn updateNav(
@@ -222,47 +220,12 @@ pub fn updateNav(
         .@"extern" => |ext| {
             _ = ext; // autofix
             @panic("@Todo updateNav extern");
-
-            // // Extern variable gets a __got entry only
-            // const name = @"extern".name.toSlice(ip);
-            // const lib_name = @"extern".lib_name.toSlice(ip);
-            // const sym_index = try self.getGlobalSymbol(macho_file, name, lib_name);
-            // if (@"extern".is_threadlocal and macho_file.base.comp.config.any_non_single_threaded) self.symbols.items[sym_index].flags.tlv = true;
-            // if (self.dwarf) |*dwarf| {
-            //     var debug_wip_nav = try dwarf.initWipNav(pt, nav_index, sym_index);
-            //     defer debug_wip_nav.deinit();
-            //     dwarf.finishWipNav(pt, nav_index, &debug_wip_nav) catch |err| switch (err) {
-            //         error.OutOfMemory => return error.OutOfMemory,
-            //         error.Overflow => return error.Overflow,
-            //         else => |e| return macho_file.base.cgFail(nav_index, "failed to finish dwarf nav: {s}", .{@errorName(e)}),
-            //     };
-            // }
-            // return;
+            // Extern functions are treated as QuakeC builtins
+            // how to bind builtin number? Hijack callconv? libname?
         },
         else => nav_res.value,
     };
     log.debug("@Todo updateNav {f}", .{nav.fqn.fmt(ip)});
-
-    // const nav_init, const chased_nav_index = switch (ip.indexToKey(nav.resolved.?.value)) {
-    //     .func => return, // global const which is a function alias
-    //     .@"extern" => |ext| {
-    //         // const name = ext.name.toSlice(ip);
-    //         if (ip.isFunctionType(nav.typeOf(ip))) {
-
-    //             // Extern functions are treated as QuakeC builtins
-    //             // how to bind builtin number? Hijack callconv? libname?
-    //             const fn_info = zcu.typeToFunc(.fromInterned(ext.ty)).?;
-    //             _ = fn_info; // autofix
-    //             log.debug("updateNav == extern func {f} ==", .{nav.fqn.fmt(ip)});
-    //             // return; // @Incomplete
-    //         }
-
-    //         @panic("TODO updateNav extern");
-    //     },
-    //     .variable => |variable| .{ variable.init, variable.owner_nav },
-    //     else => .{ nav.resolved.?.value, nav_index },
-    // };
-    // log.debug("updateNav {f} {d}", .{ nav.fqn.fmt(ip), chased_nav_index });
 
     if (nav_init != .none and !Value.fromInterned(nav_init).typeOf(zcu).hasRuntimeBits(zcu)) {
         return;

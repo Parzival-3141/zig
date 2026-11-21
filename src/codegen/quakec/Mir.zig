@@ -17,6 +17,14 @@ locals: []const ValueType,
 globals: []const InternPool.Nav.Index,
 immediates: []const f32, // @Todo handle other QC types
 
+pub fn deinit(mir: *@This(), gpa: std.mem.Allocator) void {
+    gpa.free(mir.statements);
+    gpa.free(mir.locals);
+    gpa.free(mir.immediates);
+    gpa.free(mir.globals);
+    mir.* = undefined;
+}
+
 pub const Statement = struct {
     op: Opcode,
     args: [3]Arg = @splat(.void),
@@ -34,28 +42,15 @@ pub const Statement = struct {
     };
 };
 
-pub fn deinit(mir: *@This(), gpa: std.mem.Allocator) void {
-    gpa.free(mir.statements);
-    gpa.free(mir.locals);
-    gpa.free(mir.immediates);
-    gpa.free(mir.globals);
-    mir.* = undefined;
-}
-
-// pub const Statement = extern struct {
-//     op: Opcode,
-//     args: [3]i16,
-// };
-
 pub const ValueType = enum(u15) {
     void,
     string,
     float,
     vector,
     entity,
-    field, // field offset?
+    field,
     function,
-    // pointer, // unused
+    pointer,
 };
 
 pub const Opcode = enum(u16) {

@@ -106,7 +106,7 @@ pub fn generate(
     air: *const Air,
     liveness: *const ?Air.Liveness,
 ) link.Error!Mir {
-    assert(lf.tag == .quakec); // @Cleanup or do dev.check(.quakec_backend) instead?
+    assert(lf.tag == .quakec);
     const zcu = pt.zcu;
 
     var function: CodeGen = .{
@@ -117,7 +117,7 @@ pub fn generate(
     };
     defer function.deinit();
 
-    log.debug("{f}\n\nstarting codegen:", .{AirDump{ .cg = &function }});
+    log.debug("\n{f}\n\nstarting codegen:", .{AirDump{ .cg = &function }});
 
     try function.genBody(air.getMainBody());
 
@@ -209,7 +209,6 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) !void {
                 const ty_op = air_data[@backingInt(inst_idx)].ty_op;
                 const ptr_ty = air.typeOf(ty_op.operand, ip);
                 const ptr_info = ptr_ty.ptrInfo(zcu);
-                // @Cleanup probably unecessary but for my own sanity
                 assert(Type.fromInterned(ptr_info.child).eql(ty_op.ty));
 
                 if (ptr_info.packed_offset.host_size != 0) return cg.fail("QuakeC backend does not support non-ABI-aligned pointers", .{});
