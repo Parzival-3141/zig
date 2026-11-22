@@ -643,113 +643,157 @@ pub const case_sets = [_]CaseSet{
     },
     // ---------------------------------------------------------------- batch 6
     .{
-        .disabled = true, // AIR `.loop` not implemented (while lowers to `.loop`)
-        .name = "loop-fixed-count",
+        .name = "while-loop",
         .source =
-        \\var in_a: f32 = 0;
-        \\var out: f32 = 0;
-        \\
+        \\var sum: f32 = 0;
+        \\var i: f32 = 0;
         \\export fn main() callconv(.quakec) void {
-        \\    var i: f32 = 0;
-        \\    var s: f32 = 0;
-        \\    while (i < 4) {
-        \\        s += in_a;
-        \\        i += 1;
+        \\    while (i < 5) : (i += 1) {
+        \\        sum += i;
         \\    }
-        \\    out = s + i;
         \\}
         ,
         .cases = &.{
-            .{ .inputs = &.{v("in_a", "2")}, .expects = &.{v("out", "12")} },
-            .{ .inputs = &.{v("in_a", "3")}, .expects = &.{v("out", "15")} },
-            .{ .inputs = &.{v("in_a", "0")}, .expects = &.{v("out", "4")} },
+            .{ .inputs = &.{}, .expects = &.{ v("sum", "10"), v("i", "5") } },
         },
     },
     .{
-        .disabled = true, // AIR `.loop` not implemented (while lowers to `.loop`)
-        .name = "loop-zero-trip",
+        // Port of test "while with continue expression" from
+        // test/behavior/while.zig (i32 -> f32; expect -> out global).
+        .name = "while-continue-expr",
         .source =
-        \\var in_a: f32 = 0;
-        \\var out: f32 = 0;
+        \\var out_sum: f32 = 0;
         \\
         \\export fn main() callconv(.quakec) void {
-        \\    var s: f32 = 5;
-        \\    while (in_a > 10) {
-        \\        s += 1;
-        \\    }
-        \\    out = s;
-        \\}
-        ,
-        .cases = &.{
-            .{ .inputs = &.{v("in_a", "4")}, .expects = &.{v("out", "5")} },
-            .{ .inputs = &.{v("in_a", "20")}, .expects = &.{v("out", "6")} },
-        },
-    },
-    .{
-        .disabled = true, // AIR `.loop` not implemented (while lowers to `.loop`)
-        .name = "loop-mutating-cond",
-        .source =
-        \\var in_a: f32 = 0;
-        \\var out: f32 = 0;
-        \\
-        \\export fn main() callconv(.quakec) void {
-        \\    var s: f32 = 0;
-        \\    while (s < in_a) {
-        \\        s += 2;
-        \\    }
-        \\    out = s;
-        \\}
-        ,
-        .cases = &.{
-            .{ .inputs = &.{v("in_a", "5")}, .expects = &.{v("out", "6")} },
-            .{ .inputs = &.{v("in_a", "0")}, .expects = &.{v("out", "0")} },
-            .{ .inputs = &.{v("in_a", "4")}, .expects = &.{v("out", "4")} },
-        },
-    },
-    .{
-        .disabled = true, // AIR `.loop` not implemented (while lowers to `.loop`)
-        .name = "loop-nested",
-        .source =
-        \\var out: f32 = 0;
-        \\
-        \\export fn main() callconv(.quakec) void {
-        \\    var i: f32 = 0;
-        \\    var s: f32 = 0;
-        \\    while (i < 3) {
-        \\        var j: f32 = 0;
-        \\        while (j < 2) {
-        \\            s += 1;
-        \\            j += 1;
+        \\    var sum: f32 = 0;
+        \\    {
+        \\        var i: f32 = 0;
+        \\        while (i < 10) : (i += 1) {
+        \\            if (i == 5) continue;
+        \\            sum += i;
         \\        }
-        \\        i += 1;
         \\    }
-        \\    out = s;
+        \\    out_sum = sum;
         \\}
         ,
         .cases = &.{
-            .{ .expects = &.{v("out", "6")} },
+            .{ .expects = &.{v("out_sum", "40")} },
         },
     },
     .{
-        .disabled = true, // AIR `.loop` not implemented (while lowers to `.loop`)
-        .name = "loop-early-return",
+        // Port of test "while with else" from test/behavior/while.zig
+        // (i32 -> f32; expect -> out globals).
+        .name = "while-else",
         .source =
-        \\var in_a: f32 = 0;
-        \\var out: f32 = 0;
+        \\var out_sum: f32 = 0;
+        \\var out_else: f32 = 0;
         \\
         \\export fn main() callconv(.quakec) void {
+        \\    var sum: f32 = 0;
         \\    var i: f32 = 0;
-        \\    while (i < 100) {
-        \\        if (i > in_a) {
-        \\            out = i;
-        \\            return;
-        \\        }
-        \\        i += 1;
+        \\    var got_else: f32 = 0;
+        \\    while (i < 10) : (i += 1) {
+        \\        sum += 1;
+        \\    } else {
+        \\        got_else += 1;
         \\    }
+        \\    out_sum = sum;
+        \\    out_else = got_else;
         \\}
         ,
         .cases = &.{
-            .{ .inputs = &.{v("in_a", "3.5")}, .expects = &.{v("out", "4")} },
+            .{ .expects = &.{ v("out_sum", "10"), v("out_else", "1") } },
+        },
+    },
+    .{
+        // Port of test "continue and break" from test/behavior/while.zig
+        // (i32 -> f32; expect -> out globals; counter global -> local).
+        .name = "while-continue-and-break",
+        .source =
+        \\var out_i: f32 = 0;
+        \\var out_counter: f32 = 0;
+        \\
+        \\export fn main() callconv(.quakec) void {
+        \\    var counter: f32 = 0;
+        \\    var i: f32 = 0;
+        \\    while (true) {
+        \\        counter += 2;
+        \\        i += 1;
+        \\        if (i < 4) {
+        \\            continue;
+        \\        }
+        \\        break;
+        \\    }
+        \\    out_i = i;
+        \\    out_counter = counter;
+        \\}
+        ,
+        .cases = &.{
+            .{ .expects = &.{ v("out_i", "4"), v("out_counter", "8") } },
+        },
+    },
+    .{
+        // Port of test "break from outer while loop" from
+        // test/behavior/while.zig (a normal return -> out global).
+        .name = "while-break-outer",
+        .source =
+        \\var out: bool = false;
+        \\
+        \\export fn main() callconv(.quakec) void {
+        \\    outer: while (true) {
+        \\        while (true) {
+        \\            break :outer;
+        \\        }
+        \\    }
+        \\    out = true;
+        \\}
+        ,
+        .cases = &.{
+            .{ .expects = &.{v("out", "1")} },
+        },
+    },
+    .{
+        // Port of test "continue outer while loop" from
+        // test/behavior/while.zig (usize -> f32; expect -> out global).
+        .name = "while-continue-outer",
+        .source =
+        \\var out_i: f32 = 0;
+        \\
+        \\export fn main() callconv(.quakec) void {
+        \\    var i: f32 = 0;
+        \\    outer: while (i < 10) : (i += 1) {
+        \\        while (true) {
+        \\            continue :outer;
+        \\        }
+        \\    }
+        \\    out_i = i;
+        \\}
+        ,
+        .cases = &.{
+            .{ .expects = &.{v("out_i", "10")} },
+        },
+    },
+    .{
+        // Port of test "while bool 2 break statements and an else" from
+        // test/behavior/while.zig (S.entry params -> input globals;
+        // expect -> out global).
+        .name = "while-bool-else-result",
+        .source =
+        \\var in_t: bool = false;
+        \\var in_f: bool = false;
+        \\var out_ok: bool = false;
+        \\
+        \\export fn main() callconv(.quakec) void {
+        \\    var ok = false;
+        \\    ok = while (in_t) {
+        \\        if (in_f) break false;
+        \\        if (in_t) break true;
+        \\    } else false;
+        \\    out_ok = ok;
+        \\}
+        ,
+        .cases = &.{
+            .{ .inputs = &.{ v("in_t", "1"), v("in_f", "0") }, .expects = &.{v("out_ok", "1")} },
         },
     },
     // ---------------------------------------------------------------- batch 7
@@ -996,6 +1040,7 @@ pub fn addQuakeCTests(
         const src = wf.add(b.fmt("cases/{s}.zig", .{set.name}), set.source);
         const compile = b.addRunArtifact(opts.compiler_exe);
         compile.addArgs(&.{ "build-exe", "-fno-llvm", "-fno-lld", "-target", "quakec-freestanding" });
+        // compile.addArgs(&.{ "--debug-log", "codegen" });
         compile.addFileArg(src);
         compile.addArgs(&.{ "--name", set.name });
         const dat = compile.addPrefixedOutputFileArg("-femit-bin=", b.fmt("{s}.dat", .{set.name}));

@@ -55,12 +55,8 @@ num_params: u8 = 0,
 /// appropriate memory regions. A memory region may be recycled when its value dies.
 live_values: std.AutoArrayHashMapUnmanaged(Air.Inst.Index, ValueSlot) = .empty,
 
-blocks: std.AutoHashMapUnmanaged(Air.Inst.Index, struct {
-    /// Indices of jump statements in the block body to fixup and point to end of block
-    fixups: std.ArrayList(u32),
-    /// Always an index into `frame`
-    result_slot: ?u32,
-}) = .empty,
+/// Used for block and loop instructions
+blocks: std.AutoHashMapUnmanaged(Air.Inst.Index, Block) = .empty,
 
 /// Record of how `live_values` are modified when emitting a branch.
 /// Use this data to restore the pre-branch state so the peer branch can be emitted correctly.
@@ -98,6 +94,13 @@ const ValueSlot = union(enum) {
 
     // Constants are not produced by AIR instructions and are directly
     // returned by resolveOperand.
+};
+
+const Block = struct {
+    /// Indices of goto statements in the block body to fixup.
+    fixups: std.ArrayList(u32),
+    /// Always an index into `frame`.
+    result_slot: ?u32,
 };
 
 pub fn generate(
@@ -363,14 +366,11 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) !void {
                 return cg.fail("integers are not implemented yet: {f} {t}", .{ inst_idx, Air.Inst.Tag.float_from_int });
             },
             .block => {
-                const ty_pl = air_data[@backingInt(inst_idx)].ty_pl;
-                const extra = air.extraData(Air.Block, ty_pl.payload);
-                const block_ty = ty_pl.ty;
-                const block_body: []const Air.Inst.Index = @ptrCast(air.extra.items[extra.end..][0..extra.data.body_len]);
+                const block = air.unwrapBlock(inst_idx);
 
                 // The block may have a return value, which is filled by .br instructions in the body
-                const block_result_slot: ?u32 = if (!liveness.isUnused(inst_idx) and block_ty.hasRuntimeBits(zcu))
-                    try cg.frameAllocLiveValue(inst_idx, try cg.getQCType(block_ty), .temp)
+                const block_result_slot: ?u32 = if (!liveness.isUnused(inst_idx) and block.ty.hasRuntimeBits(zcu))
+                    try cg.frameAllocLiveValue(inst_idx, try cg.getQCType(block.ty), .temp)
                 else
                     null;
 
@@ -378,19 +378,10 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) !void {
                     .fixups = .empty,
                     .result_slot = block_result_slot,
                 });
-                try cg.genBody(block_body);
+                try cg.genBody(block.body);
                 const block_end = cg.statements.items.len;
 
-                // apply fixups to body
-                var block_data = cg.blocks.fetchRemove(inst_idx).?.value;
-                defer block_data.fixups.deinit(zcu.gpa);
-                for (block_data.fixups.items) |fixup_idx| {
-                    const stmt = &cg.statements.items[fixup_idx];
-                    switch (stmt.op) {
-                        .goto => stmt.args[0].jump_to_stmt = @intCast(block_end),
-                        else => unreachable,
-                    }
-                }
+                cg.applyBlockJumpFixups(inst_idx, @intCast(block_end));
             },
             .br => {
                 const br = air_data[@backingInt(inst_idx)].br;
@@ -403,34 +394,41 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) !void {
                         .args = .{ src, .{ .local = frame_slot }, .void },
                     });
                 }
+                if (liveness.operandDies(inst_idx, 0)) try cg.killValue(br.operand);
 
                 // emit jump to block end
                 // @Todo omit jump if next statement is the block end,
                 // e.g. we're the second branch in an if-else
-                try cg.statements.append(zcu.gpa, .{
-                    .op = .goto,
-                    .args = .{ .{ .jump_to_stmt = 0 }, .void, .void },
-                });
-                // record jump offset needs fixup
-                try block.fixups.append(zcu.gpa, @intCast(cg.statements.items.len - 1));
+                try cg.emitBlockJump(block);
+            },
+            .loop => {
+                const block = air.unwrapBlock(inst_idx);
+                assert(block.ty.isNoReturn(zcu));
 
-                if (liveness.operandDies(inst_idx, 0)) try cg.killValue(br.operand);
+                try cg.blocks.putNoClobber(zcu.gpa, inst_idx, .{
+                    .fixups = .empty,
+                    .result_slot = null,
+                });
+
+                const loop_start = cg.statements.items.len;
+                try cg.genBody(block.body);
+                cg.applyBlockJumpFixups(inst_idx, @intCast(loop_start));
+            },
+            .repeat => {
+                const repeat = air_data[@backingInt(inst_idx)].repeat;
+                const block = cg.blocks.getPtr(repeat.loop_inst).?;
+                try cg.emitBlockJump(block); // emit jump to loop start
             },
             .cond_br => {
-                const pl_op = air_data[@backingInt(inst_idx)].pl_op;
+                const cond_br = air.unwrapCondBr(inst_idx);
 
                 // ifnot condition +then_body_len
                 // then body
                 // goto +else_body_len
                 // else body
 
-                const condition = try cg.resolveOperand(pl_op.operand);
-                if (liveness.operandDies(inst_idx, 0)) try cg.killValue(pl_op.operand);
-
-                const extra = air.extraData(Air.CondBr, pl_op.payload);
-                const then_body: []const Air.Inst.Index = @ptrCast(air.extra.items[extra.end..][0..extra.data.then_body_len]);
-                const else_body: []const Air.Inst.Index = @ptrCast(air.extra.items[extra.end + extra.data.then_body_len ..][0..extra.data.else_body_len]);
-                const liveness_cond_br = liveness.getCondBr(inst_idx);
+                const condition = try cg.resolveOperand(cond_br.condition);
+                if (liveness.operandDies(inst_idx, 0)) try cg.killValue(cond_br.condition);
 
                 const ifnot_idx = cg.statements.items.len;
                 try cg.statements.append(zcu.gpa, .{
@@ -441,10 +439,12 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) !void {
                 const undo_start = cg.branch_undo_stack.items.len;
                 cg.branch_depth += 1;
 
+                const liveness_cond_br = liveness.getCondBr(inst_idx);
+
                 log.debug("then_deaths:", .{});
                 for (liveness_cond_br.then_deaths) |dead_inst| try cg.killValue(dead_inst.toRef());
                 log.debug("end_then_deaths", .{});
-                try cg.genBody(then_body); // .br instruction in the body will handle jumping past the other branch
+                try cg.genBody(cond_br.then_body); // .br instruction in the body will handle jumping past the other branch
                 // fixup the jump offset
                 cg.statements.items[ifnot_idx].args[1].jump_to_stmt = @intCast(cg.statements.items.len);
 
@@ -455,7 +455,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) !void {
                 log.debug("else_deaths:", .{});
                 for (liveness_cond_br.else_deaths) |dead_inst| try cg.killValue(dead_inst.toRef());
                 log.debug("end_else_deaths", .{});
-                try cg.genBody(else_body);
+                try cg.genBody(cond_br.else_body);
 
                 // We may still be inside an outer branch, meaning the else body also appended to the undo stack,
                 // so we need to discard those undos too.
@@ -652,6 +652,32 @@ fn frameAllocLiveValue(
         ty,
     );
     return slot;
+}
+
+fn emitBlockJump(cg: *CodeGen, block: *Block) !void {
+    const gpa = cg.pt.zcu.gpa;
+    try cg.statements.append(gpa, .{
+        .op = .goto,
+        .args = .{ .{ .jump_to_stmt = 0 }, .void, .void },
+    });
+    // record jump offset needs fixup
+    try block.fixups.append(gpa, @intCast(cg.statements.items.len - 1));
+}
+
+fn applyBlockJumpFixups(
+    cg: *CodeGen,
+    inst_idx: Air.Inst.Index,
+    jump_target_stmt_idx: u32,
+) void {
+    var block_data = cg.blocks.fetchRemove(inst_idx).?.value;
+    defer block_data.fixups.deinit(cg.pt.zcu.gpa);
+    for (block_data.fixups.items) |fixup_idx| {
+        const stmt = &cg.statements.items[fixup_idx];
+        switch (stmt.op) {
+            .goto => stmt.args[0].jump_to_stmt = jump_target_stmt_idx,
+            else => unreachable,
+        }
+    }
 }
 
 const AirDump = struct {
