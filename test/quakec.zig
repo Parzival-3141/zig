@@ -754,41 +754,70 @@ pub const case_sets = [_]CaseSet{
     },
     // ---------------------------------------------------------------- batch 7
     .{
-        .disabled = true, // bool_and/bool_or lowering not implemented
-        .name = "and-short-circuit",
+        // Port of testShortCircuit from test/behavior/bool.zig. The hit flags
+        // check which bodies ran, out_err marks operands/bodies that must not
+        // execute (catches eager evaluation and wrong or/and values).
+        .name = "short-circuit",
         .source =
-        \\var in_a: f32 = 0;
-        \\var out: f32 = 0;
+        \\var in_f: bool = false;
+        \\var in_t: bool = true;
+        \\var out_h1: bool = false;
+        \\var out_h2: bool = false;
+        \\var out_h3: bool = false;
+        \\var out_h4: bool = false;
+        \\var out_err: bool = false;
         \\
         \\export fn main() callconv(.quakec) void {
-        \\    out = if (in_a > 1 and in_a < 4) 1 else 2;
+        \\    var hit_1 = in_f;
+        \\    var hit_2 = in_f;
+        \\    var hit_3 = in_f;
+        \\    var hit_4 = in_f;
+        \\
+        \\    if (in_t or x: {
+        \\        out_err = true;
+        \\        break :x in_f;
+        \\    }) {
+        \\        hit_1 = in_t;
+        \\    }
+        \\    if (in_f or x: {
+        \\        hit_2 = in_t;
+        \\        break :x in_f;
+        \\    }) {
+        \\        out_err = true;
+        \\    }
+        \\
+        \\    if (in_t and x: {
+        \\        hit_3 = in_t;
+        \\        break :x in_f;
+        \\    }) {
+        \\        out_err = true;
+        \\    }
+        \\    if (in_f and x: {
+        \\        out_err = true;
+        \\        break :x in_f;
+        \\    }) {
+        \\        out_err = true;
+        \\    } else {
+        \\        hit_4 = in_t;
+        \\    }
+        \\
+        \\    out_h1 = hit_1;
+        \\    out_h2 = hit_2;
+        \\    out_h3 = hit_3;
+        \\    out_h4 = hit_4;
         \\}
         ,
         .cases = &.{
-            .{ .inputs = &.{v("in_a", "2")}, .expects = &.{v("out", "1")} },
-            .{ .inputs = &.{v("in_a", "0")}, .expects = &.{v("out", "2")} },
-            .{ .inputs = &.{v("in_a", "5")}, .expects = &.{v("out", "2")} },
+            .{ .inputs = &.{ v("in_f", "0"), v("in_t", "1") }, .expects = &.{
+                v("out_h1", "1"),
+                v("out_h2", "1"),
+                v("out_h3", "1"),
+                v("out_h4", "1"),
+                v("out_err", "0"),
+            } },
         },
     },
     .{
-        .disabled = true, // bool_and/bool_or lowering not implemented
-        .name = "or-short-circuit",
-        .source =
-        \\var in_a: f32 = 0;
-        \\var out: f32 = 0;
-        \\
-        \\export fn main() callconv(.quakec) void {
-        \\    out = if (in_a < 1 or in_a > 4) 1 else 2;
-        \\}
-        ,
-        .cases = &.{
-            .{ .inputs = &.{v("in_a", "0")}, .expects = &.{v("out", "1")} },
-            .{ .inputs = &.{v("in_a", "2")}, .expects = &.{v("out", "2")} },
-            .{ .inputs = &.{v("in_a", "5")}, .expects = &.{v("out", "1")} },
-        },
-    },
-    .{
-        .disabled = true, // bool_and/bool_or lowering not implemented
         .name = "and-const-rhs",
         .source =
         \\var in_a: f32 = 0;
@@ -801,6 +830,43 @@ pub const case_sets = [_]CaseSet{
         .cases = &.{
             .{ .inputs = &.{v("in_a", "3")}, .expects = &.{v("out", "1")} },
             .{ .inputs = &.{v("in_a", "1")}, .expects = &.{v("out", "2")} },
+        },
+    },
+    .{
+        .name = "bool-not",
+        .source =
+        \\var in_b: bool = false;
+        \\var out_not: bool = false;
+        \\var out_dnot: bool = false;
+        \\var out_gnot: bool = false;
+        \\var out_cond: bool = false;
+        \\
+        \\export fn main() callconv(.quakec) void {
+        \\    var b = in_b;
+        \\    b = !b;
+        \\    out_not = b;
+        \\    out_dnot = !!b;
+        \\    out_gnot = !out_not;
+        \\    if (!b) {
+        \\        out_cond = true;
+        \\    } else {
+        \\        out_cond = false;
+        \\    }
+        \\}
+        ,
+        .cases = &.{
+            .{ .inputs = &.{v("in_b", "0")}, .expects = &.{
+                v("out_not", "1"),
+                v("out_dnot", "1"),
+                v("out_gnot", "0"),
+                v("out_cond", "0"),
+            } },
+            .{ .inputs = &.{v("in_b", "1")}, .expects = &.{
+                v("out_not", "0"),
+                v("out_dnot", "0"),
+                v("out_gnot", "1"),
+                v("out_cond", "1"),
+            } },
         },
     },
     // ---------------------------------------------------------------- batch 8
@@ -833,30 +899,7 @@ pub const case_sets = [_]CaseSet{
         ,
         .cases = &.{},
     },
-    // Disabled: `childType` panics on non-aggregate types instead of failing cleanly,
-    // so this currently crashes codegen rather than producing the error. Enable after
-    // the alloc handler validates the pointee type before calling childType.
     .{
-        .disabled = true,
-        .name = "fail-bool-local",
-        .expect_compile_error = true,
-        .error_substring = "unsupported quakec backend type",
-        .source =
-        \\var in_a: f32 = 0;
-        \\var out: f32 = 0;
-        \\
-        \\export fn main() callconv(.quakec) void {
-        \\    var b: bool = in_a > 2;
-        \\    out = if (b) 1 else 2;
-        \\}
-        ,
-        .cases = &.{},
-    },
-    // Disabled: vector locals are silently mis-lowered as a single float slot
-    // (alloc passes childType(f32) through to frameAlloc). Enable after the alloc
-    // handler rejects vector types.
-    .{
-        .disabled = true,
         .name = "fail-vector-local",
         .expect_compile_error = true,
         .error_substring = "unsupported quakec backend type",
@@ -874,7 +917,7 @@ pub const case_sets = [_]CaseSet{
     },
     // ------------------------------------------------- batch 9 (planned, disabled)
     .{
-        .disabled = true, // int storage/casts not implemented (u24/i25 plan)
+        .disabled = true, // runtime @bitCast lowers to `bit_cast_safe` in safe builds (unimplemented); ints also banned (u24/i25 plan)
         .name = "bitcast-roundtrip",
         .source =
         \\var in_a: f32 = 0;
@@ -888,23 +931,6 @@ pub const case_sets = [_]CaseSet{
         .cases = &.{
             .{ .inputs = &.{v("in_a", "4")}, .expects = &.{v("out", "4")} },
             .{ .inputs = &.{v("in_a", "-2")}, .expects = &.{v("out", "-2")} },
-        },
-    },
-    .{
-        .disabled = true, // bool storage not implemented
-        .name = "bool-value",
-        .source =
-        \\var in_a: f32 = 0;
-        \\var out: f32 = 0;
-        \\
-        \\export fn main() callconv(.quakec) void {
-        \\    var b: bool = in_a > 2;
-        \\    out = if (b) 10 else if (!b) 20 else 30;
-        \\}
-        ,
-        .cases = &.{
-            .{ .inputs = &.{v("in_a", "4")}, .expects = &.{v("out", "10")} },
-            .{ .inputs = &.{v("in_a", "1")}, .expects = &.{v("out", "20")} },
         },
     },
     .{
@@ -925,19 +951,6 @@ pub const case_sets = [_]CaseSet{
         .cases = &.{
             .{ .inputs = &.{v("in_a", "4")}, .expects = &.{v("out", "5")} },
         },
-    },
-    .{
-        .disabled = true, // entity fields not implemented (storep_f/load_f)
-        .name = "entity-fields",
-        .source =
-        \\var in_a: f32 = 0;
-        \\var out: f32 = 0;
-        \\
-        \\export fn main() callconv(.quakec) void {
-        \\    out = in_a;
-        \\}
-        ,
-        .cases = &.{},
     },
 };
 

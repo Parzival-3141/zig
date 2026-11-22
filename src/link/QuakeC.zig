@@ -391,14 +391,18 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
         const nav_res = nav.resolved.?;
 
         // for now nav must be a non-extern variable
-        assert(nav_res.type == .f32_type); // @Todo handle all QC types
         assert(nav.getExtern(ip) == null);
         assert(!nav_res.@"const");
 
-        const init_value: f32 = if (nav_res.value != .none and !ip.isUndef(nav_res.value))
-            Value.fromInterned(nav_res.value).toFloat(f32, zcu)
-        else
-            0;
+        const init_value: f32 = if (nav_res.value != .none and !ip.isUndef(nav_res.value)) blk: {
+            const val: Value = .fromInterned(nav_res.value);
+            // @Cleanup handle types in one place
+            // @Todo handle all QC types
+            break :blk switch (nav_res.value) {
+                .bool_true, .bool_false => @floatFromInt(@intFromBool(val.toBool())),
+                else => val.toFloat(f32, zcu),
+            };
+        } else 0;
 
         globals.appendAssumeCapacity(init_value);
         globaldefs.appendAssumeCapacity(.{

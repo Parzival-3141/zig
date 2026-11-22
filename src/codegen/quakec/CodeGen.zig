@@ -310,6 +310,19 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) !void {
                     .args = .{ a, b, .{ .local = slot } },
                 });
             },
+            .not => {
+                const ty_op = air_data[@backingInt(inst_idx)].ty_op;
+                if (ty_op.ty.toIntern() != .bool_type) return cg.fail("bitwise not is unsupported", .{});
+
+                const src = try cg.resolveOperand(ty_op.operand);
+                if (liveness.operandDies(inst_idx, 0)) try cg.killValue(ty_op.operand);
+
+                const slot = try cg.frameAllocLiveValue(inst_idx, .float, .temp);
+                try cg.statements.append(zcu.gpa, .{
+                    .op = .not_f,
+                    .args = .{ src, .void, .{ .local = slot } },
+                });
+            },
             .bit_cast => {
                 const ty_op = air_data[@backingInt(inst_idx)].ty_op;
                 const wanted_ty = ty_op.ty;
@@ -463,7 +476,9 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) !void {
 
 fn getQCType(cg: CodeGen, ty: Type) !Mir.ValueType {
     return switch (ty.toIntern()) {
-        .f32_type => .float,
+        .f32_type,
+        .bool_type,
+        => .float,
         // @Todo handle all QC types
         else => cg.fail("unsupported quakec backend type: {f}", .{ty.fmt(cg.pt.zcu)}),
     };
@@ -493,8 +508,13 @@ fn resolveOperand(cg: *CodeGen, ref: Air.Inst.Ref) !Mir.Statement.Arg {
     }
     const zcu = cg.pt.zcu;
     const val: Value = .fromInterned(ref.toInterned().?);
+    // @Cleanup @Todo refactor type handling. Not sure how the logic should be structured yet.
     _ = try cg.getQCType(val.typeOf(zcu)); // @Todo handle all QC types
-    const gop = try cg.immediates.getOrPutValue(zcu.gpa, val.toIntern(), val.toFloat(f32, zcu));
+    const imm_value: f32 = switch (val.toIntern()) {
+        .bool_true, .bool_false => @floatFromInt(@intFromBool(val.toBool())),
+        else => val.toFloat(f32, zcu),
+    };
+    const gop = try cg.immediates.getOrPutValue(zcu.gpa, val.toIntern(), imm_value);
     return .{ .immediate = @intCast(gop.index) };
 }
 
