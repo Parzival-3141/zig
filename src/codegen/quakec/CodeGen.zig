@@ -69,12 +69,9 @@ branch_undo_stack: std.ArrayList(struct {
 branch_depth: usize = 0,
 
 /// List of value slots in the function "stack" frame.
-/// @Todo vectors are explicitly ignored for now and will require a refactor.
+/// @Incomplete vectors are explicitly ignored for now and will require a refactor.
 frame: std.ArrayList(Mir.ValueType) = .empty,
 free_frame_slots: std.ArrayList(u32) = .empty,
-
-globals: std.AutoArrayHashMapUnmanaged(InternPool.Nav.Index, void) = .empty,
-immediates: std.AutoArrayHashMapUnmanaged(InternPool.Index, f32) = .empty,
 
 statements: std.ArrayList(Mir.Statement) = .empty,
 
@@ -87,13 +84,6 @@ const ValueSlot = union(enum) {
     /// Value is a stack allocated variable and is never recycled.
     /// Index into `frame`.
     local: u32,
-    /// Value is a global variable and is never recycled.
-    /// Index into `globals`.
-    // @Note currently unused since we copy on Air.load. Remove this comment when that changes.
-    global: u32,
-
-    // Constants are not produced by AIR instructions and are directly
-    // returned by resolveOperand.
 };
 
 const Block = struct {
@@ -128,15 +118,11 @@ pub fn generate(
     var mir: Mir = .{
         .statements = &.{}, // assigned after errdefer
         .locals = &.{}, // assigned after errdefer
-        .immediates = &.{}, // assigned after errdefer
-        .globals = &.{}, // assigned after errdefer
         .num_params = function.num_params,
     };
     errdefer mir.deinit(zcu.gpa);
     mir.statements = try function.statements.toOwnedSlice(zcu.gpa);
     mir.locals = try zcu.gpa.dupe(Mir.ValueType, function.frame.items);
-    mir.immediates = try zcu.gpa.dupe(f32, function.immediates.values());
-    mir.globals = try zcu.gpa.dupe(InternPool.Nav.Index, function.globals.keys());
     return mir;
 }
 
@@ -152,8 +138,6 @@ fn deinit(cg: *CodeGen) void {
     cg.branch_undo_stack.deinit(gpa);
     cg.frame.deinit(gpa);
     cg.free_frame_slots.deinit(gpa);
-    cg.immediates.deinit(gpa);
-    cg.globals.deinit(gpa);
     cg.* = undefined;
 }
 
@@ -256,7 +240,6 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) !void {
                 // Free dying operands before allocating the result so chained
                 // ops (a*b*c) reuse the dying slot. Safe since the VM reads a/b
                 // before writing c, so c == a or c == b is fine.
-                // @Todo check that assumption holds on popular quake source ports
                 if (liveness.operandDies(inst_idx, 0)) try cg.killValue(bin_op.lhs);
                 if (liveness.operandDies(inst_idx, 1)) try cg.killValue(bin_op.rhs);
 
@@ -279,9 +262,8 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) !void {
                 const value_idx = try ip.get(zcu.gpa, zcu.comp.io, pt.tid, .{
                     .float = .{ .ty = .f32_type, .storage = .{ .f32 = -1.0 } },
                 });
-                const gop = try cg.immediates.getOrPutValue(zcu.gpa, value_idx, -1.0);
 
-                const a: Mir.Statement.Arg = .{ .immediate = @intCast(gop.index) };
+                const a: Mir.Statement.Arg = .{ .immediate = .fromInterned(value_idx) };
                 const b = try cg.resolveOperand(un_op);
                 if (liveness.operandDies(inst_idx, 0)) try cg.killValue(un_op);
 
@@ -500,9 +482,7 @@ fn resolveOperand(cg: *CodeGen, ref: Air.Inst.Ref) !Mir.Statement.Arg {
     const zcu = cg.pt.zcu;
     const val: Value = .fromInterned(ref.toInterned().?);
     _ = try cg.getQCType(val.typeOf(zcu)); // @Todo handle all QC types
-    const imm_value = qc_types.floatFromValue(val, &zcu.intern_pool);
-    const gop = try cg.immediates.getOrPutValue(zcu.gpa, val.toIntern(), imm_value);
-    return .{ .immediate = @intCast(gop.index) };
+    return .{ .immediate = val };
 }
 
 /// Resolves an AIR pointer operand to a MIR statement argument.
@@ -516,7 +496,6 @@ fn resolvePtrOperand(cg: *CodeGen, ref: Air.Inst.Ref) !Mir.Statement.Arg {
             );
         return switch (in_flight) {
             .temp, .local => |slot| .{ .local = slot },
-            else => cg.fail("@Todo pointer operand does not point to a local", .{}),
         };
     }
     const zcu = cg.pt.zcu;
@@ -526,15 +505,13 @@ fn resolvePtrOperand(cg: *CodeGen, ref: Air.Inst.Ref) !Mir.Statement.Arg {
     const nav_idx = Value.pointerNav(ptr_val, zcu) orelse
         return cg.fail("@Todo pointer operand does not point to a global", .{});
     _ = try cg.getQCType(.fromInterned(ip.getNav(nav_idx).resolved.?.type)); // @Todo handle all QC types
-    const gop = try cg.globals.getOrPut(zcu.gpa, nav_idx);
-    return .{ .global = @intCast(gop.index) };
+    return .{ .global = nav_idx };
 }
 
 fn toStmtArg(in_flight: ValueSlot) Mir.Statement.Arg {
     return switch (in_flight) {
         .temp => |slot| .{ .local = slot },
         .local => |slot| .{ .local = slot },
-        .global => |slot| .{ .global = slot },
     };
 }
 
@@ -553,14 +530,13 @@ fn killValue(cg: *CodeGen, operand: Air.Inst.Ref) !void {
             .slot = entry.value,
             .slot_kind = switch (entry.value) {
                 .temp, .local => |slot| cg.frame.items[slot],
-                .global => @panic("@Incomplete"),
             },
             .action = .killed,
         });
     }
     switch (entry.value) {
         .temp => |slot| try cg.free_frame_slots.append(cg.pt.zcu.gpa, slot),
-        .local, .global => {},
+        .local => {},
     }
 }
 
@@ -600,7 +576,7 @@ fn restoreLiveValues(cg: *CodeGen, undo_start: usize) !void {
                     assert(cg.frame.items[slot] == entry.slot_kind);
                     try cg.free_frame_slots.append(cg.pt.zcu.gpa, slot);
                 },
-                .local, .global => {}, // these slots are permanently allocated
+                .local => {}, // these slots are permanently allocated
             },
             .killed => {
                 try cg.live_values.putNoClobber(cg.pt.zcu.gpa, entry.inst, entry.slot);
@@ -614,7 +590,7 @@ fn restoreLiveValues(cg: *CodeGen, undo_start: usize) !void {
                             }
                         } else unreachable;
                     },
-                    .local, .global => {}, // these slots are permanently allocated
+                    .local => {}, // these slots are permanently allocated
                 }
             },
         }
@@ -625,7 +601,7 @@ const FrameAllocMode = enum { local, temp };
 /// Returns a frame slot for a value to live in.
 /// If in temp mode: allocates or reuses a recyclable slot for an intermediate value.
 /// If in local mode: allocates a permanent slot for a variable, doesn't reuse slots.
-/// @Todo vectors are explicitly ignored for now and will require a refactor.
+/// @Incomplete vectors are explicitly ignored for now and will require a refactor.
 fn frameAlloc(cg: *CodeGen, ty: Mir.ValueType, mode: FrameAllocMode) !u32 {
     assert(ty != .vector);
     if (mode == .temp) {

@@ -89,11 +89,31 @@ const dev = @import("../dev.zig");
 const link = @import("../link.zig");
 const trace = @import("../tracy.zig").trace;
 const qc_types = @import("../codegen/quakec/types.zig");
+const qcvm = @import("qcvm");
 
 base: link.File,
-func_mir: ?Mir,
-file_name: ?[]const u8,
-func_name: ?[]const u8,
+
+// @Todo use MultiArrayList
+/// All MIR statements packed into one list. Indexed by `funcs`.
+statements: std.ArrayList(Mir.Statement) = .empty,
+/// All MIR locals packed into one list. Indexed by `funcs`.
+/// @Incomplete vectors are explicitly ignored for now and will require a refactor.
+locals: std.ArrayList(Mir.ValueType) = .empty,
+
+funcs: std.array_hash_map.Auto(InternPool.Index, Function) = .empty,
+// Deduplicated set of all globals/immediates used in the binary.
+globals: std.array_hash_map.Auto(InternPool.Nav.Index, void) = .empty,
+immediates: std.array_hash_map.Auto(Value, void) = .empty,
+
+const Function = struct {
+    num_params: u8,
+
+    statements_off: u32,
+    statements_len: u32,
+
+    locals_off: u32,
+    locals_len: u32,
+};
 
 /// Attempts incremental linking, if the file already exists. If
 /// incremental linking fails, falls back to truncating the file and
@@ -139,23 +159,10 @@ pub fn createEmpty(
             .file = file,
             .gc_sections = options.gc_sections orelse true,
             .print_gc_sections = options.print_gc_sections,
-            .stack_size = options.stack_size orelse 16777216,
+            .stack_size = options.stack_size orelse 0, // stack lives in the QCVM, we have no control over it
             .allow_shlib_undefined = options.allow_shlib_undefined orelse false,
             .build_id = options.build_id,
         },
-        .func_mir = null,
-        .func_name = null,
-        .file_name = null,
-        // .navs = .empty,
-        // .string_bytes = .empty,
-        // .uavs = .empty,
-        // .aligned_uavs = .empty,
-        // .exported_navs = .empty,
-        // .exported_uavs = .empty,
-        // .fwd_decl_buf = &.{},
-        // .code_header_buf = &.{},
-        // .code_buf = &.{},
-        // .scratch_buf = &.{},
     };
     errdefer qc_file.base.destroy();
 
@@ -163,11 +170,12 @@ pub fn createEmpty(
 }
 
 pub fn deinit(self: *QuakeC) void {
-    // @Temporary free the mir we took ownership of in updateFunc()
-    if (self.func_mir) |*mir| mir.deinit(self.base.comp.zcu.?.gpa);
     const gpa = self.base.comp.gpa;
-    if (self.file_name) |name| gpa.free(name);
-    if (self.func_name) |name| gpa.free(name);
+    self.statements.deinit(gpa);
+    self.locals.deinit(gpa);
+    self.funcs.deinit(gpa);
+    self.globals.deinit(gpa);
+    self.immediates.deinit(gpa);
 }
 
 pub fn updateFunc(
@@ -185,24 +193,48 @@ pub fn updateFunc(
     const ip = &zcu.intern_pool;
     const owner_nav = zcu.funcInfo(func_index).owner_nav;
 
-    // Is there not just a single function to get the SourceLocation strings?
-    const func_src_loc = zcu.navSrcLoc(owner_nav).upgrade(zcu);
-    self.file_name = try gpa.dupe(u8, std.fs.path.basename(func_src_loc.file_scope.sub_file_path));
-    self.func_name = try gpa.dupe(u8, std.fs.path.extension(ip.getNav(owner_nav).fqn.toSlice(ip))[1..]); // @Cleanup hacky
-
     log.debug("updateFunc {f}", .{ip.getNav(owner_nav).fqn.fmt(ip)});
 
-    // @Temporary just save the mir for now and assemble the dat file in flush
-    self.func_mir = mir.*;
-    mir.* = .{
-        // we're taking ownership of the MIR; others still need to call mir.deinit,
-        // so reset the struct to make that work.
-        .num_params = 0,
-        .immediates = &.{},
-        .locals = &.{},
-        .statements = &.{},
-        .globals = &.{},
-    };
+    try self.funcs.ensureUnusedCapacity(gpa, 1);
+    try self.statements.ensureUnusedCapacity(gpa, mir.statements.len);
+    try self.locals.ensureUnusedCapacity(gpa, mir.locals.len);
+
+    // Which globals/immediates are used is stored in the statement arguments directly as InternPool indices.
+    // Unpack them here so we can track them for allocation in the linked binary.
+    var globals_len: usize = 0;
+    var immediates_len: usize = 0;
+    for (mir.statements) |stmt| {
+        for (stmt.args) |arg| switch (arg) {
+            .immediate => immediates_len += 1,
+            .global => globals_len += 1,
+            else => {},
+        };
+    }
+    try self.globals.ensureUnusedCapacity(gpa, globals_len);
+    try self.immediates.ensureUnusedCapacity(gpa, immediates_len);
+
+    for (mir.statements) |stmt| {
+        for (stmt.args) |arg| switch (arg) {
+            .immediate => |imm| self.immediates.putAssumeCapacity(imm, {}),
+            .global => |global| self.globals.putAssumeCapacity(global, {}),
+            else => {},
+        };
+    }
+
+    const stmts_offset = self.statements.items.len;
+    const locals_offset = self.locals.items.len;
+    self.statements.appendSliceAssumeCapacity(mir.statements);
+    self.locals.appendSliceAssumeCapacity(mir.locals);
+
+    // @Todo When a function is modified during incremental compilation we will leak the original's
+    // statements/locals. Assert we're the first for now, fix this when supporting incremental compilation.
+    self.funcs.putAssumeCapacityNoClobber(func_index, .{
+        .num_params = mir.num_params,
+        .statements_off = @intCast(stmts_offset),
+        .statements_len = @intCast(self.statements.items.len - stmts_offset),
+        .locals_off = @intCast(locals_offset),
+        .locals_len = @intCast(self.locals.items.len - locals_offset),
+    });
 }
 
 pub fn updateNav(
@@ -320,43 +352,43 @@ pub fn flush(
 fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
     const zcu = self.base.comp.zcu.?;
     const ip = &zcu.intern_pool;
-    const mir = self.func_mir.?;
     const io = self.base.comp.io;
 
-    assert(mir.num_params == 0); // @Todo @Cleanup handle parameter allocation later
-    const num_globals = mir.immediates.len + mir.locals.len + mir.globals.len;
+    const num_globals = self.immediates.count() + self.locals.items.len + self.globals.count();
 
-    // add 1 to these to account for their sentinel value
-    var statements: std.ArrayList(Statement) = try .initCapacity(arena, 1 + mir.statements.len);
-    var functions: std.ArrayList(Function) = try .initCapacity(arena, 1 + 1); // only 1 function for now
-    var globaldefs: std.ArrayList(Def) = try .initCapacity(arena, 1 + num_globals);
-    var fielddefs: std.ArrayList(Def) = try .initCapacity(arena, 1);
+    // add 1 to these to account for their null value
+    var statements: std.ArrayList(qcvm.Statement) = try .initCapacity(arena, 1 + self.statements.items.len);
+    var functions: std.ArrayList(qcvm.Function) = try .initCapacity(arena, 1 + self.funcs.count());
+    var globaldefs: std.ArrayList(qcvm.Def) = try .initCapacity(arena, 1 + num_globals);
+    var fielddefs: std.ArrayList(qcvm.Def) = try .initCapacity(arena, 1); // @Todo
     var strings: std.ArrayList(u8) = try .initCapacity(arena, 1); // @Todo use StringTable instead?
-    var globals: std.ArrayList(f32) = try .initCapacity(arena, SpecialRegisterOffset.reserved_len + num_globals);
-    globals.appendNTimesAssumeCapacity(0, SpecialRegisterOffset.reserved_len);
+    var globals: std.ArrayList(f32) = try .initCapacity(arena, qcvm.SpecialRegisterOffset.reserved_len + num_globals);
 
-    // append sentinels
-    statements.appendAssumeCapacity(std.mem.zeroes(Statement));
-    functions.appendAssumeCapacity(std.mem.zeroes(Function));
-    globaldefs.appendAssumeCapacity(std.mem.zeroes(Def));
-    fielddefs.appendAssumeCapacity(std.mem.zeroes(Def));
+    // append null values
+    globals.appendNTimesAssumeCapacity(0, qcvm.SpecialRegisterOffset.reserved_len);
+    statements.appendAssumeCapacity(std.mem.zeroes(qcvm.Statement));
+    functions.appendAssumeCapacity(std.mem.zeroes(qcvm.Function));
+    globaldefs.appendAssumeCapacity(std.mem.zeroes(qcvm.Def));
+    fielddefs.appendAssumeCapacity(std.mem.zeroes(qcvm.Def));
     strings.appendAssumeCapacity(0);
 
     var immediate_string_idx: ?u32 = null;
 
     // allocate global registers
     const GlobalKey = union(enum) {
-        immediate: u32,
+        immediate: Value,
+        /// the absolute index of the local in `self.locals`
         local: u32,
-        global: u32,
+        global: InternPool.Nav.Index,
     };
     var allocated_globals: std.AutoHashMapUnmanaged(GlobalKey, u32) = .empty;
     try allocated_globals.ensureUnusedCapacity(arena, @intCast(num_globals));
 
-    for (mir.immediates, 0..) |imm, index| {
+    for (self.immediates.keys()) |imm| {
+        assert(qc_types.storageType(imm.typeOf(zcu)).? == .float);
         const offset: u32 = @intCast(globals.items.len);
-        globals.appendAssumeCapacity(imm);
 
+        globals.appendAssumeCapacity(qc_types.floatFromValue(imm, ip));
         globaldefs.appendAssumeCapacity(.{
             .type = .{ .tag = .float, .save_global = false },
             .offset = @intCast(offset),
@@ -366,13 +398,13 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
                 break :idx immediate_string_idx.?;
             },
         });
-        allocated_globals.putAssumeCapacityNoClobber(.{ .immediate = @intCast(index) }, offset);
+        allocated_globals.putAssumeCapacityNoClobber(.{ .immediate = imm }, offset);
     }
-    for (mir.locals, 0..) |local, index| {
+    for (self.locals.items, 0..) |local, index| {
         const offset: u32 = @intCast(globals.items.len);
         assert(local == .float); // @Todo handle all QC types
         globals.appendAssumeCapacity(0);
-        // @Todo don't add defs for temp variables
+        // @Todo don't add defs for temp variables (or maybe keep the LOCAL.X notation?)
         globaldefs.appendAssumeCapacity(.{
             .type = .{ .tag = .float, .save_global = false },
             .offset = @intCast(offset),
@@ -385,7 +417,7 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
         });
         allocated_globals.putAssumeCapacityNoClobber(.{ .local = @intCast(index) }, offset);
     }
-    for (mir.globals, 0..) |nav_idx, index| {
+    for (self.globals.keys()) |nav_idx| {
         const offset: u32 = @intCast(globals.items.len); // not to be confused with mir.globals!
 
         const nav = ip.getNav(nav_idx);
@@ -414,57 +446,71 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
                 break :idx str_idx;
             },
         });
-        allocated_globals.putAssumeCapacityNoClobber(.{ .global = @intCast(index) }, offset);
+        allocated_globals.putAssumeCapacityNoClobber(.{ .global = nav_idx }, offset);
     }
 
-    const first_statement: u31 = @intCast(statements.items.len);
+    // @Todo function emit order is technically dependant on Zig's analysis order. Make it deterministic.
+    var it = self.funcs.iterator();
+    while (it.next()) |kvp| {
+        const func_idx = kvp.key_ptr.*;
+        const func_data = kvp.value_ptr;
 
-    // link statements
-    for (mir.statements, 0..) |stmt, i| {
-        var result: Statement = .{ .op = stmt.op, .args = undefined };
-        for (stmt.args, &result.args) |mir_arg, *res_arg| {
-            switch (mir_arg) {
-                .void => res_arg.* = 0,
-                // @Todo handle int out-of-range errors
-                .jump_to_stmt => |index| res_arg.* = @intCast(@as(i64, index) - @as(i64, @intCast(i))),
-                // lookup allocated global offset
-                .local => |index| res_arg.* = @intCast(allocated_globals.get(.{ .local = index }).?),
-                .immediate => |index| res_arg.* = @intCast(allocated_globals.get(.{ .immediate = index }).?),
-                .global => |index| res_arg.* = @intCast(allocated_globals.get(.{ .global = index }).?),
+        const my_stmts = self.statements.items[func_data.statements_off..][0..func_data.statements_len];
+        const my_locals = self.locals.items[func_data.locals_off..][0..func_data.locals_len];
+
+        const first_statement: u31 = @intCast(statements.items.len);
+
+        // link statements
+        for (my_stmts, 0..) |stmt, i| {
+            var result: qcvm.Statement = .{ .op = stmt.op, .args = undefined };
+            for (stmt.args, &result.args) |mir_arg, *res_arg| {
+                switch (mir_arg) {
+                    .void => res_arg.* = 0,
+                    // @Todo handle int out-of-range errors
+                    .jump_to_stmt => |index| res_arg.* = @intCast(@as(i64, index) - @as(i64, @intCast(i))), // index & i are function local, no need to apply offsets
+                    // lookup allocated global offset
+                    .local => |index| res_arg.* = @intCast(allocated_globals.get(.{ .local = func_data.locals_off + index }).?),
+                    .immediate => |imm| res_arg.* = @intCast(allocated_globals.get(.{ .immediate = imm }).?),
+                    .global => |global| res_arg.* = @intCast(allocated_globals.get(.{ .global = global }).?),
+                }
             }
+            statements.appendAssumeCapacity(result);
         }
-        statements.appendAssumeCapacity(result);
-    }
 
-    // @Todo handle multiple functions
-    functions.appendAssumeCapacity(.{
-        .first_statement = first_statement,
-        .frame_start = if (mir.locals.len > 0) allocated_globals.get(.{ .local = 0 }).? else 0,
-        .frame_size = @intCast(mir.locals.len), // @Todo handle parameters
-        .profile = 0,
-        .s_name = idx: {
-            const str_idx: u32 = @intCast(strings.items.len);
-            try strings.ensureUnusedCapacity(arena, self.func_name.?.len + 1);
-            strings.appendSliceAssumeCapacity(self.func_name.?);
-            strings.appendAssumeCapacity(0);
-            break :idx str_idx;
-        },
-        .s_file = idx: {
-            const str_idx: u32 = @intCast(strings.items.len);
-            try strings.ensureUnusedCapacity(arena, self.file_name.?.len + 1);
-            strings.appendSliceAssumeCapacity(self.file_name.?);
-            strings.appendAssumeCapacity(0);
-            break :idx str_idx;
-        },
-        .num_params = mir.num_params,
-        .param_size = @splat(0), // @Todo handle parameters
-    });
+        const owner_nav = zcu.funcInfo(func_idx).owner_nav;
+        const file_name = std.fs.path.basename(zcu.navFileScope(owner_nav).sub_file_path);
+        const func_name = ip.getNav(owner_nav).name.toSlice(ip);
+
+        assert(func_data.num_params == 0); // @Incomplete @Cleanup handle parameter allocation
+        functions.appendAssumeCapacity(.{
+            .first_statement = first_statement,
+            .frame_start = if (my_locals.len > 0) allocated_globals.get(.{ .local = func_data.locals_off }).? else 0,
+            .frame_size = @intCast(my_locals.len), // @Incomplete handle parameters
+            .profile = 0,
+            .s_name = idx: {
+                const str_idx: u32 = @intCast(strings.items.len);
+                try strings.ensureUnusedCapacity(arena, func_name.len + 1);
+                strings.appendSliceAssumeCapacity(func_name);
+                strings.appendAssumeCapacity(0);
+                break :idx str_idx;
+            },
+            .s_file = idx: {
+                const str_idx: u32 = @intCast(strings.items.len);
+                try strings.ensureUnusedCapacity(arena, file_name.len + 1);
+                strings.appendSliceAssumeCapacity(file_name);
+                strings.appendAssumeCapacity(0);
+                break :idx str_idx;
+            },
+            .num_params = func_data.num_params,
+            .param_size = @splat(0), // @Incomplete handle parameters
+        });
+    }
 
     if (strings.getLast() != 0) try strings.append(arena, 0); // @Cleanup do this when writing to file instead?
 
     // Write object to file
-    var header: Header = .{
-        .version = PROG_VERSION,
+    var header: qcvm.Header = .{
+        .version = qcvm.PROG_VERSION,
         .crc = 0, // we don't generate a progdefs C header, so there's nothing to generate a checksum for
         .num_statements = @intCast(statements.items.len),
         .num_globaldefs = @intCast(globaldefs.items.len),
@@ -472,7 +518,7 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
         .num_functions = @intCast(functions.items.len),
         .size_strings = @intCast(strings.items.len),
         .num_globals = @intCast(globals.items.len),
-        .entityfields = 0, // @Todo
+        .entityfields = 0, // @Incomplete
 
         // these will be filled as their contents are written to the file
         .ofs_statements = undefined,
@@ -485,27 +531,27 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
 
     comptime {
         // ensure that all sections will align properly when written back-to-back
-        assert(std.mem.isAligned(@sizeOf(Header), @alignOf(Statement)));
-        assert(std.mem.isAligned(@sizeOf(Statement), @alignOf(Def)));
-        assert(std.mem.isAligned(@sizeOf(Def), @alignOf(Function)));
-        assert(std.mem.isAligned(@sizeOf(Function), @alignOf(f32)));
+        assert(std.mem.isAligned(@sizeOf(qcvm.Header), @alignOf(qcvm.Statement)));
+        assert(std.mem.isAligned(@sizeOf(qcvm.Statement), @alignOf(qcvm.Def)));
+        assert(std.mem.isAligned(@sizeOf(qcvm.Def), @alignOf(qcvm.Function)));
+        assert(std.mem.isAligned(@sizeOf(qcvm.Function), @alignOf(f32)));
     }
 
     var buf: [64]u8 = undefined;
     var file = self.base.file.?.writer(io, &buf);
-    try file.seekTo(@sizeOf(Header)); // skip incomplete header
+    try file.seekTo(@sizeOf(qcvm.Header)); // skip incomplete header
 
     header.ofs_statements = @intCast(file.pos + file.interface.end);
-    try file.interface.writeSliceEndian(Statement, statements.items, .little);
+    try file.interface.writeSliceEndian(qcvm.Statement, statements.items, .little);
 
     header.ofs_globaldefs = @intCast(file.pos + file.interface.end);
-    try file.interface.writeSliceEndian(Def, globaldefs.items, .little);
+    try file.interface.writeSliceEndian(qcvm.Def, globaldefs.items, .little);
 
     header.ofs_fielddefs = @intCast(file.pos + file.interface.end);
-    try file.interface.writeSliceEndian(Def, fielddefs.items, .little);
+    try file.interface.writeSliceEndian(qcvm.Def, fielddefs.items, .little);
 
     header.ofs_functions = @intCast(file.pos + file.interface.end);
-    try file.interface.writeSliceEndian(Function, functions.items, .little);
+    try file.interface.writeSliceEndian(qcvm.Function, functions.items, .little);
 
     header.ofs_globals = @intCast(file.pos + file.interface.end);
     try file.interface.writeSliceEndian(u32, @ptrCast(globals.items), .little);
@@ -521,91 +567,3 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
     try file.interface.writeStruct(header, .little);
     try file.interface.flush();
 }
-
-const Header = extern struct {
-    version: u32,
-    /// checksum of progsdefs header file
-    crc: u32,
-
-    ofs_statements: u32,
-    /// statement 0 is an error
-    num_statements: u32,
-
-    ofs_globaldefs: u32,
-    num_globaldefs: u32,
-
-    ofs_fielddefs: u32,
-    num_fielddefs: u32,
-
-    ofs_functions: u32,
-    /// function 0 is an empty
-    num_functions: u32,
-
-    ofs_strings: u32,
-    /// first string is a null string
-    size_strings: u32,
-
-    ofs_globals: u32,
-    num_globals: u32,
-
-    entityfields: u32,
-};
-
-pub const Statement = extern struct {
-    op: Mir.Opcode,
-    args: [3]i16,
-};
-
-pub const Def = extern struct {
-    type: packed struct(u16) {
-        tag: Mir.ValueType,
-        /// if DEF_SAVEGLOBGAL bit is set the variable needs
-        /// to be saved in savegames.
-        save_global: bool,
-    },
-    offset: u16,
-    s_name: u32,
-};
-
-pub const Function = extern struct {
-    /// A negative value is a builtin index and marks this function as a builtin.
-    first_statement: i32,
-    // parm_start
-    /// Offset of the function frame (parameters + local variables) in Vm.globals.
-    frame_start: u32,
-    // locals
-    frame_size: u32,
-
-    /// runtime
-    profile: u32,
-
-    s_name: u32,
-    /// source file defined in
-    s_file: u32,
-
-    num_params: u32,
-    param_size: [MAX_PARAMETERS]u8,
-
-    pub const MAX_PARAMETERS = 8;
-};
-
-pub const PROG_VERSION = 6;
-
-/// Offsets of special purpose registers in globals
-pub const SpecialRegisterOffset = enum(u16) {
-    null = 0,
-    /// Padded to 3 words to hold vectors
-    @"return" = 1,
-    // parm0-7
-    /// Function arguments, filled by caller.
-    /// Each argument is padded to 3 words to hold vectors.
-    arg0 = 4,
-    arg1 = 7,
-    arg2 = 10,
-    arg3 = 13,
-    arg4 = 16,
-    arg5 = 19,
-    arg6 = 22,
-    arg7 = 25,
-    pub const reserved_len = 28;
-};

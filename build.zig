@@ -431,6 +431,11 @@ pub fn build(b: *std.Build) !void {
         exe.root_module.addImport("tracy", tracy_mod);
     }
 
+    const qcvm_mod = b.createModule(.{
+        .root_source_file = b.path("lib/compiler/qcvm/qcvm.zig"),
+    });
+    exe.root_module.addImport("qcvm", qcvm_mod);
+
     const test_filters = b.option([]const []const u8, "test-filter", "Skip tests that do not match any filter") orelse &[0][]const u8{};
     const test_target_filters = b.option([]const []const u8, "test-target-filter", "Skip tests whose target triple do not match any filter") orelse &[0][]const u8{};
     const test_extra_targets = b.option(bool, "test-extra-targets", "Enable running module tests for additional targets") orelse false;
