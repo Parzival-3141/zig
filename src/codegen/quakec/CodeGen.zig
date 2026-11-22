@@ -4,6 +4,7 @@
 const std = @import("std");
 const link = @import("../../link.zig");
 const codegen = @import("../../codegen.zig");
+const qc_types = @import("types.zig");
 
 const log = std.log.scoped(.codegen);
 const assert = std.debug.assert;
@@ -475,20 +476,10 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) !void {
 }
 
 fn getQCType(cg: CodeGen, ty: Type) !Mir.ValueType {
-    return switch (ty.toIntern()) {
-        .f32_type,
-        .bool_type,
-        => .float,
-        // @Todo handle all QC types
-        else => cg.fail("unsupported quakec backend type: {f}", .{ty.fmt(cg.pt.zcu)}),
-    };
-}
-
-fn isValidQCType(ty: Type) bool {
-    return switch (ty.toIntern()) {
-        .f32_type => true,
-        else => false,
-    };
+    return qc_types.storageType(ty) orelse cg.fail(
+        "unsupported quakec backend type: {f}",
+        .{ty.fmt(cg.pt.zcu)},
+    );
 }
 
 fn fail(cg: CodeGen, comptime fmt: []const u8, args: anytype) Zcu.CodegenFailError {
@@ -508,12 +499,8 @@ fn resolveOperand(cg: *CodeGen, ref: Air.Inst.Ref) !Mir.Statement.Arg {
     }
     const zcu = cg.pt.zcu;
     const val: Value = .fromInterned(ref.toInterned().?);
-    // @Cleanup @Todo refactor type handling. Not sure how the logic should be structured yet.
     _ = try cg.getQCType(val.typeOf(zcu)); // @Todo handle all QC types
-    const imm_value: f32 = switch (val.toIntern()) {
-        .bool_true, .bool_false => @floatFromInt(@intFromBool(val.toBool())),
-        else => val.toFloat(f32, zcu),
-    };
+    const imm_value = qc_types.floatFromValue(val, &zcu.intern_pool);
     const gop = try cg.immediates.getOrPutValue(zcu.gpa, val.toIntern(), imm_value);
     return .{ .immediate = @intCast(gop.index) };
 }

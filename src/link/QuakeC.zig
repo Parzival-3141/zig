@@ -88,6 +88,7 @@ const codegen = @import("../codegen.zig");
 const dev = @import("../dev.zig");
 const link = @import("../link.zig");
 const trace = @import("../tracy.zig").trace;
+const qc_types = @import("../codegen/quakec/types.zig");
 
 base: link.File,
 func_mir: ?Mir,
@@ -391,18 +392,14 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
         const nav_res = nav.resolved.?;
 
         // for now nav must be a non-extern variable
+        assert(qc_types.storageType(.fromInterned(nav_res.type)).? == .float);
         assert(nav.getExtern(ip) == null);
         assert(!nav_res.@"const");
 
-        const init_value: f32 = if (nav_res.value != .none and !ip.isUndef(nav_res.value)) blk: {
-            const val: Value = .fromInterned(nav_res.value);
-            // @Cleanup handle types in one place
-            // @Todo handle all QC types
-            break :blk switch (nav_res.value) {
-                .bool_true, .bool_false => @floatFromInt(@intFromBool(val.toBool())),
-                else => val.toFloat(f32, zcu),
-            };
-        } else 0;
+        const init_value: f32 = if (nav_res.value != .none and !ip.isUndef(nav_res.value))
+            qc_types.floatFromValue(.fromInterned(nav_res.value), ip)
+        else
+            0;
 
         globals.appendAssumeCapacity(init_value);
         globaldefs.appendAssumeCapacity(.{
@@ -428,7 +425,8 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
         for (stmt.args, &result.args) |mir_arg, *res_arg| {
             switch (mir_arg) {
                 .void => res_arg.* = 0,
-                .jump_to_stmt => |index| res_arg.* = @intCast(@as(i64, index) - @as(i64, @intCast(i))), // @Todo handle int out-of-range error
+                // @Todo handle int out-of-range errors
+                .jump_to_stmt => |index| res_arg.* = @intCast(@as(i64, index) - @as(i64, @intCast(i))),
                 // lookup allocated global offset
                 .local => |index| res_arg.* = @intCast(allocated_globals.get(.{ .local = index }).?),
                 .immediate => |index| res_arg.* = @intCast(allocated_globals.get(.{ .immediate = index }).?),
