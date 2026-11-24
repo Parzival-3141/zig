@@ -5,6 +5,7 @@ const std = @import("std");
 const link = @import("../../link.zig");
 const codegen = @import("../../codegen.zig");
 const qc_types = @import("types.zig");
+const qcvm = @import("qcvm");
 
 const log = std.log.scoped(.codegen);
 const assert = std.debug.assert;
@@ -44,6 +45,9 @@ func_index: InternPool.Index,
 air: *const Air,
 liveness: Air.Liveness,
 
+/// Locals are allocated for each parameter. These MUST be the first `num_params` locals emitted in the frame.
+// @Todo we could spill extra arguments into dedicated globals and manually generate stmts to copy/access them
+// in the function body.
 num_params: u8 = 0,
 
 // The plan here is to allocate stack-frame, global, or constant slots when they are accessed by an AIR instruction.
@@ -160,6 +164,18 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) !void {
 
         switch (air_tags[@backingInt(inst_idx)]) {
             else => |air_tag| return cg.fail("unimplemented air: {f} {t}", .{ inst_idx, air_tag }),
+            .arg => {
+                const arg = air_data[@backingInt(inst_idx)].arg;
+
+                if (cg.num_params >= qcvm.Function.MAX_PARAMETERS) return cg.fail(
+                    "exceeded maximum number of function parameters (max {d})",
+                    .{qcvm.Function.MAX_PARAMETERS},
+                );
+
+                const slot = try cg.frameAllocLiveValue(inst_idx, try cg.getQCType(arg.ty), .local);
+                assert(slot == cg.num_params); // args must be the first frame slots allocated
+                cg.num_params += 1;
+            },
             .alloc => {
                 const ty = air_data[@backingInt(inst_idx)].ty;
                 const qc_ty = try cg.getQCType(ty.childType(pt.zcu));
@@ -347,8 +363,8 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) !void {
                 // I like the second option, but until then this is illegal behavior.
                 return cg.fail("integers are not implemented yet: {f} {t}", .{ inst_idx, Air.Inst.Tag.float_from_int });
             },
-            .block => {
-                const block = air.unwrapBlock(inst_idx);
+            inline .block, .dbg_inline_block => |op| {
+                const block = if (comptime op == .block) air.unwrapBlock(inst_idx) else air.unwrapDbgBlock(inst_idx);
 
                 // The block may have a return value, which is filled by .br instructions in the body
                 const block_result_slot: ?u32 = if (!liveness.isUnused(inst_idx) and block.ty.hasRuntimeBits(zcu))
@@ -443,22 +459,107 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) !void {
                 // so we need to discard those undos too.
                 cg.branch_undo_stack.shrinkRetainingCapacity(undo_start);
             },
+            .call_always_tail => return cg.fail("tail calls are unsupported", .{}),
+            .call, .call_never_inline, .call_never_tail => {
+                const call = air.unwrapCall(inst_idx);
+
+                const operand = try cg.resolveOperand(call.callee);
+                if (liveness.operandDies(inst_idx, 0)) try cg.killValue(call.callee);
+
+                // @Cleanup prefer one way to get the necessary function info
+                const func_idx: InternPool.Nav.Index = switch (operand) {
+                    .immediate => |val| switch (ip.indexToKey(val.toIntern())) {
+                        inline .func, .@"extern" => |key| key.owner_nav,
+                        .ptr => |ptr| if (ptr.byte_offset == 0)
+                            ptr.base_addr.nav
+                        else
+                            return cg.fail("unable to lower callee to function index", .{}),
+                        else => unreachable,
+                    },
+                    // a function pointer is really just a u24 index (not backed by f32!)
+                    // into the progs.dat function table.
+                    else => return cg.fail("@Incomplete function pointers", .{}),
+                };
+
+                const callee_ty = air.typeOf(call.callee, ip);
+                const fn_ty = switch (callee_ty.zigTypeTag(zcu)) {
+                    .@"fn" => callee_ty,
+                    .pointer => callee_ty.childType(zcu),
+                    else => unreachable,
+                };
+                const return_ty = fn_ty.fnReturnType(zcu);
+                const result_slot: ?u32 = if (!liveness.isUnused(inst_idx) and return_ty.hasRuntimeBits(zcu))
+                    try cg.frameAllocLiveValue(inst_idx, try cg.getQCType(return_ty), .temp)
+                else
+                    null;
+
+                // ignore non-runtime args
+                var runtime_args: std.ArrayList(Air.Inst.Ref) = try .initCapacity(zcu.gpa, call.args.len);
+                defer runtime_args.deinit(zcu.gpa);
+                for (call.args) |arg| {
+                    if (air.typeOf(arg, ip).hasRuntimeBits(zcu)) runtime_args.appendAssumeCapacity(arg);
+                }
+
+                const num_args: u16 = @intCast(runtime_args.items.len);
+                if (num_args > qcvm.Function.MAX_PARAMETERS) return cg.fail(
+                    "unable to lower function call, too many arguments (max {d}, found {d})",
+                    .{ qcvm.Function.MAX_PARAMETERS, num_args },
+                );
+                try cg.statements.ensureUnusedCapacity(zcu.gpa, num_args + 2);
+
+                // store args in special registers
+                for (runtime_args.items, 0..) |arg_ref, _arg_idx| {
+                    const arg_idx: u8 = @intCast(_arg_idx);
+
+                    const src = try cg.resolveOperand(arg_ref);
+                    assert(qc_types.storageSize(qc_types.storageType(air.typeOf(arg_ref, ip), ip).?) == 1); // @Todo handle all QC types
+                    const dest: qcvm.SpecialRegisterOffset = @fromBackingInt(
+                        @backingInt(qcvm.SpecialRegisterOffset.arg0) + arg_idx * 3,
+                    );
+
+                    cg.statements.appendAssumeCapacity(.{
+                        .op = .store_f,
+                        .args = .{ src, .{ .special = dest }, .void },
+                    });
+                }
+
+                // if the function is comptime known, pass its Nav
+                // @Incomplete if it's a function pointer, just pass the register
+                cg.statements.appendAssumeCapacity(.{
+                    .op = @fromBackingInt(@backingInt(Mir.Opcode.call0) + num_args),
+                    .args = .{ .{ .func = func_idx }, .void, .void },
+                });
+
+                // store the return value in the function's frame
+                if (result_slot) |slot| {
+                    cg.statements.appendAssumeCapacity(.{
+                        .op = .store_f,
+                        .args = .{ .{ .special = .@"return" }, .{ .local = slot }, .void },
+                    });
+                }
+            },
             .ret, .ret_safe => {
                 const un_op = air_data[@backingInt(inst_idx)].un_op;
-                if (un_op != .void_value) return cg.fail("@Todo handle return values", .{});
-                // Void functions end with `done`, matching qcc: a bare
-                // `return` copies 3 words from args[0] to OFS_RETURN, which is
-                // meaningless for void functions (and overlaps OFS_RETURN when
-                // args[0] is OFS_NULL).
-                try cg.statements.append(zcu.gpa, .{ .op = .done });
-                // No need to kill the operand value because the function is over
+                const ty = air.typeOf(un_op, ip);
+
+                if (!ty.hasRuntimeBits(zcu)) {
+                    try cg.statements.append(zcu.gpa, .{ .op = .done });
+                } else {
+                    const return_value = try cg.resolveOperand(un_op);
+                    try cg.statements.append(zcu.gpa, .{
+                        .op = .@"return",
+                        .args = .{ return_value, .void, .void },
+                    });
+                }
+
+                if (liveness.operandDies(inst_idx, 0)) try cg.killValue(un_op);
             },
         }
     }
 }
 
 fn getQCType(cg: CodeGen, ty: Type) !Mir.ValueType {
-    return qc_types.storageType(ty) orelse cg.fail(
+    return qc_types.storageType(ty, &cg.pt.zcu.intern_pool) orelse cg.fail(
         "unsupported quakec backend type: {f}",
         .{ty.fmt(cg.pt.zcu)},
     );
@@ -494,9 +595,7 @@ fn resolvePtrOperand(cg: *CodeGen, ref: Air.Inst.Ref) !Mir.Statement.Arg {
                 "internal error: no live value for pointer operand %{d}",
                 .{@backingInt(inst_idx)},
             );
-        return switch (in_flight) {
-            .temp, .local => |slot| .{ .local = slot },
-        };
+        return toStmtArg(in_flight);
     }
     const zcu = cg.pt.zcu;
     const ip = &zcu.intern_pool;

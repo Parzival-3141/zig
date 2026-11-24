@@ -959,7 +959,7 @@ pub const case_sets = [_]CaseSet{
         ,
         .cases = &.{},
     },
-    // ------------------------------------------------- batch 9 (planned, disabled)
+    // ------------------------------------------------- batch 9
     .{
         .disabled = true, // runtime @bitCast lowers to `bit_cast_safe` in safe builds (unimplemented); ints also banned (u24/i25 plan)
         .name = "bitcast-roundtrip",
@@ -978,23 +978,396 @@ pub const case_sets = [_]CaseSet{
         },
     },
     .{
-        .disabled = true, // calls/params/returns not implemented
         .name = "calls-and-params",
+        .source =
+        \\var in_a: f32 = 0;
+        \\var in_b: f32 = 0;
+        \\var out: f32 = 0;
+        \\export fn main() callconv(.quakec) void {
+        \\    out = add(in_a, in_b);
+        \\}
+        \\fn add(a: f32, b: f32) f32 {
+        \\    return a + b;
+        \\}
+        ,
+        .cases = &.{
+            .{ .inputs = &.{ v("in_a", "4"), v("in_b", "8") }, .expects = &.{v("out", "12")} },
+        },
+    },
+    .{
+        // Port of test "params" from test/behavior/fn.zig (i32 -> f32; literal args).
+        .name = "fn-params",
+        .source =
+        \\var out: f32 = 0;
+        \\
+        \\export fn main() callconv(.quakec) void {
+        \\    out = add(22, 11);
+        \\}
+        \\
+        \\fn add(a: f32, b: f32) f32 {
+        \\    return a + b;
+        \\}
+        ,
+        .cases = &.{
+            .{ .expects = &.{v("out", "33")} },
+        },
+    },
+    .{
+        // Port of test "assign inline fn to const variable" from
+        // test/behavior/fn.zig (out global proves execution continued past
+        // the inlined call; the original asserts no error).
+        .name = "fn-inline-alias",
+        .source =
+        \\var out: f32 = 0;
+        \\
+        \\export fn main() callconv(.quakec) void {
+        \\    const a = inlineFn;
+        \\    a();
+        \\    out = 1;
+        \\}
+        \\
+        \\inline fn inlineFn() void {
+        \\    out = 2;
+        \\}
+        ,
+        .cases = &.{.{ .expects = &.{v("out", "1")} }},
+    },
+    .{
+        // Port of test "local variables" from test/behavior/fn.zig
+        // (i32 -> f32; unreachable -> out flag; void fn call).
+        .name = "fn-local-vars",
+        .source =
+        \\var in_b: f32 = 0;
+        \\var out_ok: bool = false;
+        \\
+        \\export fn main() callconv(.quakec) void {
+        \\    locVars(in_b);
+        \\}
+        \\
+        \\fn locVars(b: f32) void {
+        \\    const a: f32 = 1;
+        \\    out_ok = a + b == 3;
+        \\}
+        ,
+        .cases = &.{
+            .{ .inputs = &.{v("in_b", "2")}, .expects = &.{v("out_ok", "1")} },
+        },
+    },
+    .{
+        // Port of test "mutable local variables" from test/behavior/fn.zig
+        // (i32 -> f32; zero checked via the return value).
+        .name = "fn-mutable-locals",
+        .source =
+        \\var out: f32 = 0;
+        \\
+        \\export fn main() callconv(.quakec) void {
+        \\    out = mutLocs();
+        \\}
+        \\
+        \\fn mutLocs() f32 {
+        \\    var zero: f32 = 0;
+        \\    _ = &zero;
+        \\    var i: f32 = 0;
+        \\    while (i != 3) {
+        \\        i += 1;
+        \\    }
+        \\    return i - zero;
+        \\}
+        ,
+        .cases = &.{
+            .{ .expects = &.{v("out", "3")} },
+        },
+    },
+    .{
+        // Port of test "separate block scopes" from test/behavior/fn.zig
+        // (i32 -> f32; expect -> globals).
+        .name = "fn-block-scopes",
+        .source =
+        \\var out_inner: f32 = 0;
+        \\var out_c: f32 = 0;
+        \\
+        \\export fn main() callconv(.quakec) void {
+        \\    out_c = blockScopes();
+        \\}
+        \\
+        \\fn blockScopes() f32 {
+        \\    {
+        \\        const no_conflict: f32 = 5;
+        \\        out_inner = no_conflict;
+        \\    }
+        \\
+        \\    const c = x: {
+        \\        const no_conflict: f32 = 10;
+        \\        break :x no_conflict;
+        \\    };
+        \\    return c;
+        \\}
+        ,
+        .cases = &.{
+            .{ .expects = &.{ v("out_inner", "5"), v("out_c", "10") } },
+        },
+    },
+    .{
+        // Port of test "weird function name" from test/behavior/fn.zig
+        // (i32 -> f32; expect -> out global).
+        .name = "fn-weird-name",
+        .source =
+        \\var out: f32 = 0;
+        \\
+        \\export fn main() callconv(.quakec) void {
+        \\    out = @"weird function name"();
+        \\}
+        \\
+        \\fn @"weird function name"() f32 {
+        \\    return 1234;
+        \\}
+        ,
+        .cases = &.{
+            .{ .expects = &.{v("out", "1234")} },
+        },
+    },
+    .{
+        // Port of test "function parameter self equality" from
+        // test/behavior/fn.zig (u32 -> f32; expect -> out globals;
+        // S struct methods -> plain fns). Also proves multi-function
+        // linking with 6 callees off one caller.
+        .name = "fn-param-self-compare",
+        .source =
+        \\var in_x: f32 = 0;
+        \\var out_eq: bool = false;
+        \\var out_ne: bool = false;
+        \\var out_lt: bool = false;
+        \\var out_le: bool = false;
+        \\var out_gt: bool = false;
+        \\var out_ge: bool = false;
+        \\
+        \\const S = struct {
+        \\    fn equal(x: f32) bool {
+        \\        return x == x;
+        \\    }
+        \\    fn notEqual(x: f32) bool {
+        \\        return x != x;
+        \\    }
+        \\    fn lessThan(x: f32) bool {
+        \\        return x < x;
+        \\    }
+        \\    fn lessThanOrEqual(x: f32) bool {
+        \\        return x <= x;
+        \\    }
+        \\    fn greaterThan(x: f32) bool {
+        \\        return x > x;
+        \\    }
+        \\    fn greaterThanOrEqual(x: f32) bool {
+        \\        return x >= x;
+        \\    }
+        \\};
+        \\
+        \\export fn main() callconv(.quakec) void {
+        \\    out_eq = S.equal(in_x);
+        \\    out_ne = S.notEqual(in_x);
+        \\    out_lt = S.lessThan(in_x);
+        \\    out_le = S.lessThanOrEqual(in_x);
+        \\    out_gt = S.greaterThan(in_x);
+        \\    out_ge = S.greaterThanOrEqual(in_x);
+        \\}
+        ,
+        .cases = &.{
+            .{ .inputs = &.{v("in_x", "42")}, .expects = &.{
+                v("out_eq", "1"),
+                v("out_ne", "0"),
+                v("out_lt", "0"),
+                v("out_le", "1"),
+                v("out_gt", "0"),
+                v("out_ge", "1"),
+            } },
+        },
+    },
+    .{
+        .name = "fn-call-live-result",
+        .source =
+        \\var out_nested: f32 = 0;
+        \\var out_seq: f32 = 0;
+        \\
+        \\fn add(a: f32, b: f32) f32 {
+        \\    return a + b;
+        \\}
+        \\
+        \\export fn main() callconv(.quakec) void {
+        \\    out_nested = add(add(1, 2), add(3, 4));
+        \\    const x = add(1, 2);
+        \\    const y = add(3, 4);
+        \\    out_seq = x + y;
+        \\}
+        ,
+        .cases = &.{
+            .{ .expects = &.{ v("out_nested", "10"), v("out_seq", "10") } },
+        },
+    },
+    .{
+        // Port of test "function pointers" from test/behavior/fn.zig, in the
+        // shape of a too-many-args call. Fails in the caller before the callee's
+        // own params are counted, so the substring is the .call error.
+        .name = "fail-too-many-args",
+        .expect_compile_error = true,
+        .error_substring = "too many arguments",
         .source =
         \\var in_a: f32 = 0;
         \\var out: f32 = 0;
         \\
-        \\fn addOne(t: f32) f32 {
-        \\    return t + 1;
+        \\fn sum9(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32, g: f32, h: f32, i: f32) f32 {
+        \\    return a + b + c + d + e + f + g + h + i;
         \\}
         \\
         \\export fn main() callconv(.quakec) void {
-        \\    out = addOne(in_a);
+        \\    out = sum9(in_a, in_a, in_a, in_a, in_a, in_a, in_a, in_a, in_a);
+        \\}
+        ,
+        .cases = &.{},
+    },
+    .{
+        // Port of test "void parameters" from test/behavior/fn.zig
+        // (i32 -> f32; try/expect -> out global).
+        .name = "fn-void-params",
+        .source =
+        \\var in_a: f32 = 0;
+        \\var out: f32 = 0;
+        \\
+        \\export fn main() callconv(.quakec) void {
+        \\    voidFun(in_a, {}, 2, {});
+        \\}
+        \\
+        \\fn voidFun(a: f32, b: void, c: f32, d: void) void {
+        \\    _ = b;
+        \\    _ = d;
+        \\    out = a + c;
         \\}
         ,
         .cases = &.{
-            .{ .inputs = &.{v("in_a", "4")}, .expects = &.{v("out", "5")} },
+            .{ .inputs = &.{v("in_a", "1")}, .expects = &.{v("out", "3")} },
         },
+    },
+    .{
+        // Port of test "function pointers" from test/behavior/fn.zig, reduced
+        // to a single indirect call (the original uses an array of pointers).
+        .name = "fail-fn-pointer",
+        .expect_compile_error = true,
+        .error_substring = "unsupported quakec backend type: *const fn",
+        .source =
+        \\var out: f32 = 0;
+        \\
+        \\fn fn1() f32 {
+        \\    return 5;
+        \\}
+        \\
+        \\export fn main() callconv(.quakec) void {
+        \\    var f: *const fn () f32 = &fn1;
+        \\    _ = &f;
+        \\    out = f();
+        \\}
+        ,
+        .cases = &.{.{ .expects = &.{v("out", "5")} }},
+    },
+    .{
+        // Port of test "super basic invocations" from test/behavior/call.zig
+        // (i32 -> f32; expect -> out global; comptime halves kept).
+        .name = "call-super-basic",
+        .source =
+        \\var out: f32 = 0;
+        \\
+        \\export fn main() callconv(.quakec) void {
+        \\    const foo = struct {
+        \\        fn foo() f32 {
+        \\            return 1234;
+        \\        }
+        \\    }.foo;
+        \\
+        \\    out = @call(.auto, foo, .{});
+        \\}
+        ,
+        .cases = &.{
+            .{ .expects = &.{v("out", "1234")} },
+        },
+    },
+    .{
+        // Port of test "basic invocations" from test/behavior/call.zig
+        // (i32 -> f32; expect -> out globals; comptime block kept except the
+        // .always_tail line; the runtime-known fn pointer lines dropped).
+        .name = "call-basic",
+        .source =
+        \\var out_auto: f32 = 0;
+        \\var out_no_suspend: f32 = 0;
+        \\var out_never_inline: f32 = 0;
+        \\var out_never_tail: f32 = 0;
+        \\
+        \\export fn main() callconv(.quakec) void {
+        \\    const foo = struct {
+        \\        fn foo(_: f32) f32 {
+        \\            return 1234;
+        \\        }
+        \\    }.foo;
+        \\
+        \\    out_auto = @call(.auto, foo, .{1});
+        \\    out_no_suspend = @call(.no_suspend, foo, .{2});
+        \\    out_never_inline = @call(.never_inline, foo, .{3});
+        \\    out_never_tail = @call(.never_tail, foo, .{4});
+        \\}
+        ,
+        .cases = &.{
+            .{ .expects = &.{
+                v("out_auto", "1234"),
+                v("out_no_suspend", "1234"),
+                v("out_never_inline", "1234"),
+                v("out_never_tail", "1234"),
+            } },
+        },
+    },
+    .{
+        // Port of test "recursive inline call with comptime known argument"
+        // from test/behavior/call.zig (i32 -> f32; expect -> out global).
+        .name = "call-inline-recursion",
+        .source =
+        \\var out: f32 = 0;
+        \\
+        \\export fn main() callconv(.quakec) void {
+        \\    const S = struct {
+        \\        inline fn foo(x: f32) f32 {
+        \\            if (x <= 0) {
+        \\                return 0;
+        \\            } else {
+        \\                return x * 2 + foo(x - 1);
+        \\            }
+        \\        }
+        \\    };
+        \\
+        \\    out = S.foo(4);
+        \\}
+        ,
+        .cases = &.{
+            .{ .expects = &.{v("out", "20")} },
+        },
+    },
+    .{
+        // Port of test "forced tail call" from test/behavior/call.zig, as an
+        // always_tail error probe (the backend rejects tail calls in Sema).
+        .name = "fail-always-tail-call",
+        .expect_compile_error = true,
+        .error_substring = "does not support tail calls",
+        .source =
+        \\var out: f32 = 0;
+        \\
+        \\fn foo() f32 {
+        \\    return 42;
+        \\}
+        \\
+        \\fn caller() f32 {
+        \\    return @call(.always_tail, foo, .{});
+        \\}
+        \\
+        \\export fn main() callconv(.quakec) void {
+        \\    out = caller();
+        \\}
+        ,
+        .cases = &.{},
     },
 };
 

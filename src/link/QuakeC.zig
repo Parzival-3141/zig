@@ -354,7 +354,7 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
     const ip = &zcu.intern_pool;
     const io = self.base.comp.io;
 
-    const num_globals = self.immediates.count() + self.locals.items.len + self.globals.count();
+    const num_globals = self.immediates.count() + self.locals.items.len + self.globals.count() + self.funcs.count();
 
     // add 1 to these to account for their null value
     var statements: std.ArrayList(qcvm.Statement) = try .initCapacity(arena, 1 + self.statements.items.len);
@@ -362,7 +362,7 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
     var globaldefs: std.ArrayList(qcvm.Def) = try .initCapacity(arena, 1 + num_globals);
     var fielddefs: std.ArrayList(qcvm.Def) = try .initCapacity(arena, 1); // @Todo
     var strings: std.ArrayList(u8) = try .initCapacity(arena, 1); // @Todo use StringTable instead?
-    var globals: std.ArrayList(f32) = try .initCapacity(arena, qcvm.SpecialRegisterOffset.reserved_len + num_globals);
+    var globals: std.ArrayList(f32) = try .initCapacity(arena, qcvm.SpecialRegisterOffset.reserved_len + num_globals); // not to be confused with self.globals!
 
     // append null values
     globals.appendNTimesAssumeCapacity(0, qcvm.SpecialRegisterOffset.reserved_len);
@@ -380,12 +380,13 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
         /// the absolute index of the local in `self.locals`
         local: u32,
         global: InternPool.Nav.Index,
+        func: InternPool.Nav.Index,
     };
     var allocated_globals: std.AutoHashMapUnmanaged(GlobalKey, u32) = .empty;
     try allocated_globals.ensureUnusedCapacity(arena, @intCast(num_globals));
 
     for (self.immediates.keys()) |imm| {
-        assert(qc_types.storageType(imm.typeOf(zcu)).? == .float);
+        assert(qc_types.storageType(imm.typeOf(zcu), ip).? == .float);
         const offset: u32 = @intCast(globals.items.len);
 
         globals.appendAssumeCapacity(qc_types.floatFromValue(imm, ip));
@@ -418,13 +419,13 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
         allocated_globals.putAssumeCapacityNoClobber(.{ .local = @intCast(index) }, offset);
     }
     for (self.globals.keys()) |nav_idx| {
-        const offset: u32 = @intCast(globals.items.len); // not to be confused with mir.globals!
+        const offset: u32 = @intCast(globals.items.len);
 
         const nav = ip.getNav(nav_idx);
         const nav_res = nav.resolved.?;
 
         // for now nav must be a non-extern variable
-        assert(qc_types.storageType(.fromInterned(nav_res.type)).? == .float);
+        assert(qc_types.storageType(.fromInterned(nav_res.type), ip).? == .float);
         assert(nav.getExtern(ip) == null);
         assert(!nav_res.@"const");
 
@@ -450,40 +451,23 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
     }
 
     // @Todo function emit order is technically dependant on Zig's analysis order. Make it deterministic.
-    var it = self.funcs.iterator();
-    while (it.next()) |kvp| {
-        const func_idx = kvp.key_ptr.*;
-        const func_data = kvp.value_ptr;
-
-        const my_stmts = self.statements.items[func_data.statements_off..][0..func_data.statements_len];
+    // iterate over functions, allocate functions and globals for their indices (for call stmts)
+    // func_idx starts at 1 to skip null function
+    assert(functions.items.len == 1);
+    for (self.funcs.keys(), self.funcs.values(), 1..) |ip_idx, func_data, func_idx| {
         const my_locals = self.locals.items[func_data.locals_off..][0..func_data.locals_len];
 
-        const first_statement: u31 = @intCast(statements.items.len);
-
-        // link statements
-        for (my_stmts, 0..) |stmt, i| {
-            var result: qcvm.Statement = .{ .op = stmt.op, .args = undefined };
-            for (stmt.args, &result.args) |mir_arg, *res_arg| {
-                switch (mir_arg) {
-                    .void => res_arg.* = 0,
-                    // @Todo handle int out-of-range errors
-                    .jump_to_stmt => |index| res_arg.* = @intCast(@as(i64, index) - @as(i64, @intCast(i))), // index & i are function local, no need to apply offsets
-                    // lookup allocated global offset
-                    .local => |index| res_arg.* = @intCast(allocated_globals.get(.{ .local = func_data.locals_off + index }).?),
-                    .immediate => |imm| res_arg.* = @intCast(allocated_globals.get(.{ .immediate = imm }).?),
-                    .global => |global| res_arg.* = @intCast(allocated_globals.get(.{ .global = global }).?),
-                }
-            }
-            statements.appendAssumeCapacity(result);
-        }
-
-        const owner_nav = zcu.funcInfo(func_idx).owner_nav;
+        const owner_nav = zcu.funcInfo(ip_idx).owner_nav;
         const file_name = std.fs.path.basename(zcu.navFileScope(owner_nav).sub_file_path);
         const func_name = ip.getNav(owner_nav).name.toSlice(ip);
 
-        assert(func_data.num_params == 0); // @Incomplete @Cleanup handle parameter allocation
+        var param_sizes: [qcvm.Function.MAX_PARAMETERS]u8 = @splat(0);
+        for (param_sizes[0..func_data.num_params], 0..) |*size, p| {
+            size.* = qc_types.storageSize(my_locals[p]);
+        }
+
         functions.appendAssumeCapacity(.{
-            .first_statement = first_statement,
+            .first_statement = 0, // filled during statements emit below
             .frame_start = if (my_locals.len > 0) allocated_globals.get(.{ .local = func_data.locals_off }).? else 0,
             .frame_size = @intCast(my_locals.len), // @Incomplete handle parameters
             .profile = 0,
@@ -502,8 +486,45 @@ fn writeDatFile(self: *QuakeC, arena: Allocator) !void {
                 break :idx str_idx;
             },
             .num_params = func_data.num_params,
-            .param_size = @splat(0), // @Incomplete handle parameters
+            .param_size = param_sizes,
         });
+
+        // allocate a global for the function index so it can be referenced at runtime (call stmts, func ptrs, etc.)
+        const offset: u32 = @intCast(globals.items.len);
+        globals.appendAssumeCapacity(@bitCast(@as(u32, @intCast(func_idx)))); // function indices are not f32s
+        globaldefs.appendAssumeCapacity(.{
+            .type = .{ .tag = .function, .save_global = false },
+            .offset = @intCast(offset),
+            .s_name = functions.lastPtr().?.s_name,
+        });
+        allocated_globals.putAssumeCapacityNoClobber(.{ .func = owner_nav }, offset);
+    }
+
+    // iterate over functions again, this time to emit statements
+    // func_idx starts at 1 to skip null function
+    for (self.funcs.values(), 1..) |func_data, func_idx| {
+        const my_stmts = self.statements.items[func_data.statements_off..][0..func_data.statements_len];
+
+        functions.items[func_idx].first_statement = @intCast(statements.items.len);
+
+        // link statements
+        for (my_stmts, 0..) |stmt, i| {
+            var result: qcvm.Statement = .{ .op = stmt.op, .args = undefined };
+            for (stmt.args, &result.args) |mir_arg, *res_arg| {
+                switch (mir_arg) {
+                    .void => res_arg.* = 0,
+                    // @Todo handle int out-of-range errors
+                    .jump_to_stmt => |index| res_arg.* = @intCast(@as(i64, index) - @as(i64, @intCast(i))), // index & i are function local, no need to apply offsets
+                    // lookup allocated global offset
+                    .local => |index| res_arg.* = @intCast(allocated_globals.get(.{ .local = func_data.locals_off + index }).?),
+                    .immediate => |imm| res_arg.* = @intCast(allocated_globals.get(.{ .immediate = imm }).?),
+                    .global => |global| res_arg.* = @intCast(allocated_globals.get(.{ .global = global }).?),
+                    .func => |func_nav| res_arg.* = @intCast(allocated_globals.get(.{ .func = func_nav }).?),
+                    .special => |offset| res_arg.* = @intCast(@backingInt(offset)),
+                }
+            }
+            statements.appendAssumeCapacity(result);
+        }
     }
 
     if (strings.getLast() != 0) try strings.append(arena, 0); // @Cleanup do this when writing to file instead?

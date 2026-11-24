@@ -1,9 +1,32 @@
-pub fn storageType(ty: Type) ?Mir.ValueType {
+pub fn storageType(ty: Type, ip: *const InternPool) ?Mir.ValueType {
     return switch (ty.toIntern()) {
         .f32_type,
         .bool_type,
         => .float,
+        _ => |idx| blk: {
+            const unwrapped = idx.unwrap(ip);
+            break :blk switch (unwrapped.getTag(ip)) {
+                .type_function => if (ip.indexToFuncType(idx).?.is_var_args) null else .function,
+                else => null,
+            };
+        },
         else => null,
+    };
+}
+
+/// Storage size in words (32bits)
+pub fn storageSize(qc_ty: Mir.ValueType) u8 {
+    return switch (qc_ty) {
+        .void => 0,
+        .string,
+        .float,
+        .entity,
+        .field,
+        .function,
+        .pointer,
+        => 1,
+        .vector => 3,
+        _ => unreachable,
     };
 }
 
